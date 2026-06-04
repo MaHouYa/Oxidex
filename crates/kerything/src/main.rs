@@ -325,6 +325,11 @@ impl eframe::App for KerythingApp {
                     self.recompute_hits();
                 }
 
+                if ui.button("Index Manager").clicked() {
+                    self.show_index_manager = true;
+                    self.refresh_devices();
+                }
+
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .hint_text("Search files...")
@@ -332,11 +337,6 @@ impl eframe::App for KerythingApp {
                 );
                 if response.changed() {
                     self.recompute_hits();
-                }
-
-                if ui.button("Indexes").clicked() {
-                    self.show_index_manager = true;
-                    self.refresh_devices();
                 }
             });
         });
@@ -603,9 +603,11 @@ fn scan_device_with_helper(
     });
 
     let device_id = device.metadata.device_id.clone();
-    thread::spawn(move || {
+    let stderr_handle = thread::spawn(move || -> std::io::Result<String> {
         let reader = std::io::BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
+        let mut diagnostics = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
             if let Some(rest) = line.trim().strip_prefix("KERYTHING_PROGRESS ")
                 && let Ok(percent) = rest.trim().parse::<u8>()
             {
@@ -613,22 +615,35 @@ fn scan_device_with_helper(
                     device_id: device_id.clone(),
                     percent: percent.min(100),
                 });
+            } else if !line.trim().is_empty() {
+                diagnostics.push(line);
             }
         }
+        Ok(diagnostics.join("\n"))
     });
 
+    let mut cancellation_requested = false;
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) && !cancellation_requested {
+            cancellation_requested = true;
             let _ = child.kill();
         }
         if let Some(status) = child.try_wait()? {
             let output = stdout_handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("helper stdout reader panicked"))??;
-            anyhow::ensure!(
-                status.success(),
-                "scanner helper failed with status {status}"
-            );
+            let diagnostics = stderr_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("helper stderr reader panicked"))??;
+            if cancellation_requested {
+                anyhow::bail!("scan cancelled");
+            }
+            if !status.success() {
+                if diagnostics.trim().is_empty() {
+                    anyhow::bail!("scanner helper failed with status {status}");
+                }
+                anyhow::bail!("scanner helper failed with status {status}: {diagnostics}");
+            }
             return kerything_core::stream::read_scan_stream(&output[..]);
         }
         thread::sleep(Duration::from_millis(100));

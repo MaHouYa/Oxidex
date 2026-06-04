@@ -10,8 +10,11 @@ use crate::scanner::ProgressCallback;
 pub fn scan(path: &Path, progress: &mut ProgressCallback<'_>) -> anyhow::Result<ScanDatabase> {
     progress(0, 1);
     let file = File::open(path)?;
+    // Kerything is a read-only filename indexer. Directory metadata checksums are useful
+    // for fsck, but a mismatch should not make search indexing fail outright.
     let options = ext4::Options {
-        checksums: ext4::Checksums::Enabled,
+        checksums: ext4::Checksums::Ignored,
+        load_xattrs: false,
     };
     let volume = ext4::SuperBlock::new_with_options(file, &options)?;
     let root = volume.root()?;
@@ -91,4 +94,48 @@ fn split_path(path: &str) -> (&str, &str) {
     let parent = if pos == 0 { "/" } else { &trimmed[..pos] };
     let name = &trimmed[pos + 1..];
     (parent, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+
+    #[test]
+    fn metadata_csum_seed_image_scans_when_mkfs_ext4_is_available() -> anyhow::Result<()> {
+        let image = std::env::temp_dir().join(format!(
+            "kerything-ext4-csum-seed-{}.img",
+            std::process::id()
+        ));
+        let file = fs::File::create(&image)?;
+        file.set_len(64 * 1024 * 1024)?;
+        drop(file);
+
+        let mkfs = Command::new("mkfs.ext4")
+            .arg("-q")
+            .arg("-F")
+            .arg("-O")
+            .arg("metadata_csum,metadata_csum_seed")
+            .arg(&image)
+            .status();
+
+        let Ok(status) = mkfs else {
+            let _ = fs::remove_file(&image);
+            return Ok(());
+        };
+        if !status.success() {
+            let _ = fs::remove_file(&image);
+            return Ok(());
+        }
+
+        let mut progress = |_: u64, _: u64| {};
+        let result = scan(&image, &mut progress);
+        let _ = fs::remove_file(&image);
+
+        let db = result?;
+        assert_eq!(db.fs_type, FsType::Ext4);
+        assert!(!db.records.is_empty());
+        Ok(())
+    }
 }

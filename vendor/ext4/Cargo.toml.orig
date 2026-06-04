@@ -1,0 +1,30 @@
+[package]
+authors = ["Chris West (Faux) <git@goeswhere.com>"]
+build = "build.rs"
+categories = [
+    "filesystem",
+    "os",
+    "parsing",
+]
+description = "Read information from EXT4 filesystem images"
+license = "MIT"
+name = "ext4"
+readme = "README.md"
+repository = "https://github.com/FauxFaux/ext4-rs"
+version = "0.9.0"
+
+edition = "2018"
+
+[badges.travis-ci]
+repository = "FauxFaux/ext4-rs"
+
+[dependencies]
+anyhow = "1"
+bitflags = "1"
+byteorder = "1"
+crc = "1"
+positioned-io = "0.2"
+thiserror = "1"
+
+[dev-dependencies]
+bootsector = "0.1"
