@@ -1,5 +1,6 @@
 # Cargo
 target/
+dist/
 
 # JetBrains IDEs
 .idea/

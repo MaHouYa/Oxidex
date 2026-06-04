@@ -108,6 +108,18 @@ The package installs:
 
 It does not install the previous D-Bus service, systemd daemon service, Qt/KDE files, or CMake build outputs.
 
+## Debian Package
+
+Build a local `.deb` after a release build:
+
+```shell
+scripts/package-deb.sh
+```
+
+The package is written to `dist/kerything_1.4.1_amd64.deb`. The GitHub Actions workflow in `.github/workflows/deb.yml` builds the same package inside an `ubuntu:20.04` job container and uploads it as a workflow artifact.
+
+The Debian package installs the GUI, scanner helper, desktop file, Polkit policy, hicolor icons, and license into standard system paths. This avoids the AppImage helper permission issue because Polkit authorizes `/usr/bin/kerything-scanner-helper` directly.
+
 ## Current Scanner Status
 
 ### NTFS V1
