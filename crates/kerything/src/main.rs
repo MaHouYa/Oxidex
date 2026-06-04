@@ -165,9 +165,11 @@ impl KerythingApp {
 
     fn open_selected(&mut self) {
         let Some(row) = self.selected_row else {
+            self.status = "No result selected.".into();
             return;
         };
         let Some((idx, rec_idx)) = self.hit_at(row) else {
+            self.status = "No result selected.".into();
             return;
         };
         let Some(device) = self.device_by_id(&idx.metadata.device_id) else {
@@ -187,9 +189,11 @@ impl KerythingApp {
 
     fn open_selected_location(&mut self) {
         let Some(row) = self.selected_row else {
+            self.status = "No result selected.".into();
             return;
         };
         let Some((idx, rec_idx)) = self.hit_at(row) else {
+            self.status = "No result selected.".into();
             return;
         };
         let Some(device) = self.device_by_id(&idx.metadata.device_id) else {
@@ -213,9 +217,11 @@ impl KerythingApp {
 
     fn copy_selected_names(&mut self, ctx: &egui::Context) {
         let Some(row) = self.selected_row else {
+            self.status = "No result selected.".into();
             return;
         };
         let Some((idx, rec_idx)) = self.hit_at(row) else {
+            self.status = "No result selected.".into();
             return;
         };
         let name = idx.name(rec_idx).to_owned();
@@ -225,9 +231,11 @@ impl KerythingApp {
 
     fn copy_selected_paths(&mut self, ctx: &egui::Context) {
         let Some(row) = self.selected_row else {
+            self.status = "No result selected.".into();
             return;
         };
         let Some((idx, rec_idx)) = self.hit_at(row) else {
+            self.status = "No result selected.".into();
             return;
         };
         let (mounted, mp) = self
@@ -376,17 +384,30 @@ impl eframe::App for KerythingApp {
 
 impl KerythingApp {
     fn results_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let has_selection = self.selected_row.and_then(|row| self.hit_at(row)).is_some();
         ui.horizontal(|ui| {
-            if ui.button("Open").clicked() {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Open"))
+                .clicked()
+            {
                 self.open_selected();
             }
-            if ui.button("Open Folder").clicked() {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Open Folder"))
+                .clicked()
+            {
                 self.open_selected_location();
             }
-            if ui.button("Copy Name").clicked() {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copy Name"))
+                .clicked()
+            {
                 self.copy_selected_names(ctx);
             }
-            if ui.button("Copy Path").clicked() {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copy Path"))
+                .clicked()
+            {
                 self.copy_selected_paths(ctx);
             }
             ui.separator();
@@ -430,6 +451,7 @@ impl KerythingApp {
         TableBuilder::new(ui)
             .id_salt("results")
             .striped(true)
+            .sense(egui::Sense::click())
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::initial(260.0).at_least(120.0).clip(true))
