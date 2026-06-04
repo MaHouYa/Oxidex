@@ -1,5 +1,0 @@
-[D-BUS Service]
-Name=net.reikooters.Kerything1
-Exec=/usr/bin/kerythingd
-User=root
-SystemdService=kerythingd.service

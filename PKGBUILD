@@ -4,17 +4,15 @@
 pkgname=kerything
 pkgver=1.4.1
 pkgrel=1
-pkgdesc="Fast NTFS and EXT4 file scanner using trigrams"
+pkgdesc="Fast Rust/egui filename search for NTFS and EXT4 devices"
 arch=('x86_64')
 url="https://github.com/Reikooters/kerything"
 license=('GPL-3.0-or-later')
-depends=('qt6-base' 'kwidgetsaddons' 'kcoreaddons' 'solid' 'kio' 'kxmlgui' 'onetbb' 'e2fsprogs')
-makedepends=('cmake' 'extra-cmake-modules')
+depends=('gcc-libs' 'glibc' 'polkit' 'libx11' 'libxcb' 'libxkbcommon' 'wayland' 'libglvnd' 'vulkan-icd-loader' 'fontconfig' 'xdg-utils' 'hicolor-icon-theme')
+makedepends=('cargo')
 
-# Disable the creation of the -debug package
-# Add link time optimization
-# Stop Arch Linux from injecting its default build flags
-options=('!debug' 'lto' '!buildflags')
+# Disable the creation of the -debug package.
+options=('!debug')
 
 #source=("git+${url}.git#tag=v${pkgver}")
 #sha256sums=('SKIP')
@@ -24,20 +22,20 @@ source=()
 sha256sums=()
 
 build() {
-  # Omit `-Wp,-D_GLIBCXX_ASSERTIONS` as this security flag decreases application performance by 10x
-  local my_flags="-march=x86-64 -mtune=generic -O2 -flto=auto -DNDEBUG -fno-plt -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fstack-protector-strong -fstack-clash-protection -fcf-protection -fexceptions -Wp,-D_FORTIFY_SOURCE=3"
-
-  cmake -B build -S "$startdir" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_FLAGS_RELEASE="$my_flags" \
-    -DCMAKE_C_FLAGS_RELEASE="$my_flags" \
-    -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-Wl,-O1,--sort-common,--as-needed" \
-    -DCMAKE_INSTALL_PREFIX=/usr \
-    -Wno-dev
-
-  cmake --build build --parallel $(nproc)
+  cd "$startdir"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked --workspace
 }
 
 package() {
-  DESTDIR="$pkgdir" cmake --install build
+  install -Dm755 "$srcdir/target/release/kerything" "$pkgdir/usr/bin/kerything"
+  install -Dm755 "$srcdir/target/release/kerything-scanner-helper" "$pkgdir/usr/bin/kerything-scanner-helper"
+
+  install -Dm644 "$startdir/net.reikooters.kerything.desktop" "$pkgdir/usr/share/applications/net.reikooters.kerything.desktop"
+  install -Dm644 "$startdir/net.reikooters.kerything.policy" "$pkgdir/usr/share/polkit-1/actions/net.reikooters.kerything.policy"
+  install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  for size in 16 32 48 256; do
+    install -Dm644 "$startdir/icons/${size}-apps-kerything.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/kerything.png"
+  done
 }

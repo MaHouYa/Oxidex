@@ -1,0 +1,17 @@
+[package]
+name = "kerything-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+byteorder.workspace = true
+ext4.workspace = true
+ntfs.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+xdg.workspace = true
