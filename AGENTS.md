@@ -68,7 +68,7 @@ The GitHub Actions Debian package workflow runs inside an `ubuntu:20.04` job con
 
 Use idiomatic Rust and keep formatting under `cargo fmt`. Prefer small, explicit modules over broad abstractions, and follow the existing crate boundaries before adding new ones. Use `snake_case` for functions, modules, and locals; `PascalCase` for types and enum variants; and `SCREAMING_SNAKE_CASE` for constants.
 
-Prefer Rust-native crates and standard library facilities. Avoid dynamic C library bindings for filesystem scanners unless the user explicitly approves that tradeoff. The EXT4 scanner currently uses the patched Rust `ext4` crate from `vendor/ext4`; NTFS uses the Rust `ntfs` crate. Btrfs is planned as V2 raw metadata-tree support, not as a mounted-path crawler.
+Prefer Rust-native crates and standard library facilities. Avoid dynamic C library bindings for filesystem scanners unless the user explicitly approves that tradeoff. The EXT4 scanner currently uses the patched Rust `ext4` crate from `vendor/ext4`; NTFS uses the Rust `ntfs` crate. Btrfs V2-basic uses `btrfs-fs`/`btrfs-disk` for default-root raw metadata scanning and must not become a mounted-path crawler.
 
 Keep helper stdout reserved for binary scan data. Progress and diagnostics belong on stderr, with progress lines formatted as:
 
@@ -80,9 +80,9 @@ KERYTHING_PROGRESS <0-100>
 
 For GUI changes, manually verify search, device filtering, row selection, sorting, open/open-folder actions, copy-name/copy-path actions, progress display, cancellation, and snapshot reload after restart.
 
-For search or snapshot changes, run unit tests and check path reconstruction, Unicode names, hard links, short-token fallback, trigram matching, deterministic sorting, multi-device merging, corruption rejection, and version mismatch behavior.
+For search or snapshot changes, run unit tests and check path reconstruction, Unicode names, hard links, short-token fallback, trigram matching, wildcard matching, extension/type/path filters, deterministic sorting, multi-device merging, corruption rejection, and version mismatch behavior.
 
-For scanner changes, validate both mounted and unmounted devices when possible. NTFS should scan MFT metadata and preserve hard-link names. EXT4 should read filesystem metadata, inode metadata, and directory-entry blocks; it must not scan regular file contents or do whole-disk byte-by-byte discovery. Btrfs V2 should treat subvolumes and snapshots as separate searchable roots so identical inode numbers in different roots do not collide.
+For scanner changes, validate both mounted and unmounted devices when possible. NTFS should scan MFT metadata and preserve hard-link names. EXT4 should read filesystem metadata, inode metadata, and directory-entry blocks; it must not scan regular file contents or do whole-disk byte-by-byte discovery. Btrfs V2-basic scans only the default/main root, treats other subvolumes as boundaries, and rejects unsupported multi-device layouts clearly.
 
 When changing packaging, validate at least:
 

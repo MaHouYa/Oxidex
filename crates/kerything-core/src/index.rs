@@ -69,6 +69,136 @@ pub struct SearchHit {
     pub record_idx: u32,
 }
 
+impl PartialEq for SearchHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.device_id == other.device_id && self.record_idx == other.record_idx
+    }
+}
+
+impl Eq for SearchHit {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchFileType {
+    File,
+    Dir,
+    Symlink,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchFilters {
+    pub extensions: Vec<String>,
+    pub file_type: Option<SearchFileType>,
+    pub path_contains: Vec<String>,
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        self.extensions.is_empty() && self.file_type.is_none() && self.path_contains.is_empty()
+    }
+
+    pub fn add_extensions(&mut self, value: &str) {
+        for ext in value.split(',') {
+            let ext = normalize_extension(ext);
+            if !ext.is_empty() && !self.extensions.iter().any(|existing| existing == &ext) {
+                self.extensions.push(ext);
+            }
+        }
+    }
+
+    pub fn add_path_contains(&mut self, value: &str) {
+        let value = value.trim().to_lowercase();
+        if !value.is_empty() {
+            self.path_contains.push(value);
+        }
+    }
+
+    pub fn merge(&mut self, other: SearchFilters) {
+        for ext in other.extensions {
+            if !self.extensions.iter().any(|existing| existing == &ext) {
+                self.extensions.push(ext);
+            }
+        }
+        if other.file_type.is_some() {
+            self.file_type = other.file_type;
+        }
+        self.path_contains.extend(other.path_contains);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SearchTerm {
+    Contains(String),
+    Phrase(String),
+    Wildcard(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchRequest {
+    pub terms: Vec<SearchTerm>,
+    pub filters: SearchFilters,
+}
+
+impl SearchRequest {
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.filters.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchParseError {
+    message: String,
+}
+
+impl SearchParseError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SearchParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SearchParseError {}
+
+pub fn parse_search_query(query: &str) -> Result<SearchRequest, SearchParseError> {
+    let mut request = SearchRequest::default();
+    for token in tokenize_query(query)? {
+        if token.value.is_empty() {
+            continue;
+        }
+        if !token.quoted {
+            let lowered = token.value.to_ascii_lowercase();
+            if lowered.starts_with("ext:") {
+                request.filters.add_extensions(&token.value[4..]);
+                continue;
+            }
+            if lowered.starts_with("path:") {
+                request.filters.add_path_contains(&token.value[5..]);
+                continue;
+            }
+            if lowered.starts_with("type:") {
+                request.filters.file_type = Some(parse_file_type(&token.value[5..])?);
+                continue;
+            }
+        }
+
+        let folded = token.value.to_lowercase();
+        if folded.contains('*') {
+            request.terms.push(SearchTerm::Wildcard(folded));
+        } else if token.quoted {
+            request.terms.push(SearchTerm::Phrase(folded));
+        } else {
+            request.terms.push(SearchTerm::Contains(folded));
+        }
+    }
+    Ok(request)
+}
+
 impl SearchIndex {
     pub fn from_scan(
         metadata: DeviceMetadata,
@@ -190,27 +320,34 @@ impl SearchIndex {
     }
 
     pub fn search(&self, query: &str, sort_key: SortKey, direction: SortDirection) -> Vec<u32> {
-        let tokens: Vec<String> = query
-            .split_whitespace()
-            .map(|s| s.to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let request = parse_search_query(query).unwrap_or_else(|_| SearchRequest {
+            terms: query
+                .split_whitespace()
+                .map(|s| SearchTerm::Contains(s.to_lowercase()))
+                .collect(),
+            filters: SearchFilters::default(),
+        });
+        self.search_request(&request, sort_key, direction)
+    }
 
-        let mut hits = if tokens.is_empty() {
+    pub fn search_request(
+        &self,
+        request: &SearchRequest,
+        sort_key: SortKey,
+        direction: SortDirection,
+    ) -> Vec<u32> {
+        let mut hits = if request.is_empty() {
             self.pick_order(sort_key).clone()
         } else {
+            let tokens = request_candidate_tokens(request);
             let candidates = self.candidates_for_tokens(&tokens);
-            let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
             candidates
                 .into_par_iter()
-                .filter(|&idx| {
-                    let name = self.folded_name(idx);
-                    token_refs.iter().all(|tok| name.contains(tok))
-                })
+                .filter(|&idx| self.matches_request(idx, request))
                 .collect()
         };
 
-        if !tokens.is_empty() {
+        if !request.is_empty() {
             let rank = self.rank_for(sort_key);
             hits.par_sort_unstable_by(|a, b| {
                 rank[*a as usize]
@@ -223,6 +360,64 @@ impl SearchIndex {
             hits.reverse();
         }
         hits
+    }
+
+    fn matches_request(&self, record_idx: u32, request: &SearchRequest) -> bool {
+        let name = self.folded_name(record_idx);
+        for term in &request.terms {
+            match term {
+                SearchTerm::Contains(needle) | SearchTerm::Phrase(needle) => {
+                    if !name.contains(needle) {
+                        return false;
+                    }
+                }
+                SearchTerm::Wildcard(pattern) => {
+                    if !wildcard_matches(pattern, name) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        let rec = &self.records[record_idx as usize];
+        if let Some(file_type) = request.filters.file_type {
+            let matches = match file_type {
+                SearchFileType::Dir => rec.is_dir(),
+                SearchFileType::Symlink => rec.is_symlink(),
+                SearchFileType::File => !rec.is_dir() && !rec.is_symlink(),
+            };
+            if !matches {
+                return false;
+            }
+        }
+
+        if !request.filters.extensions.is_empty() {
+            let Some(ext) = file_extension(name) else {
+                return false;
+            };
+            if !request
+                .filters
+                .extensions
+                .iter()
+                .any(|wanted| wanted == ext)
+            {
+                return false;
+            }
+        }
+
+        if !request.filters.path_contains.is_empty() {
+            let path = self.internal_path(record_idx).to_lowercase();
+            if !request
+                .filters
+                .path_contains
+                .iter()
+                .all(|needle| path.contains(needle))
+            {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn build_path_for(&self, record_idx: u32, depth: usize) -> String {
@@ -403,6 +598,23 @@ pub fn merge_search(
     sort_key: SortKey,
     direction: SortDirection,
 ) -> Vec<SearchHit> {
+    let request = parse_search_query(query).unwrap_or_else(|_| SearchRequest {
+        terms: query
+            .split_whitespace()
+            .map(|s| SearchTerm::Contains(s.to_lowercase()))
+            .collect(),
+        filters: SearchFilters::default(),
+    });
+    merge_search_request(indexes, device_filter, &request, sort_key, direction)
+}
+
+pub fn merge_search_request(
+    indexes: &[SearchIndex],
+    device_filter: Option<&str>,
+    request: &SearchRequest,
+    sort_key: SortKey,
+    direction: SortDirection,
+) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     for index in indexes {
         if let Some(device_id) = device_filter
@@ -413,7 +625,7 @@ pub fn merge_search(
 
         hits.extend(
             index
-                .search(query, sort_key, SortDirection::Asc)
+                .search_request(request, sort_key, SortDirection::Asc)
                 .into_iter()
                 .map(|record_idx| SearchHit {
                     device_id: index.metadata.device_id.clone(),
@@ -469,6 +681,136 @@ fn compare_hits(
         .then_with(|| a.cmp(&b))
 }
 
+#[derive(Clone, Debug)]
+struct QueryToken {
+    value: String,
+    quoted: bool,
+}
+
+fn tokenize_query(query: &str) -> Result<Vec<QueryToken>, SearchParseError> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut token_was_quoted = false;
+    let mut chars = query.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                token_was_quoted = true;
+            }
+            '\\' if quoted => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                } else {
+                    current.push(ch);
+                }
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                if !current.is_empty() || token_was_quoted {
+                    tokens.push(QueryToken {
+                        value: std::mem::take(&mut current),
+                        quoted: token_was_quoted,
+                    });
+                    token_was_quoted = false;
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if quoted {
+        return Err(SearchParseError::new("unterminated quoted search phrase"));
+    }
+    if !current.is_empty() || token_was_quoted {
+        tokens.push(QueryToken {
+            value: current,
+            quoted: token_was_quoted,
+        });
+    }
+    Ok(tokens)
+}
+
+fn parse_file_type(value: &str) -> Result<SearchFileType, SearchParseError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "file" | "regular" => Ok(SearchFileType::File),
+        "dir" | "directory" | "folder" => Ok(SearchFileType::Dir),
+        "symlink" | "link" => Ok(SearchFileType::Symlink),
+        other => Err(SearchParseError::new(format!(
+            "unsupported type filter '{other}'; use file, dir, or symlink"
+        ))),
+    }
+}
+
+fn normalize_extension(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('.')
+        .to_lowercase()
+        .trim()
+        .to_owned()
+}
+
+fn request_candidate_tokens(request: &SearchRequest) -> Vec<String> {
+    let mut out = Vec::new();
+    for term in &request.terms {
+        match term {
+            SearchTerm::Contains(value) | SearchTerm::Phrase(value) => {
+                out.push(value.clone());
+            }
+            SearchTerm::Wildcard(pattern) => {
+                out.extend(
+                    pattern
+                        .split('*')
+                        .filter(|part| part.len() >= 3)
+                        .map(str::to_owned),
+                );
+            }
+        }
+    }
+    out
+}
+
+fn file_extension(name: &str) -> Option<&str> {
+    let (_, ext) = name.rsplit_once('.')?;
+    (!ext.is_empty()).then_some(ext)
+}
+
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == text;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut remainder = text;
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if idx == 0 && anchored_start {
+            let Some(next) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = next;
+            continue;
+        }
+        let Some(pos) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[pos + part.len()..];
+    }
+
+    if anchored_end && let Some(last) = parts.iter().rev().find(|part| !part.is_empty()) {
+        text.ends_with(last)
+    } else {
+        true
+    }
+}
+
 pub fn join_prefix(prefix: &str, internal_path: &str) -> String {
     if prefix.is_empty() {
         internal_path.to_owned()
@@ -513,6 +855,12 @@ mod tests {
             .unwrap();
         scan.push_record(0, "alpha.log", 20, 1, false, false)
             .unwrap();
+        let src = scan.push_record(0, "src", 0, 3, true, false).unwrap();
+        scan.push_record(src, "main.rs", 30, 4, false, false)
+            .unwrap();
+        scan.push_record(src, "lib.RS", 40, 5, false, false)
+            .unwrap();
+        scan.push_record(0, "latest", 0, 6, false, true).unwrap();
         SearchIndex::from_scan(
             DeviceMetadata {
                 device_id: "uuid:test".into(),
@@ -547,5 +895,74 @@ mod tests {
         let idx = sample_index();
         assert_eq!(idx.internal_path(1), "/Résumé.TXT");
         assert_eq!(idx.display_path(1, false, ""), "[Test]/Résumé.TXT");
+    }
+
+    #[test]
+    fn wildcard_search_works() {
+        let idx = sample_index();
+        let request = parse_search_query("*.rs").unwrap();
+        let hits = idx.search_request(&request, SortKey::Name, SortDirection::Asc);
+        assert_eq!(hits, vec![5, 4]);
+    }
+
+    #[test]
+    fn extension_filter_is_case_insensitive_and_dot_optional() {
+        let idx = sample_index();
+        let request = parse_search_query("ext:.RS").unwrap();
+        let hits = idx.search_request(&request, SortKey::Path, SortDirection::Asc);
+        assert_eq!(hits, vec![5, 4]);
+    }
+
+    #[test]
+    fn filter_prefixes_are_case_insensitive() {
+        let idx = sample_index();
+        let request = parse_search_query("EXT:RS TYPE:FILE PATH:SRC").unwrap();
+        let hits = idx.search_request(&request, SortKey::Path, SortDirection::Asc);
+        assert_eq!(hits, vec![5, 4]);
+    }
+
+    #[test]
+    fn extension_filter_accepts_multiple_values() {
+        let idx = sample_index();
+        let request = parse_search_query("ext:rs,txt").unwrap();
+        let hits = idx.search_request(&request, SortKey::Path, SortDirection::Asc);
+        assert_eq!(hits, vec![1, 5, 4]);
+    }
+
+    #[test]
+    fn type_filter_works() {
+        let idx = sample_index();
+        let dirs = parse_search_query("type:dir").unwrap();
+        assert_eq!(
+            idx.search_request(&dirs, SortKey::Path, SortDirection::Asc),
+            vec![0, 3]
+        );
+
+        let links = parse_search_query("type:symlink").unwrap();
+        assert_eq!(
+            idx.search_request(&links, SortKey::Path, SortDirection::Asc),
+            vec![6]
+        );
+    }
+
+    #[test]
+    fn path_filter_combines_with_name_terms() {
+        let idx = sample_index();
+        let request = parse_search_query("path:src main").unwrap();
+        let hits = idx.search_request(&request, SortKey::Path, SortDirection::Asc);
+        assert_eq!(hits, vec![4]);
+    }
+
+    #[test]
+    fn quoted_phrase_search_works() {
+        let idx = sample_index();
+        let request = parse_search_query("\"résumé.txt\"").unwrap();
+        let hits = idx.search_request(&request, SortKey::Name, SortDirection::Asc);
+        assert_eq!(hits, vec![1]);
+    }
+
+    #[test]
+    fn invalid_query_reports_error() {
+        assert!(parse_search_query("\"unterminated").is_err());
     }
 }

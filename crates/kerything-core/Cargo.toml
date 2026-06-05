@@ -8,10 +8,12 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+btrfs-fs.workspace = true
 byteorder.workspace = true
 ext4.workspace = true
 ntfs.workspace = true
 rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 xdg.workspace = true

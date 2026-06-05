@@ -23,8 +23,8 @@ impl FsType {
         }
     }
 
-    pub fn is_supported_v1(self) -> bool {
-        matches!(self, Self::Ntfs | Self::Ext4)
+    pub fn is_supported_for_scan(self) -> bool {
+        matches!(self, Self::Ntfs | Self::Ext4 | Self::Btrfs)
     }
 }
 

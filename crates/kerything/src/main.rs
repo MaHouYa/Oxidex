@@ -13,7 +13,10 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use kerything_core::device::{DeviceInfo, list_known_devices};
-use kerything_core::index::{SearchHit, SearchIndex, merge_search};
+use kerything_core::index::{
+    SearchFileType, SearchFilters, SearchHit, SearchIndex, SearchRequest, merge_search_request,
+    parse_search_query,
+};
 use kerything_core::model::{DeviceMetadata, FsType, SortDirection, SortKey};
 use kerything_core::snapshot;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
@@ -39,12 +42,18 @@ struct KerythingApp {
     indexes: Vec<SearchIndex>,
     hits: Vec<SearchHit>,
     query: String,
+    filter_extensions: String,
+    filter_path: String,
+    filter_type: Option<SearchFileType>,
     selected_scope: String,
-    selected_row: Option<usize>,
+    selected_hit: Option<SearchHit>,
     sort_key: SortKey,
     sort_direction: SortDirection,
     status: String,
+    show_filters: bool,
     show_index_manager: bool,
+    properties_hit: Option<SearchHit>,
+    last_scan_errors: HashMap<String, String>,
     scan_job: Option<ScanJob>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
@@ -77,12 +86,18 @@ impl KerythingApp {
             indexes,
             hits: Vec::new(),
             query: String::new(),
+            filter_extensions: String::new(),
+            filter_path: String::new(),
+            filter_type: None,
             selected_scope: String::new(),
-            selected_row: None,
+            selected_hit: None,
             sort_key: SortKey::Name,
             sort_direction: SortDirection::Asc,
             status: String::new(),
+            show_filters: false,
             show_index_manager: false,
+            properties_hit: None,
+            last_scan_errors: HashMap::new(),
             scan_job: None,
             tx,
             rx,
@@ -111,6 +126,8 @@ impl KerythingApp {
                     self.scan_job = None;
                     match *result {
                         Ok(index) => {
+                            let indexed_fs_type = index.metadata.fs_type;
+                            self.last_scan_errors.remove(&device_id);
                             self.indexes
                                 .retain(|idx| idx.metadata.device_id != device_id);
                             self.indexes.push(index);
@@ -118,10 +135,19 @@ impl KerythingApp {
                                 .sort_by(|a, b| a.metadata.device_id.cmp(&b.metadata.device_id));
                             self.refresh_devices();
                             self.recompute_hits();
-                            self.status = format!("Indexed {device_id}.");
+                            self.status = if indexed_fs_type == FsType::Btrfs {
+                                format!(
+                                    "Indexed {device_id}. Btrfs V2 indexes the default root only."
+                                )
+                            } else {
+                                format!("Indexed {device_id}.")
+                            };
                         }
                         Err(err) => {
-                            self.status = format!("Indexing failed for {device_id}: {err:#}");
+                            let message = format!("{err:#}");
+                            self.last_scan_errors
+                                .insert(device_id.clone(), message.clone());
+                            self.status = format!("Indexing failed for {device_id}: {message}");
                         }
                     }
                 }
@@ -134,15 +160,37 @@ impl KerythingApp {
     }
 
     fn recompute_hits(&mut self) {
+        let previous_selection = self.selected_hit.clone();
         let filter = (!self.selected_scope.is_empty()).then_some(self.selected_scope.as_str());
-        self.hits = merge_search(
+        let request = match self.search_request() {
+            Ok(request) => request,
+            Err(err) => {
+                self.status = format!("Search error: {err}");
+                return;
+            }
+        };
+        self.hits = merge_search_request(
             &self.indexes,
             filter,
-            &self.query,
+            &request,
             self.sort_key,
             self.sort_direction,
         );
-        self.selected_row = None;
+        self.selected_hit = previous_selection.filter(|hit| self.hits.iter().any(|h| h == hit));
+    }
+
+    fn search_request(&self) -> Result<SearchRequest, kerything_core::index::SearchParseError> {
+        let mut request = parse_search_query(&self.query)?;
+        request.filters.merge(self.panel_filters());
+        Ok(request)
+    }
+
+    fn panel_filters(&self) -> SearchFilters {
+        let mut filters = SearchFilters::default();
+        filters.add_extensions(&self.filter_extensions);
+        filters.add_path_contains(&self.filter_path);
+        filters.file_type = self.filter_type;
+        filters
     }
 
     fn device_by_id(&self, device_id: &str) -> Option<&DeviceInfo> {
@@ -163,12 +211,18 @@ impl KerythingApp {
             .map(|idx| (idx, hit.record_idx))
     }
 
+    fn selected_index_record(&self) -> Option<(&SearchIndex, u32)> {
+        let hit = self.selected_hit.as_ref()?;
+        self.index_by_id(&hit.device_id)
+            .map(|idx| (idx, hit.record_idx))
+    }
+
+    fn select_row(&mut self, row: usize) {
+        self.selected_hit = self.hits.get(row).cloned();
+    }
+
     fn open_selected(&mut self) {
-        let Some(row) = self.selected_row else {
-            self.status = "No result selected.".into();
-            return;
-        };
-        let Some((idx, rec_idx)) = self.hit_at(row) else {
+        let Some((idx, rec_idx)) = self.selected_index_record() else {
             self.status = "No result selected.".into();
             return;
         };
@@ -188,11 +242,7 @@ impl KerythingApp {
     }
 
     fn open_selected_location(&mut self) {
-        let Some(row) = self.selected_row else {
-            self.status = "No result selected.".into();
-            return;
-        };
-        let Some((idx, rec_idx)) = self.hit_at(row) else {
+        let Some((idx, rec_idx)) = self.selected_index_record() else {
             self.status = "No result selected.".into();
             return;
         };
@@ -216,11 +266,7 @@ impl KerythingApp {
     }
 
     fn copy_selected_names(&mut self, ctx: &egui::Context) {
-        let Some(row) = self.selected_row else {
-            self.status = "No result selected.".into();
-            return;
-        };
-        let Some((idx, rec_idx)) = self.hit_at(row) else {
+        let Some((idx, rec_idx)) = self.selected_index_record() else {
             self.status = "No result selected.".into();
             return;
         };
@@ -230,11 +276,7 @@ impl KerythingApp {
     }
 
     fn copy_selected_paths(&mut self, ctx: &egui::Context) {
-        let Some(row) = self.selected_row else {
-            self.status = "No result selected.".into();
-            return;
-        };
-        let Some((idx, rec_idx)) = self.hit_at(row) else {
+        let Some((idx, rec_idx)) = self.selected_index_record() else {
             self.status = "No result selected.".into();
             return;
         };
@@ -249,10 +291,6 @@ impl KerythingApp {
     fn start_scan(&mut self, device: DeviceInfo) {
         if self.scan_job.is_some() {
             self.status = "Another indexing job is already running.".into();
-            return;
-        }
-        if device.metadata.fs_type == FsType::Btrfs {
-            self.status = "Btrfs scanning is planned for v2; this Rust v1 helper exposes the type but does not parse Btrfs yet.".into();
             return;
         }
 
@@ -294,6 +332,7 @@ impl eframe::App for KerythingApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
         let ctx = ui.ctx().clone();
+        self.handle_keyboard(&ctx);
         if self.scan_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -338,15 +377,28 @@ impl eframe::App for KerythingApp {
                     self.refresh_devices();
                 }
 
+                if ui.selectable_label(self.show_filters, "Filters").clicked() {
+                    self.show_filters = !self.show_filters;
+                }
+
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search files...")
+                        .hint_text("Search files, e.g. *.rs ext:txt path:src type:dir")
                         .desired_width(f32::INFINITY),
                 );
                 if response.changed() {
                     self.recompute_hits();
                 }
             });
+            if self.show_filters {
+                ui.separator();
+                self.filter_panel(ui);
+            }
+            if let Some(summary) = self.filter_summary() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(summary);
+                });
+            }
         });
 
         egui::Panel::bottom("status").show_inside(ui, |ui| {
@@ -379,12 +431,124 @@ impl eframe::App for KerythingApp {
         if self.show_index_manager {
             self.index_manager(&ctx);
         }
+        self.properties_window(&ctx);
     }
 }
 
 impl KerythingApp {
+    fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.properties_hit = None;
+            }
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.open_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.properties_hit.is_some() {
+                self.properties_hit = None;
+            } else if self.show_filters {
+                self.show_filters = false;
+            } else {
+                self.selected_hit = None;
+            }
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+            if ctx.input(|i| i.modifiers.shift) {
+                self.copy_selected_names(ctx);
+            } else {
+                self.copy_selected_paths(ctx);
+            }
+        }
+    }
+
+    fn filter_panel(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Extension");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.filter_extensions)
+                        .hint_text("rs,txt")
+                        .desired_width(120.0),
+                )
+                .changed();
+
+            ui.label("Type");
+            egui::ComboBox::from_id_salt("type-filter")
+                .selected_text(file_type_label(self.filter_type))
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(&mut self.filter_type, None, "All")
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.filter_type,
+                            Some(SearchFileType::File),
+                            "Files",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.filter_type,
+                            Some(SearchFileType::Dir),
+                            "Folders",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.filter_type,
+                            Some(SearchFileType::Symlink),
+                            "Symlinks",
+                        )
+                        .changed();
+                });
+
+            ui.label("Path");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.filter_path)
+                        .hint_text("src")
+                        .desired_width(180.0),
+                )
+                .changed();
+
+            if ui.button("Clear Filters").clicked() {
+                self.filter_extensions.clear();
+                self.filter_path.clear();
+                self.filter_type = None;
+                changed = true;
+            }
+        });
+
+        if changed {
+            self.recompute_hits();
+        }
+    }
+
+    fn filter_summary(&self) -> Option<String> {
+        let request = self.search_request().ok()?;
+        if request.filters.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !request.filters.extensions.is_empty() {
+            parts.push(format!("ext:{}", request.filters.extensions.join(",")));
+        }
+        if let Some(file_type) = request.filters.file_type {
+            parts.push(format!("type:{}", search_file_type_name(file_type)));
+        }
+        for path in request.filters.path_contains {
+            parts.push(format!("path:{path}"));
+        }
+        Some(format!("Active filters: {}", parts.join("  ")))
+    }
+
     fn results_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let has_selection = self.selected_row.and_then(|row| self.hit_at(row)).is_some();
+        let has_selection = self.selected_index_record().is_some();
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(has_selection, egui::Button::new("Open"))
@@ -409,6 +573,12 @@ impl KerythingApp {
                 .clicked()
             {
                 self.copy_selected_paths(ctx);
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Properties"))
+                .clicked()
+            {
+                self.properties_hit = self.selected_hit.clone();
             }
             ui.separator();
             let mut sort_changed = false;
@@ -447,6 +617,24 @@ impl KerythingApp {
     }
 
     fn results_table(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.indexes.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("No indexes yet");
+                ui.label("Open Index Manager to index an NTFS, EXT4, or Btrfs device.");
+            });
+            return;
+        }
+        if self.hits.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("No results");
+                ui.label("Try a different name, wildcard, extension, path, or type filter.");
+            });
+            return;
+        }
+
         let row_height = 24.0;
         TableBuilder::new(ui)
             .id_salt("results")
@@ -475,6 +663,9 @@ impl KerythingApp {
             .body(|body| {
                 body.rows(row_height, self.hits.len(), |mut row| {
                     let row_index = row.index();
+                    let Some(hit) = self.hits.get(row_index).cloned() else {
+                        return;
+                    };
                     let Some((idx, rec_idx)) = self.hit_at(row_index) else {
                         return;
                     };
@@ -487,7 +678,7 @@ impl KerythingApp {
                     let path = idx.display_path(rec_idx, mounted, mp);
                     let size = format_size(rec.size);
                     let modified = format_time(rec.mtime);
-                    let selected = self.selected_row == Some(row_index);
+                    let selected = self.selected_hit.as_ref() == Some(&hit);
                     row.set_selected(selected);
 
                     row.col(|ui| {
@@ -504,14 +695,94 @@ impl KerythingApp {
                     });
 
                     let response = row.response();
+                    if response.secondary_clicked() {
+                        self.selected_hit = Some(hit.clone());
+                    }
+                    response.clone().context_menu(|ui| {
+                        self.selected_hit = Some(hit.clone());
+                        self.result_context_menu(ui, &ctx);
+                    });
                     if response.double_clicked() {
-                        self.selected_row = Some(row_index);
+                        self.select_row(row_index);
                         self.open_selected();
                     } else if response.clicked() {
-                        self.selected_row = Some(row_index);
+                        self.select_row(row_index);
                     }
                 });
             });
+    }
+
+    fn result_context_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let has_selection = self.selected_index_record().is_some();
+        let selected_device = self
+            .selected_hit
+            .as_ref()
+            .and_then(|hit| self.device_by_id(&hit.device_id))
+            .cloned();
+        let can_rescan = selected_device
+            .as_ref()
+            .map(|device| device.metadata.fs_type.is_supported_for_scan())
+            .unwrap_or(false);
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Open"))
+            .clicked()
+        {
+            self.open_selected();
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Open Folder"))
+            .clicked()
+        {
+            self.open_selected_location();
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Copy Name"))
+            .clicked()
+        {
+            self.copy_selected_names(ctx);
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Copy Path"))
+            .clicked()
+        {
+            self.copy_selected_paths(ctx);
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                has_selection && can_rescan && self.scan_job.is_none(),
+                egui::Button::new("Rescan Device"),
+            )
+            .clicked()
+        {
+            if let Some(device) = selected_device {
+                self.start_scan(device);
+            }
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                has_selection && self.scan_job.is_none(),
+                egui::Button::new("Forget Index"),
+            )
+            .clicked()
+        {
+            if let Some(device_id) = self.selected_hit.as_ref().map(|hit| hit.device_id.clone()) {
+                self.forget_index(&device_id);
+            }
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Properties"))
+            .clicked()
+        {
+            self.properties_hit = self.selected_hit.clone();
+            ui.close();
+        }
     }
 
     fn index_manager(&mut self, ctx: &egui::Context) {
@@ -542,9 +813,10 @@ impl KerythingApp {
                         for device in self.devices.clone() {
                             ui.horizontal(|ui| {
                                 let meta = &device.metadata;
+                                let index = self.index_by_id(&meta.device_id);
                                 let count = indexed.get(&meta.device_id).copied();
                                 ui.label(fit(&device_label(meta), 28));
-                                ui.label(fit(meta.fs_type.as_str(), 6));
+                                ui.label(fit(meta.fs_type.as_str(), 7));
                                 ui.label(if device.mounted {
                                     "mounted"
                                 } else {
@@ -555,20 +827,30 @@ impl KerythingApp {
                                     Some(n) => format!("{n} entries"),
                                     None => "not indexed".to_owned(),
                                 });
+                                ui.label(
+                                    index
+                                        .map(|idx| {
+                                            format!(
+                                                "indexed {}",
+                                                format_time(idx.last_indexed_time)
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "never indexed".to_owned()),
+                                );
+                                if let Some(err) = self.last_scan_errors.get(&meta.device_id) {
+                                    ui.label(fit(err, 36));
+                                }
 
                                 let busy = self.scan_job.is_some();
                                 let scan_label = if count.is_some() { "Rescan" } else { "Index" };
                                 if ui
                                     .add_enabled(
-                                        !busy && meta.fs_type.is_supported_v1(),
+                                        !busy && meta.fs_type.is_supported_for_scan(),
                                         egui::Button::new(scan_label),
                                     )
                                     .clicked()
                                 {
                                     self.start_scan(device.clone());
-                                }
-                                if !meta.fs_type.is_supported_v1() {
-                                    ui.label("v2");
                                 }
                                 if count.is_some()
                                     && ui.add_enabled(!busy, egui::Button::new("Forget")).clicked()
@@ -581,6 +863,48 @@ impl KerythingApp {
                     });
             });
         self.show_index_manager = open;
+    }
+
+    fn properties_window(&mut self, ctx: &egui::Context) {
+        let Some(hit) = self.properties_hit.clone() else {
+            return;
+        };
+        let Some(idx) = self.index_by_id(&hit.device_id) else {
+            self.properties_hit = None;
+            return;
+        };
+        let rec_idx = hit.record_idx;
+        let Some(rec) = idx.records.get(rec_idx as usize) else {
+            self.properties_hit = None;
+            return;
+        };
+        let device = self.device_by_id(&idx.metadata.device_id);
+        let (mounted, mp) = device
+            .map(|dev| (dev.mounted, dev.primary_mount_point.as_str()))
+            .unwrap_or((false, ""));
+        let mut open = true;
+
+        egui::Window::new("Properties")
+            .open(&mut open)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                property_row(ui, "Name", idx.name(rec_idx));
+                property_row(ui, "Path", &idx.display_path(rec_idx, mounted, mp));
+                property_row(ui, "Internal Path", idx.internal_path(rec_idx));
+                property_row(ui, "Device", &device_label(&idx.metadata));
+                property_row(ui, "Device ID", &idx.metadata.device_id);
+                property_row(ui, "Filesystem", idx.metadata.fs_type.as_str());
+                property_row(ui, "Size", &format_size(rec.size));
+                property_row(ui, "Modified", &format_time(rec.mtime));
+                property_row(ui, "Directory", yes_no(rec.is_dir()));
+                property_row(ui, "Symlink", yes_no(rec.is_symlink()));
+                property_row(ui, "Mounted", yes_no(mounted));
+                property_row(ui, "Last Indexed", &format_time(idx.last_indexed_time));
+            });
+
+        if !open {
+            self.properties_hit = None;
+        }
     }
 }
 
@@ -711,6 +1035,34 @@ fn device_label(meta: &DeviceMetadata) -> String {
     } else {
         meta.device_id.clone()
     }
+}
+
+fn file_type_label(file_type: Option<SearchFileType>) -> &'static str {
+    match file_type {
+        None => "All",
+        Some(SearchFileType::File) => "Files",
+        Some(SearchFileType::Dir) => "Folders",
+        Some(SearchFileType::Symlink) => "Symlinks",
+    }
+}
+
+fn search_file_type_name(file_type: SearchFileType) -> &'static str {
+    match file_type {
+        SearchFileType::File => "file",
+        SearchFileType::Dir => "dir",
+        SearchFileType::Symlink => "symlink",
+    }
+}
+
+fn property_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("{label}:"));
+        ui.monospace(value);
+    });
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn sort_button(

@@ -2,7 +2,7 @@
 
 Kerything is a Linux desktop filename search utility inspired by Voidtools Everything. This branch rewrites the application in Rust with an unprivileged `egui` GUI and a small privileged scanner helper launched through `pkexec`.
 
-The V1 Rust app indexes NTFS and EXT4 devices by reading filesystem metadata instead of crawling mounted directories or reading file contents. Btrfs is represented in the data model, device discovery, helper interface, snapshot metadata, and UI as a planned V2 backend; the V2 scanner is intended to be a native read-only metadata-tree parser using Rust crates rather than `libbtrfs` bindings.
+The Rust app indexes NTFS, EXT4, and basic Btrfs devices by reading filesystem metadata instead of crawling mounted directories or reading file contents. Btrfs V2 support is native and read-only through Rust crates; it indexes the default/main root and treats other subvolumes as boundaries for now.
 
 Kerything is a community project and is not affiliated with Voidtools.
 
@@ -16,9 +16,10 @@ Kerything is a community project and is not affiliated with Voidtools.
 - Stable device IDs using `partuuid:<id>`, then `uuid:<filesystem-uuid>`, then `dev:<canonical-dev-node>`.
 - NTFS V1 scanner reads MFT metadata, preserves hard-link names as separate entries, filters duplicate DOS 8.3 aliases, and hides early `$` system files.
 - EXT4 V1 scanner reads filesystem metadata, inode metadata, and directory entries through a Rust-native crate.
-- Search uses Unicode lowercase folding plus byte trigrams for tokens of length three or more, with substring refinement and short-token fallback.
+- Btrfs V2 scanner reads the default/main root through Rust-native Btrfs metadata APIs and rejects unsupported multi-device layouts clearly.
+- Search uses Unicode lowercase folding plus byte trigrams for tokens of length three or more, with substring refinement, short-token fallback, wildcards, quoted phrases, and `ext:`/`type:`/`path:` filters.
 - Multi-device search, device-scope filtering, result sorting, mounted/unmounted path display, and persisted snapshot reload on restart.
-- Guaranteed actions: open file, open containing folder, copy file name, and copy full path.
+- Guaranteed actions: open file, open containing folder, copy file name/path, right-click context actions, and properties.
 
 ## What Was Removed
 
@@ -42,16 +43,8 @@ The helper validates the device path, resolves symlinks, rejects unsafe inputs, 
 
 ```shell
 kerything-scanner-helper --version
-kerything-scanner-helper <absolute-/dev-device> <ntfs|ext4>
-```
-
-The V2 interface extends the filesystem argument to:
-
-```shell
 kerything-scanner-helper <absolute-/dev-device> <ntfs|ext4|btrfs>
 ```
-
-At the moment, `btrfs` is accepted by shared types but the backend returns an explicit unsupported error until the V2 raw metadata scanner is implemented.
 
 Progress is emitted on stderr in this format:
 
@@ -88,6 +81,18 @@ target/release/kerything
 ```
 
 For local helper testing, the GUI first looks for `kerything-scanner-helper` beside the running `kerything` binary and then falls back to `PATH`. Installed systems should use the Polkit policy that authorizes `/usr/bin/kerything-scanner-helper`.
+
+## Search Syntax
+
+Plain whitespace-separated terms match file names as case-insensitive substrings. V2 also supports:
+
+- Wildcards: `*.rs`, `foo*`, `*backup*`
+- Quoted phrases: `"exact phrase"`
+- Extensions: `ext:rs`, `ext:.RS`, `ext:rs,txt`
+- File types: `type:file`, `type:dir`, `type:symlink`
+- Path filters: `path:src`
+
+Typed filters and the GUI filter panel combine with AND semantics. Regex and OR/negation are intentionally outside V2-basic.
 
 ## Arch Package
 
@@ -132,9 +137,9 @@ The EXT4 scanner reads filesystem metadata through the Rust `ext4` crate. It doe
 
 ### Btrfs V2
 
-Btrfs support is planned as a native raw metadata-tree scanner. The intended backend will extract metadata from Btrfs inode items and names/parent relationships from inode refs, extended inode refs, directory items, and directory indexes. Subvolumes and snapshots should be searchable as separate roots so identical inode numbers in different roots do not collide.
+Btrfs support uses the Rust `btrfs-fs` crate on top of `btrfs-disk`. It scans the default/main root directly from metadata and records names, parent relationships, size, modification time, directory flags, and symlink flags.
 
-If existing Rust Btrfs crates cannot expose the required metadata efficiently, the V2 path should add a small custom read-only parser for the needed tree items rather than linking dynamic Btrfs libraries.
+V2-basic does not recurse into additional subvolumes or snapshots. Those entries are treated as directory-like boundaries and the scan reports that only the default root is indexed. Multi-device Btrfs layouts are rejected clearly until the raw scanner grows full device mapping support.
 
 ## Development Notes
 
@@ -142,7 +147,7 @@ If existing Rust Btrfs crates cannot expose the required metadata efficiently, t
 - Helper stdout must contain only binary scan data.
 - Path/device validation in the helper is security-sensitive.
 - Old C++ snapshots are intentionally ignored.
-- Live fanotify updates, background daemon indexing, D-Bus APIs, and rich drag-out/file-URI clipboard support are outside the V1 guarantee.
+- Live fanotify updates, background daemon indexing, D-Bus APIs, full Btrfs subvolume traversal, regex search, OR/negation query syntax, and rich drag-out/file-URI clipboard support are outside the V2-basic guarantee.
 
 ## License
 
