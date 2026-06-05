@@ -1,6 +1,6 @@
 # Kerything
 
-Kerything is a Linux desktop filename search utility inspired by Voidtools Everything. This branch rewrites the application in Rust with an unprivileged `egui` GUI and a small privileged scanner helper launched through `pkexec`.
+Kerything is a Linux desktop filename search utility inspired by Voidtools Everything. This branch rewrites the application in Rust with an unprivileged `egui` GUI, an unprivileged per-user daemon, and a small privileged scanner daemon authorized through Polkit.
 
 The Rust app indexes NTFS, EXT4, and basic Btrfs devices by reading filesystem metadata instead of crawling mounted directories or reading file contents. Btrfs V2 support is native and read-only through Rust crates; it indexes the default/main root and treats other subvolumes as boundaries for now.
 
@@ -10,8 +10,8 @@ Kerything is a community project and is not affiliated with Voidtools.
 
 ## Features
 
-- Rust-native desktop GUI built with `eframe`/`egui`.
-- Unprivileged GUI; only `kerything-scanner-helper` is run through Polkit.
+- Rust-native desktop GUI built with `eframe`/`egui`, using the `glow` backend by default.
+- Unprivileged GUI and user daemon; only `kerything-scannerd` or the compatibility `kerything-scanner-helper` performs privileged raw metadata scans.
 - Persistent multi-device indexes under `$XDG_DATA_HOME/kerything/indexes/`.
 - Stable device IDs using `partuuid:<id>`, then `uuid:<filesystem-uuid>`, then `dev:<canonical-dev-node>`.
 - NTFS V1 scanner reads MFT metadata, preserves hard-link names as separate entries, filters duplicate DOS 8.3 aliases, and hides early `$` system files.
@@ -23,23 +23,42 @@ Kerything is a community project and is not affiliated with Voidtools.
 
 ## What Was Removed
 
-The Rust build does not use Qt6, KDE Frameworks, KIO, Solid, a D-Bus indexing daemon, systemd daemon activation, libblkid, e2fsprogs/libext2fs, or Intel OneTBB. Polkit remains because raw block-device scanning is privileged.
+The Rust build does not use Qt6, KDE Frameworks, KIO, Solid, a D-Bus indexing daemon, libblkid, e2fsprogs/libext2fs, Intel OneTBB, or `wgpu` by default. Polkit remains because raw block-device scanning is privileged.
 
 The old C++ daemon snapshot format is intentionally not imported. Users rescan once into the new Rust snapshot format.
 
 ## Architecture
 
-The Cargo workspace contains three crates:
+The Cargo workspace contains these primary crates:
 
 - `crates/kerything`: the `eframe`/`egui` GUI.
-- `crates/kerything-scanner-helper`: the privileged scanner CLI.
+- `crates/kerything-daemon`: `kerythingd`, the unprivileged per-user daemon that owns config, loaded indexes, search, scan requests, and snapshot persistence.
+- `crates/kerything-scannerd`: `kerything-scannerd`, the privileged scanner daemon that validates raw `/dev/...` scan requests and streams `ScanStreamV1` data.
+- `crates/kerything-client`: shared Unix-socket client library for GUI and CLI frontends.
+- `crates/kerything-cli`: CLI and rofi/script integration client.
+- `crates/kerything-scanner-helper`: the compatibility privileged scanner CLI kept for one release.
 - `crates/kerything-core`: shared device discovery, scan stream, indexing, search, snapshots, path resolution, and scanner backends.
 
-The GUI discovers known devices from `/dev/disk/by-*`, `/run/udev/data`, and `/proc/self/mountinfo`. It stores snapshots in the user data directory and launches the helper only when a rescan is requested.
+`kerythingd` discovers known devices from `/dev/disk/by-*`, `/run/udev/data`, and `/proc/self/mountinfo`. It stores snapshots in the user data directory and connects to `kerything-scannerd` only when a raw rescan is requested. If the scanner daemon is not reachable, it can still fall back to the compatibility helper.
 
-The helper validates the device path, resolves symlinks, rejects unsafe inputs, scans the requested filesystem, reports progress on stderr, and writes only binary scan data to stdout.
+`kerything-scannerd` validates the device path, resolves symlinks, rejects unsafe inputs, scans the requested filesystem, reports progress as structured IPC events, and returns the existing binary scan stream as a framed payload.
+
+The GUI defaults to daemon mode. Use the standalone fallback when developing or recovering from daemon setup problems:
+
+```shell
+kerything --standalone
+```
+
+Daemon sockets:
+
+```text
+$XDG_RUNTIME_DIR/kerything/kerythingd.sock
+/run/kerything/scannerd.sock
+```
 
 ## Helper CLI
+
+The helper remains available for compatibility and manual diagnostics:
 
 ```shell
 kerything-scanner-helper --version
@@ -54,12 +73,55 @@ KERYTHING_PROGRESS <0-100>
 
 Stdout is reserved for the binary `ScanStreamV1` payload.
 
+## Daemon And CLI
+
+Foreground development mode:
+
+```shell
+scripts/dev-install-polkit.sh
+kerythingd --foreground
+sudo kerything-scannerd --foreground
+```
+
+The first command installs the local Polkit action file and checks that `pkaction` can see `net.reikooters.kerything.connect-scanner`. Without that, `pkcheck` will fail with `Action net.reikooters.kerything.connect-scanner is not registered`.
+
+For local foreground testing, the scanner daemon socket is still protected by Unix permissions before Polkit can run. Create the socket group, add your user, and start a fresh login session or `newgrp` before running `kerythingd`:
+
+```shell
+sudo groupadd --system kerything 2>/dev/null || true
+sudo usermod -aG kerything "$USER"
+newgrp kerything
+scripts/dev-install-polkit.sh
+sudo target/release/kerything-scannerd --foreground
+```
+
+If the scanner daemon was already running before the group existed, restart it. The foreground daemon will create `/run/kerything/scannerd.sock` as `root:kerything` with mode `0660` when the group is available. Without that, `kerythingd` will see `Permission denied` before the Polkit authorization step.
+
+CLI examples:
+
+```shell
+kerything-cli search "ext:rs path:src main"
+kerything-cli search --json "foo"
+kerything-cli rofi "foo"
+kerything-cli indexes
+kerything-cli devices
+kerything-cli scan partuuid:...
+kerything-cli config get
+kerything-cli config set ui.theme dark
+```
+
+Rofi script mode can call the CLI:
+
+```shell
+rofi -dmenu -i -p Kerything < <(kerything-cli rofi "$query")
+```
+
 ## Building
 
 Install Rust and the native libraries needed by `eframe`/`winit` for Linux desktop rendering. On Arch Linux:
 
 ```shell
-sudo pacman -S cargo polkit libx11 libxcb libxkbcommon wayland libglvnd vulkan-icd-loader fontconfig xdg-utils hicolor-icon-theme
+sudo pacman -S cargo polkit libx11 libxcb libxkbcommon wayland libglvnd fontconfig xdg-utils hicolor-icon-theme
 ```
 
 Build all Rust crates:
@@ -80,7 +142,7 @@ Run the GUI from the build tree:
 target/release/kerything
 ```
 
-For local helper testing, the GUI first looks for `kerything-scanner-helper` beside the running `kerything` binary and then falls back to `PATH`. Installed systems should use the Polkit policy that authorizes `/usr/bin/kerything-scanner-helper`.
+For local scanner testing, `kerythingd` first tries `/run/kerything/scannerd.sock`. If that daemon is unavailable, it looks for `kerything-scanner-helper` beside the running daemon binary and then falls back to `PATH`. Installed systems should prefer the scanner daemon and keep the helper only as a compatibility fallback.
 
 ## Search Syntax
 
@@ -105,9 +167,14 @@ makepkg -si -f -c
 The package installs:
 
 - `/usr/bin/kerything`
+- `/usr/bin/kerything-cli`
+- `/usr/bin/kerythingd`
+- `/usr/bin/kerything-scannerd`
 - `/usr/bin/kerything-scanner-helper`
 - `/usr/share/applications/net.reikooters.kerything.desktop`
 - `/usr/share/polkit-1/actions/net.reikooters.kerything.policy`
+- systemd user units for `kerythingd`
+- systemd system units for `kerything-scannerd`
 - hicolor app icons
 - the GPL license
 
@@ -123,7 +190,20 @@ scripts/package-deb.sh
 
 The package is written to `dist/kerything_1.4.1_amd64.deb`. The GitHub Actions workflow in `.github/workflows/deb.yml` builds the same package inside an `ubuntu:20.04` job container and uploads it as a workflow artifact.
 
-The Debian package installs the GUI, scanner helper, desktop file, Polkit policy, hicolor icons, and license into standard system paths. This avoids the AppImage helper permission issue because Polkit authorizes `/usr/bin/kerything-scanner-helper` directly.
+The Debian package installs the GUI, CLI, user daemon, scanner daemon, compatibility scanner helper, desktop file, systemd units, Polkit policy, hicolor icons, and license into standard system paths. This avoids the AppImage helper permission issue because privileged components live under `/usr/bin`.
+
+The package creates a system group named `kerything` for the privileged scanner socket. Users who should connect to the scanner daemon can be added to that group by the system administrator. Polkit authorization is still required by default.
+
+An optional passwordless Polkit rule can be installed by administrators, but it is not shipped by default:
+
+```js
+polkit.addRule(function(action, subject) {
+    if (action.id == "net.reikooters.kerything.connect-scanner" &&
+        subject.isInGroup("kerything")) {
+        return polkit.Result.YES;
+    }
+});
+```
 
 ## Current Scanner Status
 
@@ -145,9 +225,10 @@ V2-basic does not recurse into additional subvolumes or snapshots. Those entries
 
 - The GUI must not run as root.
 - Helper stdout must contain only binary scan data.
-- Path/device validation in the helper is security-sensitive.
+- Scanner daemon responses use framed IPC; only the final scan response carries binary `ScanStreamV1`.
+- Path/device validation in the helper and scanner daemon is security-sensitive.
 - Old C++ snapshots are intentionally ignored.
-- Live fanotify updates, background daemon indexing, D-Bus APIs, full Btrfs subvolume traversal, regex search, OR/negation query syntax, and rich drag-out/file-URI clipboard support are outside the V2-basic guarantee.
+- Live fanotify updates, native rofi plugin ABI support, D-Bus APIs, full Btrfs subvolume traversal, regex search, OR/negation query syntax, and rich drag-out/file-URI clipboard support are outside the V3 guarantee.
 
 ## License
 

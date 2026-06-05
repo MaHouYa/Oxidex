@@ -63,7 +63,7 @@ pub struct SearchIndex {
     pub order_by_mtime: Vec<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SearchHit {
     pub device_id: String,
     pub record_idx: u32,
@@ -77,14 +77,15 @@ impl PartialEq for SearchHit {
 
 impl Eq for SearchHit {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchFileType {
     File,
     Dir,
     Symlink,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct SearchFilters {
     pub extensions: Vec<String>,
     pub file_type: Option<SearchFileType>,
@@ -125,14 +126,15 @@ impl SearchFilters {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchTerm {
     Contains(String),
     Phrase(String),
     Wildcard(String),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct SearchRequest {
     pub terms: Vec<SearchTerm>,
     pub filters: SearchFilters,

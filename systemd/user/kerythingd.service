@@ -1,0 +1,8 @@
+[Unit]
+Description=Kerything user search daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kerythingd --foreground
+Restart=on-failure
+RestartSec=2s

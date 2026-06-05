@@ -12,6 +12,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use kerything_client::KerythingClient;
+use kerything_core::config::{ThemeMode, load_config};
+use kerything_core::daemon_model::{
+    DeviceSummary, IndexSummary, SearchQueryParams, SearchResultRow,
+};
 use kerything_core::device::{DeviceInfo, list_known_devices};
 use kerything_core::index::{
     SearchFileType, SearchFilters, SearchHit, SearchIndex, SearchRequest, merge_search_request,
@@ -22,18 +27,28 @@ use kerything_core::snapshot;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 
 fn main() -> eframe::Result {
+    let standalone = std::env::args().any(|arg| arg == "--standalone");
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("net.reikooters.kerything")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([820.0, 520.0]),
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
     eframe::run_native(
         "Kerything",
         native_options,
-        Box::new(|_cc| Ok(Box::new(KerythingApp::new()))),
+        Box::new(move |cc| {
+            if standalone {
+                return Ok(Box::new(KerythingApp::new(cc)) as Box<dyn eframe::App>);
+            }
+            match DaemonGuiApp::new(cc) {
+                Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
+                Err(err) => Ok(Box::new(ServiceErrorApp::new(err)) as Box<dyn eframe::App>),
+            }
+        }),
     )
 }
 
@@ -76,9 +91,588 @@ enum AppEvent {
     },
 }
 
+struct DaemonGuiApp {
+    client: Option<KerythingClient>,
+    query: String,
+    rows: Vec<SearchResultRow>,
+    devices: Vec<DeviceSummary>,
+    indexes: Vec<IndexSummary>,
+    selected_hit: Option<SearchHit>,
+    sort_key: SortKey,
+    sort_direction: SortDirection,
+    status: String,
+    show_index_manager: bool,
+    show_settings: bool,
+    theme: ThemeMode,
+}
+
+impl DaemonGuiApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
+        let mut client = connect_or_start_daemon()?;
+        let config = client.config_get().ok();
+        let theme = config
+            .as_ref()
+            .map(|config| config.config.ui.theme)
+            .unwrap_or(ThemeMode::System);
+        apply_theme(&cc.egui_ctx, theme);
+
+        let sort_key = config
+            .as_ref()
+            .map(|config| config.config.search.default_sort)
+            .unwrap_or(SortKey::Name);
+        let sort_direction = config
+            .as_ref()
+            .map(|config| config.config.search.default_direction)
+            .unwrap_or(SortDirection::Asc);
+        let devices = client.devices().unwrap_or_default();
+        let indexes = client.indexes().unwrap_or_default();
+        let mut app = Self {
+            client: Some(client),
+            query: String::new(),
+            rows: Vec::new(),
+            devices,
+            indexes,
+            selected_hit: None,
+            sort_key,
+            sort_direction,
+            status: "Connected to kerythingd.".into(),
+            show_index_manager: false,
+            show_settings: false,
+            theme,
+        };
+        app.recompute_rows();
+        Ok(app)
+    }
+
+    fn recompute_rows(&mut self) {
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        let previous = self.selected_hit.clone();
+        let result = client.search(&SearchQueryParams {
+            query: self.query.clone(),
+            request: None,
+            device_filter: None,
+            sort_key: self.sort_key,
+            sort_direction: self.sort_direction,
+            max_results: None,
+        });
+        match result {
+            Ok(result) => {
+                let count = result.rows.len();
+                let truncated = result.truncated;
+                self.rows = result.rows;
+                self.selected_hit =
+                    previous.filter(|hit| self.rows.iter().any(|row| row.hit == *hit));
+                self.status = if truncated {
+                    format!("Showing first {count} results.")
+                } else {
+                    format!("{count} result{}.", plural(count))
+                };
+            }
+            Err(err) => self.status = format!("Search failed: {err:#}"),
+        }
+    }
+
+    fn refresh_lists(&mut self) {
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        match (client.devices(), client.indexes()) {
+            (Ok(devices), Ok(indexes)) => {
+                self.devices = devices;
+                self.indexes = indexes;
+                self.status = "Refreshed devices and indexes.".into();
+            }
+            (Err(err), _) | (_, Err(err)) => self.status = format!("Refresh failed: {err:#}"),
+        }
+    }
+
+    fn selected_row(&self) -> Option<&SearchResultRow> {
+        let hit = self.selected_hit.as_ref()?;
+        self.rows.iter().find(|row| &row.hit == hit)
+    }
+
+    fn open_selected(&mut self) {
+        let Some(row) = self.selected_row().cloned() else {
+            self.status = "No result selected.".into();
+            return;
+        };
+        let Some(client) = self.client.as_mut() else {
+            self.status = "Daemon client is unavailable.".into();
+            return;
+        };
+        match client.resolve_path(&row.hit.device_id, row.hit.record_idx) {
+            Ok(path) if path.mounted => match open::that(&path.path) {
+                Ok(()) => self.status = format!("Opened {}", path.path),
+                Err(err) => self.status = format!("Failed to open {}: {err}", path.path),
+            },
+            Ok(_) => self.status = "This item is indexed, but its device is not mounted.".into(),
+            Err(err) => self.status = format!("Failed to resolve path: {err:#}"),
+        }
+    }
+
+    fn open_selected_location(&mut self) {
+        let Some(row) = self.selected_row().cloned() else {
+            self.status = "No result selected.".into();
+            return;
+        };
+        let Some(client) = self.client.as_mut() else {
+            self.status = "Daemon client is unavailable.".into();
+            return;
+        };
+        match client.resolve_path(&row.hit.device_id, row.hit.record_idx) {
+            Ok(path) if path.mounted => {
+                let target = if row.is_dir {
+                    PathBuf::from(&path.path)
+                } else {
+                    PathBuf::from(&path.path)
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(&path.path))
+                };
+                match open::that(&target) {
+                    Ok(()) => self.status = format!("Opened {}", target.display()),
+                    Err(err) => self.status = format!("Failed to open {}: {err}", target.display()),
+                }
+            }
+            Ok(_) => self.status = "This item is indexed, but its device is not mounted.".into(),
+            Err(err) => self.status = format!("Failed to resolve path: {err:#}"),
+        }
+    }
+
+    fn copy_selected_name(&mut self, ctx: &egui::Context) {
+        let Some(row) = self.selected_row() else {
+            self.status = "No result selected.".into();
+            return;
+        };
+        ctx.copy_text(row.name.clone());
+        self.status = "Copied file name.".into();
+    }
+
+    fn copy_selected_path(&mut self, ctx: &egui::Context) {
+        let Some(row) = self.selected_row() else {
+            self.status = "No result selected.".into();
+            return;
+        };
+        ctx.copy_text(row.display_path.clone());
+        self.status = "Copied full path.".into();
+    }
+
+    fn scan_device(&mut self, device_id: String) {
+        let Some(client) = self.client.as_mut() else {
+            self.status = "Daemon client is unavailable.".into();
+            return;
+        };
+        self.status = format!("Indexing {device_id}...");
+        match client.start_scan(&device_id) {
+            Ok(result) => {
+                self.status = format!(
+                    "Indexed {} with {} entries.",
+                    result.summary.device_id, result.summary.entry_count
+                );
+                self.refresh_lists();
+                self.recompute_rows();
+            }
+            Err(err) => self.status = format!("Indexing failed for {device_id}: {err:#}"),
+        }
+    }
+
+    fn forget_index(&mut self, device_id: String) {
+        let Some(client) = self.client.as_mut() else {
+            self.status = "Daemon client is unavailable.".into();
+            return;
+        };
+        match client.forget_index(&device_id) {
+            Ok(indexes) => {
+                self.indexes = indexes;
+                self.rows.retain(|row| row.hit.device_id != device_id);
+                if self
+                    .selected_hit
+                    .as_ref()
+                    .map(|hit| hit.device_id == device_id)
+                    .unwrap_or(false)
+                {
+                    self.selected_hit = None;
+                }
+                self.status = format!("Forgot {device_id}.");
+            }
+            Err(err) => self.status = format!("Failed to forget {device_id}: {err:#}"),
+        }
+    }
+
+    fn apply_theme_setting(&mut self, ctx: &egui::Context, theme: ThemeMode) {
+        let Some(client) = self.client.as_mut() else {
+            self.status = "Daemon client is unavailable.".into();
+            return;
+        };
+        let value = match theme {
+            ThemeMode::System => "system",
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        };
+        match client.config_set("ui.theme", serde_json::Value::String(value.into())) {
+            Ok(_) => {
+                self.theme = theme;
+                apply_theme(ctx, theme);
+                self.status = format!("Theme set to {value}.");
+            }
+            Err(err) => self.status = format!("Failed to update theme: {err:#}"),
+        }
+    }
+}
+
+impl eframe::App for DaemonGuiApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
+            self.open_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.egui_wants_keyboard_input() {
+            self.selected_hit = None;
+            self.show_settings = false;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
+            && !ctx.egui_wants_keyboard_input()
+        {
+            if ctx.input(|i| i.modifiers.shift) {
+                self.copy_selected_name(&ctx);
+            } else {
+                self.copy_selected_path(&ctx);
+            }
+        }
+
+        egui::Panel::top("daemon-top").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Refresh").clicked() {
+                    self.refresh_lists();
+                    self.recompute_rows();
+                }
+                if ui.button("Indexes").clicked() {
+                    self.show_index_manager = true;
+                    self.refresh_lists();
+                }
+                if ui.button("Settings").clicked() {
+                    self.show_settings = true;
+                }
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.query)
+                        .hint_text("Search files, e.g. *.rs ext:txt path:src type:dir")
+                        .desired_width(f32::INFINITY),
+                );
+                if response.changed() {
+                    self.recompute_rows();
+                }
+            });
+        });
+
+        egui::Panel::bottom("daemon-status").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} object{} found",
+                    self.rows.len(),
+                    plural(self.rows.len())
+                ));
+                ui.separator();
+                ui.label(&self.status);
+            });
+        });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            self.daemon_toolbar(ui, &ctx);
+            ui.separator();
+            self.daemon_results(ui, &ctx);
+        });
+
+        if self.show_index_manager {
+            self.daemon_index_manager(&ctx);
+        }
+        if self.show_settings {
+            self.daemon_settings(&ctx);
+        }
+    }
+}
+
+impl DaemonGuiApp {
+    fn daemon_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let has_selection = self.selected_row().is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Open"))
+                .clicked()
+            {
+                self.open_selected();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Open Folder"))
+                .clicked()
+            {
+                self.open_selected_location();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copy Name"))
+                .clicked()
+            {
+                self.copy_selected_name(ctx);
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copy Path"))
+                .clicked()
+            {
+                self.copy_selected_path(ctx);
+            }
+            ui.separator();
+            let mut sort_changed = false;
+            sort_changed |= sort_button(
+                ui,
+                &mut self.sort_key,
+                &mut self.sort_direction,
+                SortKey::Name,
+                "Name",
+            );
+            sort_changed |= sort_button(
+                ui,
+                &mut self.sort_key,
+                &mut self.sort_direction,
+                SortKey::Path,
+                "Path",
+            );
+            sort_changed |= sort_button(
+                ui,
+                &mut self.sort_key,
+                &mut self.sort_direction,
+                SortKey::Size,
+                "Size",
+            );
+            sort_changed |= sort_button(
+                ui,
+                &mut self.sort_key,
+                &mut self.sort_direction,
+                SortKey::Mtime,
+                "Date",
+            );
+            if sort_changed {
+                self.recompute_rows();
+            }
+        });
+    }
+
+    fn daemon_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.indexes.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("No indexes yet");
+                ui.label("Open Indexes to index an NTFS, EXT4, or Btrfs device.");
+            });
+            return;
+        }
+        if self.rows.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("No results");
+                ui.label("Try a different name, wildcard, extension, path, or type filter.");
+            });
+            return;
+        }
+
+        let row_height = 24.0;
+        TableBuilder::new(ui)
+            .id_salt("daemon-results")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(260.0).at_least(120.0).clip(true))
+            .column(Column::remainder().at_least(220.0).clip(true))
+            .column(Column::initial(110.0).at_least(80.0).clip(true))
+            .column(Column::initial(150.0).at_least(120.0).clip(true))
+            .header(row_height, |mut row| {
+                row.col(|ui| {
+                    ui.strong("Name");
+                });
+                row.col(|ui| {
+                    ui.strong("Path");
+                });
+                row.col(|ui| {
+                    ui.strong("Size");
+                });
+                row.col(|ui| {
+                    ui.strong("Modified");
+                });
+            })
+            .body(|body| {
+                body.rows(row_height, self.rows.len(), |mut row| {
+                    let row_index = row.index();
+                    let Some(result) = self.rows.get(row_index).cloned() else {
+                        return;
+                    };
+                    let selected = self.selected_hit.as_ref() == Some(&result.hit);
+                    row.set_selected(selected);
+                    row.col(|ui| {
+                        ui.label(&result.name);
+                    });
+                    row.col(|ui| {
+                        ui.label(&result.display_path);
+                    });
+                    row.col(|ui| {
+                        ui.label(format_size(result.size));
+                    });
+                    row.col(|ui| {
+                        ui.label(format_time(result.mtime));
+                    });
+
+                    let response = row.response();
+                    if response.secondary_clicked() {
+                        self.selected_hit = Some(result.hit.clone());
+                    }
+                    response.clone().context_menu(|ui| {
+                        self.selected_hit = Some(result.hit.clone());
+                        if ui.button("Open").clicked() {
+                            self.open_selected();
+                            ui.close();
+                        }
+                        if ui.button("Open Folder").clicked() {
+                            self.open_selected_location();
+                            ui.close();
+                        }
+                        if ui.button("Copy Name").clicked() {
+                            self.copy_selected_name(ctx);
+                            ui.close();
+                        }
+                        if ui.button("Copy Path").clicked() {
+                            self.copy_selected_path(ctx);
+                            ui.close();
+                        }
+                    });
+                    if response.double_clicked() {
+                        self.selected_hit = Some(result.hit);
+                        self.open_selected();
+                    } else if response.clicked() {
+                        self.selected_hit = Some(result.hit);
+                    }
+                });
+            });
+    }
+
+    fn daemon_index_manager(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_index_manager;
+        egui::Window::new("Indexes")
+            .open(&mut open)
+            .default_width(980.0)
+            .show(ctx, |ui| {
+                if ui.button("Refresh Devices").clicked() {
+                    self.refresh_lists();
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(460.0)
+                    .show(ui, |ui| {
+                        for device in self.devices.clone() {
+                            let indexed_count = self
+                                .indexes
+                                .iter()
+                                .find(|index| index.device_id == device.device_id)
+                                .map(|index| index.entry_count);
+                            ui.horizontal(|ui| {
+                                ui.label(fit(&device_summary_label(&device), 30));
+                                ui.label(fit(device.fs_type.as_str(), 7));
+                                ui.label(if device.mounted {
+                                    "mounted"
+                                } else {
+                                    "not mounted"
+                                });
+                                ui.label(fit(&device.dev_node, 22));
+                                ui.label(
+                                    indexed_count
+                                        .map(|count| format!("{count} entries"))
+                                        .unwrap_or_else(|| "not indexed".into()),
+                                );
+                                let label = if indexed_count.is_some() {
+                                    "Rescan"
+                                } else {
+                                    "Index"
+                                };
+                                if ui.button(label).clicked() {
+                                    self.scan_device(device.device_id.clone());
+                                }
+                                if indexed_count.is_some() && ui.button("Forget").clicked() {
+                                    self.forget_index(device.device_id.clone());
+                                }
+                            });
+                            ui.separator();
+                        }
+                    });
+            });
+        self.show_index_manager = open;
+    }
+
+    fn daemon_settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.heading("Appearance");
+                ui.horizontal(|ui| {
+                    ui.label("Theme");
+                    let mut next_theme = self.theme;
+                    egui::ComboBox::from_id_salt("daemon-theme")
+                        .selected_text(theme_label(self.theme))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut next_theme, ThemeMode::System, "System");
+                            ui.selectable_value(&mut next_theme, ThemeMode::Light, "Light");
+                            ui.selectable_value(&mut next_theme, ThemeMode::Dark, "Dark");
+                        });
+                    if next_theme != self.theme {
+                        self.apply_theme_setting(ctx, next_theme);
+                    }
+                });
+                ui.separator();
+                ui.heading("Advanced");
+                if let Some(client) = self.client.as_mut()
+                    && ui.button("Show Config Path").clicked()
+                {
+                    match client.config_get() {
+                        Ok(config) => self.status = config.path,
+                        Err(err) => self.status = format!("Failed to read config: {err:#}"),
+                    }
+                }
+            });
+        self.show_settings = open;
+    }
+}
+
+struct ServiceErrorApp {
+    message: String,
+}
+
+impl ServiceErrorApp {
+    fn new(err: anyhow::Error) -> Self {
+        Self {
+            message: format!(
+                "Could not connect to kerythingd: {err:#}\n\nRun kerything --standalone for the in-process fallback, or start kerythingd --foreground."
+            ),
+        }
+    }
+}
+
+impl eframe::App for ServiceErrorApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(72.0);
+                ui.heading("Kerything service is unavailable");
+                ui.label(&self.message);
+            });
+        });
+    }
+}
+
 impl KerythingApp {
-    fn new() -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let config = load_config().unwrap_or_default();
+        apply_theme(&cc.egui_ctx, config.ui.theme);
         let devices = list_known_devices().unwrap_or_default();
         let indexes = snapshot::load_all_indexes().unwrap_or_default();
         let mut app = Self {
@@ -94,7 +688,7 @@ impl KerythingApp {
             sort_key: SortKey::Name,
             sort_direction: SortDirection::Asc,
             status: String::new(),
-            show_filters: false,
+            show_filters: config.ui.show_filter_panel,
             show_index_manager: false,
             properties_hit: None,
             last_scan_errors: HashMap::new(),
@@ -996,6 +1590,45 @@ fn scan_device_with_helper(
     }
 }
 
+fn connect_or_start_daemon() -> anyhow::Result<KerythingClient> {
+    match KerythingClient::connect_default() {
+        Ok(client) => Ok(client),
+        Err(first_err) => {
+            start_daemon_once()?;
+            for _ in 0..20 {
+                if let Ok(client) = KerythingClient::connect_default() {
+                    return Ok(client);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::bail!("failed to connect after attempting to start kerythingd: {first_err:#}")
+        }
+    }
+}
+
+fn start_daemon_once() -> anyhow::Result<()> {
+    Command::new(sibling_binary("kerythingd"))
+        .arg("--foreground")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+fn sibling_binary(name: &str) -> PathBuf {
+    let Ok(exe) = std::env::current_exe() else {
+        return PathBuf::from(name);
+    };
+    if let Some(dir) = exe.parent() {
+        let sibling = dir.join(name);
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+    PathBuf::from(name)
+}
+
 fn helper_path() -> PathBuf {
     let Ok(exe) = std::env::current_exe() else {
         return PathBuf::from("kerything-scanner-helper");
@@ -1018,6 +1651,14 @@ fn mounted_path(index: &SearchIndex, rec_idx: u32, device: &DeviceInfo) -> PathB
     path
 }
 
+fn apply_theme(ctx: &egui::Context, theme: ThemeMode) {
+    match theme {
+        ThemeMode::System => {}
+        ThemeMode::Light => ctx.set_visuals(egui::Visuals::light()),
+        ThemeMode::Dark => ctx.set_visuals(egui::Visuals::dark()),
+    }
+}
+
 fn scope_label(scope: &str, indexes: &[SearchIndex]) -> String {
     if scope.is_empty() {
         return "All indexed devices".into();
@@ -1034,6 +1675,22 @@ fn device_label(meta: &DeviceMetadata) -> String {
         format!("{} ({})", meta.label.trim(), meta.device_id)
     } else {
         meta.device_id.clone()
+    }
+}
+
+fn device_summary_label(device: &DeviceSummary) -> String {
+    if !device.label.trim().is_empty() {
+        format!("{} ({})", device.label.trim(), device.device_id)
+    } else {
+        device.device_id.clone()
+    }
+}
+
+fn theme_label(theme: ThemeMode) -> &'static str {
+    match theme {
+        ThemeMode::System => "System",
+        ThemeMode::Light => "Light",
+        ThemeMode::Dark => "Dark",
     }
 }
 

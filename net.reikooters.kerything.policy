@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE policyconfig PUBLIC
- "-//dsit//DTD PolicyKit Policy Configuration 1.0//EN"
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
 
@@ -14,9 +14,20 @@
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin</allow_active>
+      <allow_active>auth_admin_keep</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/kerything-scanner-helper</annotate>
+  </action>
+
+  <action id="net.reikooters.kerything.connect-scanner">
+    <description>Use the Kerything scanner service</description>
+    <message>Authentication is required to allow Kerything to scan raw block-device metadata.</message>
+    <icon_name>kerything</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
   </action>
 
 </policyconfig>

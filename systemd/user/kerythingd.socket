@@ -1,0 +1,10 @@
+[Unit]
+Description=Kerything user search daemon socket
+
+[Socket]
+ListenStream=%t/kerything/kerythingd.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

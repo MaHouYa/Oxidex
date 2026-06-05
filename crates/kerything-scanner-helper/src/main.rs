@@ -1,12 +1,10 @@
 use std::env;
-use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use kerything_core::model::FsType;
+use kerything_core::scanner::validate_device_path;
 
 fn main() {
     if let Err(err) = run() {
@@ -50,33 +48,6 @@ fn print_usage(argv0: &str) {
     eprintln!(
         "Usage:\n  {argv0} --version\n  {argv0} <devicePath> <fsType>\nWhere:\n  <devicePath> is a block device path under /dev\n  <fsType> is one of: ntfs, ext4, btrfs"
     );
-}
-
-fn validate_device_path(input: &str) -> anyhow::Result<PathBuf> {
-    anyhow::ensure!(!input.is_empty(), "empty device path");
-    let path = Path::new(input);
-    anyhow::ensure!(path.is_absolute(), "device path must be absolute");
-    anyhow::ensure!(input.starts_with("/dev/"), "device path must be under /dev");
-
-    let resolved = fs::canonicalize(path)?;
-    let resolved_string = resolved.to_string_lossy();
-    anyhow::ensure!(
-        resolved_string.starts_with("/dev/"),
-        "resolved device path must remain under /dev"
-    );
-
-    let meta = fs::metadata(&resolved)?;
-    anyhow::ensure!(
-        meta.file_type().is_block_device(),
-        "{} is not a block device",
-        resolved.display()
-    );
-    anyhow::ensure!(
-        meta.permissions().mode() & 0o002 == 0,
-        "refusing world-writable device node {}",
-        resolved.display()
-    );
-    Ok(resolved)
 }
 
 struct ProgressReporter {

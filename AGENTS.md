@@ -2,21 +2,27 @@
 
 ## Project Structure & Module Organization
 
-Kerything is currently a Rust 2024 Cargo workspace that rewrites the old Qt/KDE application as a Linux desktop filename search tool. The workspace contains three active crates:
+Kerything is currently a Rust 2024 Cargo workspace that rewrites the old Qt/KDE application as a Linux desktop filename search tool. The workspace contains these active crates:
 
-- `crates/kerything`: the unprivileged `eframe`/`egui` GUI.
-- `crates/kerything-scanner-helper`: the privileged scanner CLI launched through `pkexec`.
+- `crates/kerything`: the unprivileged `eframe`/`egui` GUI. Default launch connects to `kerythingd`; `--standalone` keeps the in-process fallback.
+- `crates/kerything-client`: shared Unix-socket client library for GUI and CLI frontends.
 - `crates/kerything-core`: shared device discovery, scan streams, snapshots, indexing/search, path reconstruction, and scanner backends.
+- `crates/kerything-daemon`: `kerythingd`, the unprivileged per-user daemon that owns config, loaded indexes, search, scan requests, and snapshot persistence.
+- `crates/kerything-scannerd`: `kerything-scannerd`, the privileged scanner daemon that owns raw `/dev/...` scans only.
+- `crates/kerything-cli`: CLI and rofi/script integration client.
+- `crates/kerything-scanner-helper`: compatibility privileged scanner CLI launched through `pkexec`.
 
-The GUI persists indexes under `$XDG_DATA_HOME/kerything/indexes/`. Runtime metadata formats live in `crates/kerything-core/src/stream.rs` and `crates/kerything-core/src/snapshot.rs`; search/index logic is in `crates/kerything-core/src/index.rs`; scanner backends are in `crates/kerything-core/src/scanner/`.
+`kerythingd` persists indexes under `$XDG_DATA_HOME/kerything/indexes/` and config under `$XDG_CONFIG_HOME/kerything/config.toml`. Runtime metadata formats live in `crates/kerything-core/src/stream.rs` and `crates/kerything-core/src/snapshot.rs`; search/index logic is in `crates/kerything-core/src/index.rs`; config and include/exclude rules are in `crates/kerything-core/src/config.rs` and `crates/kerything-core/src/rules.rs`; scanner backends are in `crates/kerything-core/src/scanner/`.
 
-Legacy C++/Qt/KDE directories and files may still be present in the tree for history or transition, but the active build is Rust/Cargo. Do not reintroduce Qt6, KDE Frameworks, KIO, Solid, D-Bus daemon activation, systemd daemon activation, libblkid, or e2fsprogs/libext2fs runtime dependencies unless explicitly approved.
+Legacy C++/Qt/KDE directories and files may still be present in the tree for history or transition, but the active build is Rust/Cargo. Do not reintroduce Qt6, KDE Frameworks, KIO, Solid, D-Bus APIs/activation, libblkid, e2fsprogs/libext2fs runtime dependencies, `libbtrfs` bindings, or `wgpu` as a default renderer unless explicitly approved.
 
 Packaging and desktop integration files live at the repository root and under `scripts/` and `.github/`:
 
 - `PKGBUILD`: Arch package build.
 - `net.reikooters.kerything.desktop`: desktop entry.
-- `net.reikooters.kerything.policy`: Polkit policy for the scanner helper.
+- `net.reikooters.kerything.policy`: Polkit policy for the compatibility helper and scanner-daemon connection authorization.
+- `systemd/user/`: user service/socket units for `kerythingd`.
+- `systemd/system/`: system service/socket units for `kerything-scannerd`.
 - `scripts/package-deb.sh`: local Debian package build.
 - `scripts/ci/build-deb-ubuntu20.04.sh`: Ubuntu 20.04 package build script.
 - `.github/workflows/deb.yml`: GitHub Actions Debian package workflow.
@@ -33,6 +39,28 @@ Run the GUI from the build tree:
 
 ```bash
 cargo run --release -p kerything
+```
+
+Run the standalone fallback from the build tree:
+
+```bash
+cargo run --release -p kerything -- --standalone
+```
+
+Run the daemons in foreground development mode:
+
+```bash
+scripts/dev-install-polkit.sh
+cargo run --release -p kerything-daemon -- --foreground
+sudo target/release/kerything-scannerd --foreground
+```
+
+For manual scanner-daemon testing, install the Polkit action first or expect `Action net.reikooters.kerything.connect-scanner is not registered`. The user running `kerythingd` must also be able to connect to `/run/kerything/scannerd.sock` before Polkit can authorize the session. The foreground scanner daemon attempts to create the socket as `root:kerything` with mode `0660`; make sure the `kerything` group exists and the test user is in that group, or expect `Permission denied (os error 13)`.
+
+Run the CLI:
+
+```bash
+cargo run --release -p kerything-cli -- search "ext:rs path:src main"
 ```
 
 Run the scanner helper directly:
@@ -70,19 +98,25 @@ Use idiomatic Rust and keep formatting under `cargo fmt`. Prefer small, explicit
 
 Prefer Rust-native crates and standard library facilities. Avoid dynamic C library bindings for filesystem scanners unless the user explicitly approves that tradeoff. The EXT4 scanner currently uses the patched Rust `ext4` crate from `vendor/ext4`; NTFS uses the Rust `ntfs` crate. Btrfs V2-basic uses `btrfs-fs`/`btrfs-disk` for default-root raw metadata scanning and must not become a mounted-path crawler.
 
+The GUI should use `eframe`/`egui` with the `glow` renderer by default. Do not add `wgpu` to default features without explicit approval.
+
 Keep helper stdout reserved for binary scan data. Progress and diagnostics belong on stderr, with progress lines formatted as:
 
 ```text
 KERYTHING_PROGRESS <0-100>
 ```
 
+`kerything-scannerd` uses framed Unix-socket IPC instead: progress is a structured event and the final `scanner.start_scan` response carries binary `ScanStreamV1` as the frame payload.
+
 ## Testing Guidelines
 
-For GUI changes, manually verify search, device filtering, row selection, sorting, open/open-folder actions, copy-name/copy-path actions, progress display, cancellation, and snapshot reload after restart.
+For GUI changes, manually verify daemon connection, standalone fallback, search, device filtering, row selection, sorting, open/open-folder actions, copy-name/copy-path actions, progress display, cancellation/error display, and snapshot reload after restart.
 
 For search or snapshot changes, run unit tests and check path reconstruction, Unicode names, hard links, short-token fallback, trigram matching, wildcard matching, extension/type/path filters, deterministic sorting, multi-device merging, corruption rejection, and version mismatch behavior.
 
 For scanner changes, validate both mounted and unmounted devices when possible. NTFS should scan MFT metadata and preserve hard-link names. EXT4 should read filesystem metadata, inode metadata, and directory-entry blocks; it must not scan regular file contents or do whole-disk byte-by-byte discovery. Btrfs V2-basic scans only the default/main root, treats other subvolumes as boundaries, and rejects unsupported multi-device layouts clearly.
+
+When changing daemon/client/IPC code, verify `kerythingd --foreground`, `kerything-cli devices`, `kerything-cli indexes`, `kerything-cli search`, and scanner authorization/error handling. `kerything-scannerd` should accept only scanner protocol methods, validate every scan request, and never expose arbitrary block reads.
 
 When changing packaging, validate at least:
 
@@ -97,7 +131,7 @@ If Docker is available, the workflow can be tested through the same `ubuntu:20.0
 
 ## Debian Package Notes
 
-The Debian package installs `kerything`, `kerything-scanner-helper`, the desktop file, hicolor icons, license, and `net.reikooters.kerything.policy` into standard system paths. This is the preferred portable packaging path because Polkit authorizes `/usr/bin/kerything-scanner-helper` directly.
+The Debian package installs `kerything`, `kerything-cli`, `kerythingd`, `kerything-scannerd`, `kerything-scanner-helper`, the desktop file, hicolor icons, license, systemd units, and `net.reikooters.kerything.policy` into standard system paths. It creates a `kerything` system group for the scanner daemon socket. This is the preferred portable packaging path because privileged components live under `/usr/bin`.
 
 ## Commit & Pull Request Guidelines
 
@@ -105,6 +139,6 @@ Use concise, descriptive commit summaries that state the user-visible or technic
 
 ## Security & Configuration Tips
 
-Raw block-device access is privileged. Keep validation in `crates/kerything-scanner-helper/src/main.rs` strict: reject empty paths, non-absolute paths, non-`/dev` paths, non-existent paths, non-block devices, world-writable device nodes, and unsupported filesystem types. Resolve symlinks before scanning.
+Raw block-device access is privileged. Keep validation in `crates/kerything-core/src/scanner/mod.rs` strict because it is shared by the helper and scanner daemon: reject empty paths, non-absolute paths, non-`/dev` paths, non-existent paths, non-block devices, world-writable device nodes, and unsupported filesystem types. Resolve symlinks before scanning.
 
-Treat Polkit policy changes as security-sensitive. The GUI must remain unprivileged; only the helper should run with elevated privileges. Avoid logging sensitive full paths unless needed for a clear diagnostic.
+Treat Polkit policy changes as security-sensitive. The GUI and `kerythingd` must remain unprivileged; only `kerything-scannerd` and the compatibility helper should run with elevated privileges. Scanner authorization is per socket connection/session through `net.reikooters.kerything.connect-scanner`; the helper compatibility action is `net.reikooters.kerything.run-scanner`. Avoid logging sensitive full paths unless needed for a clear diagnostic.

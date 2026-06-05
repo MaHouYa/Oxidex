@@ -1,6 +1,10 @@
+pub mod config;
+pub mod daemon_model;
 pub mod device;
 pub mod index;
+pub mod ipc;
 pub mod model;
+pub mod rules;
 pub mod scanner;
 pub mod snapshot;
 pub mod stream;

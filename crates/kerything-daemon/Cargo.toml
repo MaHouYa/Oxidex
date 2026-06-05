@@ -1,22 +1,18 @@
 [package]
-name = "kerything-core"
+name = "kerything-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "kerythingd"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
-btrfs-fs.workspace = true
-byteorder.workspace = true
-ext4.workspace = true
-globset.workspace = true
-ntfs.workspace = true
-rayon.workspace = true
+kerything-core = { path = "../kerything-core" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-toml.workspace = true
 xdg.workspace = true

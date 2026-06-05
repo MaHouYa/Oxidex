@@ -1,0 +1,14 @@
+post_install() {
+  if ! getent group kerything >/dev/null 2>&1; then
+    groupadd -r kerything >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
