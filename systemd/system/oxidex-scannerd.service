@@ -1,0 +1,11 @@
+[Unit]
+Description=Oxidex privileged scanner daemon
+After=polkit.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/oxidex-scannerd --foreground
+User=root
+Group=root
+Restart=on-failure
+RestartSec=2s

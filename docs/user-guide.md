@@ -1,54 +1,56 @@
-# Kerything User Guide
+# Oxidex User Guide
 
-This guide is for people using Kerything as a desktop filename search app. It covers installation setup, indexing disks, searching, rofi/CLI usage, troubleshooting, and exporting logs for debugging.
+This guide is for people using Oxidex as a desktop filename search app. It covers installation setup, indexing disks, searching, rofi/CLI usage, troubleshooting, and exporting logs for debugging.
 
-Kerything has three main pieces:
+Oxidex has three main pieces:
 
-- `kerything`: the graphical search app.
-- `kerythingd`: your unprivileged per-user search daemon.
-- `kerything-scannerd`: the privileged scanner daemon used only when Kerything needs to read raw filesystem metadata from `/dev/...`.
+- `oxidex`: the graphical search app.
+- `oxidexd`: your unprivileged per-user search daemon.
+- `oxidex-scannerd`: the privileged scanner daemon used only when Oxidex needs to read raw filesystem metadata from `/dev/...`.
 
 The GUI and user daemon do not run as root. When a raw disk scan is needed, Polkit authorizes the scanner daemon.
 
+The app has been rebranded to Oxidex, but the current compatibility release keeps the existing `oxidex` command names, config paths, index paths, and scanner group name.
+
 ## First-Time Setup
 
-After installing Kerything from a package, make sure your user can connect to the scanner daemon socket:
+After installing Oxidex from a package, make sure your user can connect to the scanner daemon socket:
 
 ```sh
-sudo usermod -aG kerything "$USER"
+sudo usermod -aG oxidex "$USER"
 ```
 
 Then log out and log back in. For a temporary current-terminal session, you can run:
 
 ```sh
-newgrp kerything
+newgrp oxidex
 ```
 
 Check the setup:
 
 ```sh
-kerything-cli doctor
+oxidex-cli doctor
 ```
 
 You want the scanner socket, Polkit action, config, and index checks to be `OK`. A warning about the daemon not running is usually harmless before the first GUI launch.
 
-## Starting Kerything
+## Starting Oxidex
 
 Start the GUI from your desktop launcher or terminal:
 
 ```sh
-kerything
+oxidex
 ```
 
-By default the GUI connects to `kerythingd`. If the daemon is not already running, the GUI or CLI will try to start it.
+By default the GUI connects to `oxidexd`. If the daemon is not already running, the GUI or CLI will try to start it.
 
 For recovery or development, you can run the old in-process mode:
 
 ```sh
-kerything --standalone
+oxidex --standalone
 ```
 
-Standalone mode is useful if the daemon socket or service setup is broken, but normal use should go through `kerythingd`.
+Standalone mode is useful if the daemon socket or service setup is broken, but normal use should go through `oxidexd`.
 
 ## Optional Systemd Socket Activation
 
@@ -57,23 +59,23 @@ Packages install systemd socket units. Socket activation lets systemd start daem
 Enable the user daemon socket:
 
 ```sh
-systemctl --user enable --now kerythingd.socket
+systemctl --user enable --now oxidexd.socket
 ```
 
 Enable the privileged scanner socket:
 
 ```sh
-sudo systemctl enable --now kerything-scannerd.socket
+sudo systemctl enable --now oxidex-scannerd.socket
 ```
 
 Check them:
 
 ```sh
-systemctl --user status kerythingd.socket
-systemctl status kerything-scannerd.socket
+systemctl --user status oxidexd.socket
+systemctl status oxidex-scannerd.socket
 ```
 
-The GUI and CLI can also start `kerythingd` themselves if the user socket is not active. The scanner daemon should normally be reached through `/run/kerything/scannerd.sock`; if it is unavailable, Kerything may fall back to the compatibility helper.
+The GUI and CLI can also start `oxidexd` themselves if the user socket is not active. The scanner daemon should normally be reached through `/run/oxidex/scannerd.sock`; if it is unavailable, Oxidex may fall back to the compatibility helper.
 
 ## Indexing A Disk
 
@@ -103,15 +105,15 @@ To cancel a scan:
 From the CLI:
 
 ```sh
-kerything-cli devices
-kerything-cli scan partuuid:YOUR-PARTUUID --wait
-kerything-cli jobs
-kerything-cli cancel 1
+oxidex-cli devices
+oxidex-cli scan partuuid:YOUR-PARTUUID --wait
+oxidex-cli jobs
+oxidex-cli cancel 1
 ```
 
 ## Mounted Live Updates
 
-After a full raw scan, Kerything can keep mounted indexes fresher using normal Linux filename notifications.
+After a full raw scan, Oxidex can keep mounted indexes fresher using normal Linux filename notifications.
 
 This means:
 
@@ -120,7 +122,7 @@ This means:
 - Renaming files and directories can update paths.
 - Metadata changes can refresh size and modified time.
 
-This is not raw filesystem delta scanning. If a device is unmounted, changed outside Linux, or if the notification queue overflows, Kerything marks the index stale and you should rescan.
+This is not raw filesystem delta scanning. If a device is unmounted, changed outside Linux, or if the notification queue overflows, Oxidex marks the index stale and you should rescan.
 
 The default settings are:
 
@@ -178,12 +180,12 @@ Sort modes:
 - **Size**
 - **Date**
 
-Relevance is stateless. Kerything does not store open history or frecency data.
+Relevance is stateless. Oxidex does not store open history or frecency data.
 
 To see how a query is interpreted:
 
 ```sh
-kerything-cli explain 'ext:rs path:src "scan stream" !target'
+oxidex-cli explain 'ext:rs path:src "scan stream" !target'
 ```
 
 ## Result Actions
@@ -207,23 +209,23 @@ If a device is not mounted, text copy actions still work. Open actions require a
 Basic search:
 
 ```sh
-kerything-cli search "ext:rs path:src main"
-kerything-cli search --json "project"
-kerything-cli search --limit 100 --sort relevance "main !target"
+oxidex-cli search "ext:rs path:src main"
+oxidex-cli search --json "project"
+oxidex-cli search --limit 100 --sort relevance "main !target"
 ```
 
 Rofi output:
 
 ```sh
-kerything-cli rofi "main"
-kerything-cli rofi --show-id "main"
-kerything-cli rofi --full-path "main"
+oxidex-cli rofi "main"
+oxidex-cli rofi --show-id "main"
+oxidex-cli rofi --full-path "main"
 ```
 
 Simple rofi command:
 
 ```sh
-rofi -dmenu -i -p Kerything < <(kerything-cli rofi "$query")
+rofi -dmenu -i -p Oxidex < <(oxidex-cli rofi "$query")
 ```
 
 A minimal script that lets rofi choose an item and then opens it:
@@ -231,20 +233,20 @@ A minimal script that lets rofi choose an item and then opens it:
 ```sh
 #!/bin/sh
 query="${*:-}"
-selected="$(kerything-cli rofi --show-id "$query" | rofi -dmenu -i -p Kerything)"
+selected="$(oxidex-cli rofi --show-id "$query" | rofi -dmenu -i -p Oxidex)"
 [ -n "$selected" ] || exit 0
 hit="$(printf '%s\n' "$selected" | awk -F '\t' '{print $NF}')"
-kerything-cli open --hit "$hit"
+oxidex-cli open --hit "$hit"
 ```
 
 Resolve or open a known hit:
 
 ```sh
-kerything-cli resolve --hit 'partuuid:YOUR-ID:1234'
-kerything-cli resolve --json --hit 'partuuid:YOUR-ID:1234'
-kerything-cli open --hit 'partuuid:YOUR-ID:1234'
-kerything-cli open-folder --hit 'partuuid:YOUR-ID:1234'
-kerything-cli copy-path --hit 'partuuid:YOUR-ID:1234'
+oxidex-cli resolve --hit 'partuuid:YOUR-ID:1234'
+oxidex-cli resolve --json --hit 'partuuid:YOUR-ID:1234'
+oxidex-cli open --hit 'partuuid:YOUR-ID:1234'
+oxidex-cli open-folder --hit 'partuuid:YOUR-ID:1234'
+oxidex-cli copy-path --hit 'partuuid:YOUR-ID:1234'
 ```
 
 ## Configuration
@@ -252,30 +254,30 @@ kerything-cli copy-path --hit 'partuuid:YOUR-ID:1234'
 The config file is:
 
 ```text
-$XDG_CONFIG_HOME/kerything/config.toml
+$XDG_CONFIG_HOME/oxidex/config.toml
 ```
 
 Usually this expands to:
 
 ```text
-~/.config/kerything/config.toml
+~/.config/oxidex/config.toml
 ```
 
 Show the current config:
 
 ```sh
-kerything-cli config get
+oxidex-cli config get
 ```
 
 Set simple values:
 
 ```sh
-kerything-cli config set ui.theme dark
-kerything-cli config set ui.theme light
-kerything-cli config set ui.theme system
-kerything-cli config set search.default_sort relevance
-kerything-cli config set indexing.watch_mounted true
-kerything-cli config set rofi.max_results 200
+oxidex-cli config set ui.theme dark
+oxidex-cli config set ui.theme light
+oxidex-cli config set ui.theme system
+oxidex-cli config set search.default_sort relevance
+oxidex-cli config set indexing.watch_mounted true
+oxidex-cli config set rofi.max_results 200
 ```
 
 Per-device include/exclude rules are edited in `config.toml`. Example:
@@ -306,7 +308,7 @@ Rules are applied before snapshots are saved, so excluded paths are not persiste
 Start with:
 
 ```sh
-kerything-cli doctor
+oxidex-cli doctor
 ```
 
 Common problems:
@@ -322,22 +324,22 @@ permission denied connecting to scanner daemon socket
 Check:
 
 ```sh
-ls -l /run/kerything/scannerd.sock
+ls -l /run/oxidex/scannerd.sock
 id -nG
 ```
 
-The socket should normally be owned by `root:kerything` and have mode `0660`. Your user should be in the `kerything` group.
+The socket should normally be owned by `root:oxidex` and have mode `0660`. Your user should be in the `oxidex` group.
 
 Fix:
 
 ```sh
-sudo usermod -aG kerything "$USER"
+sudo usermod -aG oxidex "$USER"
 ```
 
 Then log out and log back in, or run:
 
 ```sh
-newgrp kerything
+newgrp oxidex
 ```
 
 ### Polkit Action Is Not Registered
@@ -345,20 +347,20 @@ newgrp kerything
 Symptoms:
 
 ```text
-Action net.reikooters.kerything.connect-scanner is not registered
+Action org.mahouya.oxidex.connect-scanner is not registered
 ```
 
 Check:
 
 ```sh
-pkaction | grep kerything
+pkaction | grep oxidex
 ```
 
 You should see:
 
 ```text
-net.reikooters.kerything.connect-scanner
-net.reikooters.kerything.run-scanner
+org.mahouya.oxidex.connect-scanner
+org.mahouya.oxidex.run-scanner
 ```
 
 If you are running from the source tree for development, install the local Polkit policy:
@@ -370,7 +372,7 @@ scripts/dev-install-polkit.sh
 If you installed a package, reinstall the package or verify that this file exists:
 
 ```text
-/usr/share/polkit-1/actions/net.reikooters.kerything.policy
+/usr/share/polkit-1/actions/org.mahouya.oxidex.policy
 ```
 
 ### Polkit Prompt Does Not Appear
@@ -381,7 +383,7 @@ You can test Polkit manually:
 
 ```sh
 pkcheck \
-  --action-id net.reikooters.kerything.connect-scanner \
+  --action-id org.mahouya.oxidex.connect-scanner \
   --process $$ \
   --allow-user-interaction
 ```
@@ -391,16 +393,16 @@ pkcheck \
 Try:
 
 ```sh
-kerything-cli indexes
-kerything-cli devices
-kerything-cli jobs
-kerything-cli doctor
+oxidex-cli indexes
+oxidex-cli devices
+oxidex-cli jobs
+oxidex-cli doctor
 ```
 
 Then rescan the affected device:
 
 ```sh
-kerything-cli scan partuuid:YOUR-PARTUUID --wait
+oxidex-cli scan partuuid:YOUR-PARTUUID --wait
 ```
 
 If a mounted live update overflow happened, the index may be marked stale until a full rescan completes.
@@ -420,28 +422,28 @@ When reporting a bug, include a log bundle if possible. Logs may contain file pa
 This command creates a compressed debug bundle in `/tmp`:
 
 ```sh
-bundle="/tmp/kerything-debug-$(date +%Y%m%d-%H%M%S)"
+bundle="/tmp/oxidex-debug-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$bundle"
 
-kerything-cli doctor --json > "$bundle/doctor.json" 2> "$bundle/doctor.stderr" || true
-kerything-cli devices > "$bundle/devices.txt" 2> "$bundle/devices.stderr" || true
-kerything-cli indexes > "$bundle/indexes.txt" 2> "$bundle/indexes.stderr" || true
-kerything-cli jobs > "$bundle/jobs.txt" 2> "$bundle/jobs.stderr" || true
-kerything-cli config get > "$bundle/config.toml" 2> "$bundle/config.stderr" || true
+oxidex-cli doctor --json > "$bundle/doctor.json" 2> "$bundle/doctor.stderr" || true
+oxidex-cli devices > "$bundle/devices.txt" 2> "$bundle/devices.stderr" || true
+oxidex-cli indexes > "$bundle/indexes.txt" 2> "$bundle/indexes.stderr" || true
+oxidex-cli jobs > "$bundle/jobs.txt" 2> "$bundle/jobs.stderr" || true
+oxidex-cli config get > "$bundle/config.toml" 2> "$bundle/config.stderr" || true
 
-systemctl --user status kerythingd.service > "$bundle/kerythingd-user-status.txt" 2>&1 || true
-systemctl --user status kerythingd.socket > "$bundle/kerythingd-user-socket-status.txt" 2>&1 || true
-systemctl status kerything-scannerd.service > "$bundle/kerything-scannerd-status.txt" 2>&1 || true
-systemctl status kerything-scannerd.socket > "$bundle/kerything-scannerd-socket-status.txt" 2>&1 || true
+systemctl --user status oxidexd.service > "$bundle/oxidexd-user-status.txt" 2>&1 || true
+systemctl --user status oxidexd.socket > "$bundle/oxidexd-user-socket-status.txt" 2>&1 || true
+systemctl status oxidex-scannerd.service > "$bundle/oxidex-scannerd-status.txt" 2>&1 || true
+systemctl status oxidex-scannerd.socket > "$bundle/oxidex-scannerd-socket-status.txt" 2>&1 || true
 
-journalctl --user -u kerythingd.service --since "2 hours ago" > "$bundle/kerythingd-user-journal.log" 2>&1 || true
-journalctl -u kerything-scannerd.service --since "2 hours ago" > "$bundle/kerything-scannerd-journal.log" 2>&1 || true
-journalctl --since "2 hours ago" | grep -i kerything > "$bundle/kerything-system-grep.log" 2>&1 || true
+journalctl --user -u oxidexd.service --since "2 hours ago" > "$bundle/oxidexd-user-journal.log" 2>&1 || true
+journalctl -u oxidex-scannerd.service --since "2 hours ago" > "$bundle/oxidex-scannerd-journal.log" 2>&1 || true
+journalctl --since "2 hours ago" | grep -i oxidex > "$bundle/oxidex-system-grep.log" 2>&1 || true
 
-pkaction | grep kerything > "$bundle/polkit-actions.txt" 2>&1 || true
+pkaction | grep oxidex > "$bundle/polkit-actions.txt" 2>&1 || true
 id > "$bundle/id.txt" 2>&1 || true
-ls -l /run/kerything /run/kerything/scannerd.sock > "$bundle/scanner-socket.txt" 2>&1 || true
-ls -l "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kerything" > "$bundle/user-runtime-socket.txt" 2>&1 || true
+ls -l /run/oxidex /run/oxidex/scannerd.sock > "$bundle/scanner-socket.txt" 2>&1 || true
+ls -l "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/oxidex" > "$bundle/user-runtime-socket.txt" 2>&1 || true
 
 tar -C "$(dirname "$bundle")" -czf "$bundle.tar.gz" "$(basename "$bundle")"
 echo "$bundle.tar.gz"
@@ -456,34 +458,34 @@ If you can reproduce the bug manually, foreground logs are often easier to read.
 Stop the packaged user daemon if it is running:
 
 ```sh
-systemctl --user stop kerythingd.service kerythingd.socket
+systemctl --user stop oxidexd.service oxidexd.socket
 ```
 
 Run the user daemon in one terminal:
 
 ```sh
-RUST_BACKTRACE=1 kerythingd --foreground 2>&1 | tee /tmp/kerythingd.log
+RUST_BACKTRACE=1 oxidexd --foreground 2>&1 | tee /tmp/oxidexd.log
 ```
 
 Run the scanner daemon in another terminal:
 
 ```sh
-sudo env RUST_BACKTRACE=1 kerything-scannerd --foreground 2>&1 | tee /tmp/kerything-scannerd.log
+sudo env RUST_BACKTRACE=1 oxidex-scannerd --foreground 2>&1 | tee /tmp/oxidex-scannerd.log
 ```
 
 Run the GUI in a third terminal:
 
 ```sh
-RUST_BACKTRACE=1 kerything 2>&1 | tee /tmp/kerything-gui.log
+RUST_BACKTRACE=1 oxidex 2>&1 | tee /tmp/oxidex-gui.log
 ```
 
 Then reproduce the issue and collect:
 
 ```sh
-tar -czf /tmp/kerything-foreground-logs.tar.gz \
-  /tmp/kerythingd.log \
-  /tmp/kerything-scannerd.log \
-  /tmp/kerything-gui.log
+tar -czf /tmp/oxidex-foreground-logs.tar.gz \
+  /tmp/oxidexd.log \
+  /tmp/oxidex-scannerd.log \
+  /tmp/oxidex-gui.log
 ```
 
 ### Scanner Helper Logs
@@ -491,16 +493,16 @@ tar -czf /tmp/kerything-foreground-logs.tar.gz \
 The compatibility helper writes binary scan data to stdout, so do not paste stdout into bug reports. If you need helper diagnostics, redirect stdout to a file and attach only stderr unless asked:
 
 ```sh
-pkexec kerything-scanner-helper /dev/YOUR_DEVICE ext4 \
-  > /tmp/kerything-scan.bin \
-  2> /tmp/kerything-helper.log
+pkexec oxidex-scanner-helper /dev/YOUR_DEVICE ext4 \
+  > /tmp/oxidex-scan.bin \
+  2> /tmp/oxidex-helper.log
 ```
 
-Usually `/tmp/kerything-helper.log` is enough. The `.bin` file can be large and may indirectly reveal filesystem metadata, so do not share it publicly unless a maintainer asks for it.
+Usually `/tmp/oxidex-helper.log` is enough. The `.bin` file can be large and may indirectly reveal filesystem metadata, so do not share it publicly unless a maintainer asks for it.
 
 ## Privacy Notes
 
-Kerything indexes file names and internal paths. Debug bundles and logs can reveal:
+Oxidex indexes file names and internal paths. Debug bundles and logs can reveal:
 
 - user names
 - mount points

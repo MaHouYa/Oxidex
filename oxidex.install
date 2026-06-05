@@ -1,0 +1,27 @@
+post_install() {
+  if ! getent group oxidex >/dev/null 2>&1; then
+    groupadd -r oxidex >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  cat <<'EOF'
+Oxidex installed.
+
+To let your user daemon connect to the privileged scanner daemon, add your user
+to the oxidex group, then log out and back in or run newgrp:
+
+  sudo usermod -aG oxidex "$USER"
+  newgrp oxidex
+
+Check the setup with:
+
+  oxidex-cli doctor
+EOF
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}

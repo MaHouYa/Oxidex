@@ -38,6 +38,6 @@ jobs:
       - name: Upload Debian package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kerything-deb-amd64
+          name: oxidex-deb-amd64
           path: dist/*.deb
           if-no-files-found: error

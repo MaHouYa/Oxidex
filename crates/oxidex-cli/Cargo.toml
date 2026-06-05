@@ -1,0 +1,19 @@
+[package]
+name = "oxidex-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oxidex-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+oxidex-client = { path = "../oxidex-client" }
+oxidex-core = { path = "../oxidex-core" }
+open.workspace = true
+serde_json.workspace = true
+toml.workspace = true

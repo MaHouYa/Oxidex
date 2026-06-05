@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  Honghao <https://github.com/Rasphino>
 # Copyright (C) 2026  Reikooters <https://github.com/Reikooters>
 
-pkgname=kerything
-pkgver=1.4.1
+
+pkgname=oxidex
+pkgver=2.0.0
 pkgrel=1
-pkgdesc="Fast Rust/egui filename search for NTFS, EXT4, and Btrfs devices"
+pkgdesc="Oxidex, a fast Rust/egui filename search app for NTFS, EXT4, and Btrfs devices"
 arch=('x86_64')
-url="https://github.com/Reikooters/kerything"
+url="https://github.com/MaHouYa/Oxidex"
 license=('GPL-3.0-or-later')
 depends=('gcc-libs' 'glibc' 'polkit' 'libx11' 'libxcb' 'libxkbcommon' 'wayland' 'libglvnd' 'fontconfig' 'xdg-utils' 'hicolor-icon-theme')
 makedepends=('cargo' 'clang')
-install=kerything.install
+install=oxidex.install
 
 # Disable the creation of the -debug package.
 options=('!debug')
@@ -29,21 +31,21 @@ build() {
 }
 
 package() {
-  install -Dm755 "$srcdir/target/release/kerything" "$pkgdir/usr/bin/kerything"
-  install -Dm755 "$srcdir/target/release/kerything-cli" "$pkgdir/usr/bin/kerything-cli"
-  install -Dm755 "$srcdir/target/release/kerythingd" "$pkgdir/usr/bin/kerythingd"
-  install -Dm755 "$srcdir/target/release/kerything-scannerd" "$pkgdir/usr/bin/kerything-scannerd"
-  install -Dm755 "$srcdir/target/release/kerything-scanner-helper" "$pkgdir/usr/bin/kerything-scanner-helper"
+  install -Dm755 "$srcdir/target/release/oxidex" "$pkgdir/usr/bin/oxidex"
+  install -Dm755 "$srcdir/target/release/oxidex-cli" "$pkgdir/usr/bin/oxidex-cli"
+  install -Dm755 "$srcdir/target/release/oxidexd" "$pkgdir/usr/bin/oxidexd"
+  install -Dm755 "$srcdir/target/release/oxidex-scannerd" "$pkgdir/usr/bin/oxidex-scannerd"
+  install -Dm755 "$srcdir/target/release/oxidex-scanner-helper" "$pkgdir/usr/bin/oxidex-scanner-helper"
 
-  install -Dm644 "$startdir/net.reikooters.kerything.desktop" "$pkgdir/usr/share/applications/net.reikooters.kerything.desktop"
-  install -Dm644 "$startdir/net.reikooters.kerything.policy" "$pkgdir/usr/share/polkit-1/actions/net.reikooters.kerything.policy"
+  install -Dm644 "$startdir/org.mahouya.oxidex.desktop" "$pkgdir/usr/share/applications/org.mahouya.oxidex.desktop"
+  install -Dm644 "$startdir/org.mahouya.oxidex.policy" "$pkgdir/usr/share/polkit-1/actions/org.mahouya.oxidex.policy"
   install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-  install -Dm644 "$startdir/systemd/user/kerythingd.service" "$pkgdir/usr/lib/systemd/user/kerythingd.service"
-  install -Dm644 "$startdir/systemd/user/kerythingd.socket" "$pkgdir/usr/lib/systemd/user/kerythingd.socket"
-  install -Dm644 "$startdir/systemd/system/kerything-scannerd.service" "$pkgdir/usr/lib/systemd/system/kerything-scannerd.service"
-  install -Dm644 "$startdir/systemd/system/kerything-scannerd.socket" "$pkgdir/usr/lib/systemd/system/kerything-scannerd.socket"
+  install -Dm644 "$startdir/systemd/user/oxidexd.service" "$pkgdir/usr/lib/systemd/user/oxidexd.service"
+  install -Dm644 "$startdir/systemd/user/oxidexd.socket" "$pkgdir/usr/lib/systemd/user/oxidexd.socket"
+  install -Dm644 "$startdir/systemd/system/oxidex-scannerd.service" "$pkgdir/usr/lib/systemd/system/oxidex-scannerd.service"
+  install -Dm644 "$startdir/systemd/system/oxidex-scannerd.socket" "$pkgdir/usr/lib/systemd/system/oxidex-scannerd.socket"
 
   for size in 16 32 48 256; do
-    install -Dm644 "$startdir/icons/${size}-apps-kerything.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/kerything.png"
+    install -Dm644 "$startdir/icons/${size}-apps-oxidex.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/oxidex.png"
   done
 }

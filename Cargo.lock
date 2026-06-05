@@ -1977,97 +1977,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kerything"
-version = "1.4.1"
-dependencies = [
- "anyhow",
- "crossbeam-channel",
- "eframe",
- "egui_extras",
- "kerything-client",
- "kerything-core",
- "open",
- "serde",
- "serde_json",
- "time",
-]
-
-[[package]]
-name = "kerything-cli"
-version = "1.4.1"
-dependencies = [
- "anyhow",
- "kerything-client",
- "kerything-core",
- "open",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "kerything-client"
-version = "1.4.1"
-dependencies = [
- "anyhow",
- "kerything-core",
- "serde",
- "serde_json",
- "xdg",
-]
-
-[[package]]
-name = "kerything-core"
-version = "1.4.1"
-dependencies = [
- "anyhow",
- "btrfs-fs",
- "byteorder 1.5.0",
- "ext4",
- "globset",
- "libc",
- "ntfs",
- "rayon",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "toml",
- "xdg",
-]
-
-[[package]]
-name = "kerything-daemon"
-version = "1.4.1"
-dependencies = [
- "anyhow",
- "kerything-core",
- "libc",
- "notify",
- "serde",
- "serde_json",
- "xdg",
-]
-
-[[package]]
-name = "kerything-scanner-helper"
-version = "1.4.1"
-dependencies = [
- "anyhow",
- "kerything-core",
-]
-
-[[package]]
-name = "kerything-scannerd"
-version = "1.4.1"
-dependencies = [
- "anyhow",
- "kerything-core",
- "libc",
- "serde_json",
-]
-
-[[package]]
 name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2781,6 +2690,97 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "oxidex"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "eframe",
+ "egui_extras",
+ "open",
+ "oxidex-client",
+ "oxidex-core",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
+name = "oxidex-cli"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "open",
+ "oxidex-client",
+ "oxidex-core",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "oxidex-client"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "oxidex-core",
+ "serde",
+ "serde_json",
+ "xdg",
+]
+
+[[package]]
+name = "oxidex-core"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "btrfs-fs",
+ "byteorder 1.5.0",
+ "ext4",
+ "globset",
+ "libc",
+ "ntfs",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "toml",
+ "xdg",
+]
+
+[[package]]
+name = "oxidex-daemon"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "notify",
+ "oxidex-core",
+ "serde",
+ "serde_json",
+ "xdg",
+]
+
+[[package]]
+name = "oxidex-scanner-helper"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "oxidex-core",
+]
+
+[[package]]
+name = "oxidex-scannerd"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "oxidex-core",
+ "serde_json",
 ]
 
 [[package]]

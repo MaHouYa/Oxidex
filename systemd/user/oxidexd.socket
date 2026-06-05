@@ -1,0 +1,10 @@
+[Unit]
+Description=Oxidex user search daemon socket
+
+[Socket]
+ListenStream=%t/oxidex/oxidexd.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

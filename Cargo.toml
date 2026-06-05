@@ -1,21 +1,21 @@
 [workspace]
 members = [
-    "crates/kerything",
-    "crates/kerything-cli",
-    "crates/kerything-client",
-    "crates/kerything-core",
-    "crates/kerything-daemon",
-    "crates/kerything-scanner-helper",
-    "crates/kerything-scannerd",
+    "crates/oxidex",
+    "crates/oxidex-cli",
+    "crates/oxidex-client",
+    "crates/oxidex-core",
+    "crates/oxidex-daemon",
+    "crates/oxidex-scanner-helper",
+    "crates/oxidex-scannerd",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "1.4.1"
+version = "2.0.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-authors = ["Reikooters <https://github.com/Reikooters>"]
-repository = "https://github.com/Reikooters/kerything"
+authors = ["Honghao <https://github.com/Rasphino>"]
+repository = "https://github.com/MaHouYa/Oxidex"
 
 [workspace.dependencies]
 anyhow = "1.0"

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Oxidex
+Exec=oxidex
+Icon=oxidex
+Type=Application
+Categories=Utility;FileTools;
+GenericName=Device Filename Search
+Comment=Fast NTFS, EXT4, and Btrfs filename search using raw metadata indexes
+Terminal=false
+StartupWMClass=oxidex

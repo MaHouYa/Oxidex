@@ -7,5 +7,5 @@ dist/
 
 # makepkg
 pkg/
-kerything-*.pkg.tar.zst
-kerything-*.pkg.tar.zst.sig
+oxidex-*.pkg.tar.zst
+oxidex-*.pkg.tar.zst.sig

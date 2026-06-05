@@ -1,0 +1,8 @@
+[Unit]
+Description=Oxidex user search daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/oxidexd --foreground
+Restart=on-failure
+RestartSec=2s

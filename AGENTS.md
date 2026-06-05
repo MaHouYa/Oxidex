@@ -2,27 +2,27 @@
 
 ## Project Structure & Module Organization
 
-Kerything is currently a Rust 2024 Cargo workspace that rewrites the old Qt/KDE application as a Linux desktop filename search tool. The workspace contains these active crates:
+Oxidex is currently a Rust 2024 Cargo workspace for a Linux desktop filename search tool. The workspace contains these active crates:
 
-- `crates/kerything`: the unprivileged `eframe`/`egui` GUI. Default launch connects to `kerythingd`; `--standalone` keeps the in-process fallback.
-- `crates/kerything-client`: shared Unix-socket client library for GUI and CLI frontends.
-- `crates/kerything-core`: shared device discovery, scan streams, snapshots, indexing/search, path reconstruction, and scanner backends.
-- `crates/kerything-daemon`: `kerythingd`, the unprivileged per-user daemon that owns config, loaded indexes, search, scan requests, and snapshot persistence.
-- `crates/kerything-scannerd`: `kerything-scannerd`, the privileged scanner daemon that owns raw `/dev/...` scans only.
-- `crates/kerything-cli`: CLI and rofi/script integration client.
-- `crates/kerything-scanner-helper`: compatibility privileged scanner CLI launched through `pkexec`.
+- `crates/oxidex`: the unprivileged `eframe`/`egui` GUI. Default launch connects to `oxidexd`; `--standalone` keeps the in-process fallback.
+- `crates/oxidex-client`: shared Unix-socket client library for GUI and CLI frontends.
+- `crates/oxidex-core`: shared device discovery, scan streams, snapshots, indexing/search, path reconstruction, and scanner backends.
+- `crates/oxidex-daemon`: `oxidexd`, the unprivileged per-user daemon that owns config, loaded indexes, search, scan requests, and snapshot persistence.
+- `crates/oxidex-scannerd`: `oxidex-scannerd`, the privileged scanner daemon that owns raw `/dev/...` scans only.
+- `crates/oxidex-cli`: CLI and rofi/script integration client.
+- `crates/oxidex-scanner-helper`: compatibility privileged scanner CLI launched through `pkexec`.
 
-`kerythingd` persists indexes under `$XDG_DATA_HOME/kerything/indexes/` and config under `$XDG_CONFIG_HOME/kerything/config.toml`. Runtime metadata formats live in `crates/kerything-core/src/stream.rs` and `crates/kerything-core/src/snapshot.rs`; V4 index health sidecars live beside snapshots as `*.state.json`; search/index logic is in `crates/kerything-core/src/index.rs`; config and include/exclude rules are in `crates/kerything-core/src/config.rs` and `crates/kerything-core/src/rules.rs`; scanner backends are in `crates/kerything-core/src/scanner/`; setup diagnostics are in `crates/kerything-core/src/doctor.rs`.
+`oxidexd` persists indexes under `$XDG_DATA_HOME/oxidex/indexes/` and config under `$XDG_CONFIG_HOME/oxidex/config.toml`. Runtime metadata formats live in `crates/oxidex-core/src/stream.rs` and `crates/oxidex-core/src/snapshot.rs`; V4 index health sidecars live beside snapshots as `*.state.json`; search/index logic is in `crates/oxidex-core/src/index.rs`; config and include/exclude rules are in `crates/oxidex-core/src/config.rs` and `crates/oxidex-core/src/rules.rs`; scanner backends are in `crates/oxidex-core/src/scanner/`; setup diagnostics are in `crates/oxidex-core/src/doctor.rs`.
 
 Legacy C++/Qt/KDE directories and files may still be present in the tree for history or transition, but the active build is Rust/Cargo. Do not reintroduce Qt6, KDE Frameworks, KIO, Solid, D-Bus APIs/activation, libblkid, e2fsprogs/libext2fs runtime dependencies, `libbtrfs` bindings, or `wgpu` as a default renderer unless explicitly approved.
 
 Packaging and desktop integration files live at the repository root and under `scripts/` and `.github/`:
 
 - `PKGBUILD`: Arch package build.
-- `net.reikooters.kerything.desktop`: desktop entry.
-- `net.reikooters.kerything.policy`: Polkit policy for the compatibility helper and scanner-daemon connection authorization.
-- `systemd/user/`: user service/socket units for `kerythingd`.
-- `systemd/system/`: system service/socket units for `kerything-scannerd`.
+- `org.mahouya.oxidex.desktop`: desktop entry.
+- `org.mahouya.oxidex.policy`: Polkit policy for the compatibility helper and scanner-daemon connection authorization.
+- `systemd/user/`: user service/socket units for `oxidexd`.
+- `systemd/system/`: system service/socket units for `oxidex-scannerd`.
 - `scripts/package-deb.sh`: local Debian package build.
 - `scripts/ci/build-deb-ubuntu20.04.sh`: Ubuntu 20.04 package build script.
 - `.github/workflows/deb.yml`: GitHub Actions Debian package workflow.
@@ -38,36 +38,36 @@ cargo build --release --locked --workspace
 Run the GUI from the build tree:
 
 ```bash
-cargo run --release -p kerything
+cargo run --release -p oxidex
 ```
 
 Run the standalone fallback from the build tree:
 
 ```bash
-cargo run --release -p kerything -- --standalone
+cargo run --release -p oxidex -- --standalone
 ```
 
 Run the daemons in foreground development mode:
 
 ```bash
 scripts/dev-install-polkit.sh
-cargo run --release -p kerything-daemon -- --foreground
-sudo target/release/kerything-scannerd --foreground
+cargo run --release -p oxidex-daemon -- --foreground
+sudo target/release/oxidex-scannerd --foreground
 ```
 
-For manual scanner-daemon testing, install the Polkit action first or expect `Action net.reikooters.kerything.connect-scanner is not registered`. The user running `kerythingd` must also be able to connect to `/run/kerything/scannerd.sock` before Polkit can authorize the session. The foreground scanner daemon attempts to create the socket as `root:kerything` with mode `0660`; make sure the `kerything` group exists and the test user is in that group, or expect `Permission denied (os error 13)`.
+For manual scanner-daemon testing, install the Polkit action first or expect `Action org.mahouya.oxidex.connect-scanner is not registered`. The user running `oxidexd` must also be able to connect to `/run/oxidex/scannerd.sock` before Polkit can authorize the session. The foreground scanner daemon attempts to create the socket as `root:oxidex` with mode `0660`; make sure the `oxidex` group exists and the test user is in that group, or expect `Permission denied (os error 13)`.
 
 Run the CLI:
 
 ```bash
-cargo run --release -p kerything-cli -- search "ext:rs path:src main"
-cargo run --release -p kerything-cli -- doctor
+cargo run --release -p oxidex-cli -- search "ext:rs path:src main"
+cargo run --release -p oxidex-cli -- doctor
 ```
 
 Run the scanner helper directly:
 
 ```bash
-cargo run --release -p kerything-scanner-helper -- --version
+cargo run --release -p oxidex-scanner-helper -- --version
 ```
 
 Run tests and checks:
@@ -104,10 +104,10 @@ The GUI should use `eframe`/`egui` with the `glow` renderer by default. Do not a
 Keep helper stdout reserved for binary scan data. Progress and diagnostics belong on stderr, with progress lines formatted as:
 
 ```text
-KERYTHING_PROGRESS <0-100>
+OXIDEX_PROGRESS <0-100>
 ```
 
-`kerything-scannerd` uses framed Unix-socket IPC instead: progress is a structured event and the final `scanner.start_scan` response carries binary `ScanStreamV1` as the frame payload.
+`oxidex-scannerd` uses framed Unix-socket IPC instead: progress is a structured event and the final `scanner.start_scan` response carries binary `ScanStreamV1` as the frame payload.
 
 ## Testing Guidelines
 
@@ -117,13 +117,13 @@ For search or snapshot changes, run unit tests and check path reconstruction, Un
 
 For scanner changes, validate both mounted and unmounted devices when possible. NTFS should scan MFT metadata and preserve hard-link names. EXT4 should read filesystem metadata, inode metadata, and directory-entry blocks; it must not scan regular file contents or do whole-disk byte-by-byte discovery. Btrfs V2-basic scans only the default/main root, treats other subvolumes as boundaries, and rejects unsupported multi-device layouts clearly.
 
-When changing daemon/client/IPC code, verify `kerythingd --foreground`, `kerything-cli devices`, `kerything-cli indexes`, `kerything-cli search`, `kerything-cli jobs`, `kerything-cli scan --wait`, `kerything-cli cancel`, `kerything-cli doctor`, and scanner authorization/error handling. `kerything-scannerd` should accept only scanner protocol methods, validate every scan request, start cancellable scanner jobs, expose final scan streams only through the framed `scanner.take_result` response, and never expose arbitrary block reads.
+When changing daemon/client/IPC code, verify `oxidexd --foreground`, `oxidex-cli devices`, `oxidex-cli indexes`, `oxidex-cli search`, `oxidex-cli jobs`, `oxidex-cli scan --wait`, `oxidex-cli cancel`, `oxidex-cli doctor`, and scanner authorization/error handling. `oxidex-scannerd` should accept only scanner protocol methods, validate every scan request, start cancellable scanner jobs, expose final scan streams only through the framed `scanner.take_result` response, and never expose arbitrary block reads.
 
 When changing packaging, validate at least:
 
 ```bash
 cargo build --release --locked --workspace
-desktop-file-validate net.reikooters.kerything.desktop
+desktop-file-validate org.mahouya.oxidex.desktop
 bash -n scripts/ci/build-deb-ubuntu20.04.sh scripts/package-deb.sh
 scripts/package-deb.sh
 ```
@@ -132,7 +132,7 @@ If Docker is available, the workflow can be tested through the same `ubuntu:20.0
 
 ## Debian Package Notes
 
-The Debian package installs `kerything`, `kerything-cli`, `kerythingd`, `kerything-scannerd`, `kerything-scanner-helper`, the desktop file, hicolor icons, license, systemd units, and `net.reikooters.kerything.policy` into standard system paths. It creates a `kerything` system group for the scanner daemon socket. This is the preferred portable packaging path because privileged components live under `/usr/bin`.
+The Debian package installs `oxidex`, `oxidex-cli`, `oxidexd`, `oxidex-scannerd`, `oxidex-scanner-helper`, the desktop file, hicolor icons, license, systemd units, and `org.mahouya.oxidex.policy` into standard system paths. It creates an `oxidex` system group for the scanner daemon socket. This is the preferred portable packaging path because privileged components live under `/usr/bin`.
 
 ## Commit & Pull Request Guidelines
 
@@ -140,6 +140,6 @@ Use concise, descriptive commit summaries that state the user-visible or technic
 
 ## Security & Configuration Tips
 
-Raw block-device access is privileged. Keep validation in `crates/kerything-core/src/scanner/mod.rs` strict because it is shared by the helper and scanner daemon: reject empty paths, non-absolute paths, non-`/dev` paths, non-existent paths, non-block devices, world-writable device nodes, and unsupported filesystem types. Resolve symlinks before scanning.
+Raw block-device access is privileged. Keep validation in `crates/oxidex-core/src/scanner/mod.rs` strict because it is shared by the helper and scanner daemon: reject empty paths, non-absolute paths, non-`/dev` paths, non-existent paths, non-block devices, world-writable device nodes, and unsupported filesystem types. Resolve symlinks before scanning.
 
-Treat Polkit policy changes as security-sensitive. The GUI and `kerythingd` must remain unprivileged; only `kerything-scannerd` and the compatibility helper should run with elevated privileges. Scanner authorization is per socket connection/session through `net.reikooters.kerything.connect-scanner`; the helper compatibility action is `net.reikooters.kerything.run-scanner`. Avoid logging sensitive full paths unless needed for a clear diagnostic.
+Treat Polkit policy changes as security-sensitive. The GUI and `oxidexd` must remain unprivileged; only `oxidex-scannerd` and the compatibility helper should run with elevated privileges. Scanner authorization is per socket connection/session through `org.mahouya.oxidex.connect-scanner`; the helper compatibility action is `org.mahouya.oxidex.run-scanner`. Avoid logging sensitive full paths unless needed for a clear diagnostic.
