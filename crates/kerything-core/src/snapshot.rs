@@ -3,7 +3,9 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use serde::{Deserialize, Serialize};
 
+use crate::daemon_model::IndexStateSummary;
 use crate::index::{IndexedRecord, SearchIndex, TrigramEntry};
 use crate::model::{DeviceMetadata, FsType};
 
@@ -18,6 +20,49 @@ pub fn index_dir() -> anyhow::Result<PathBuf> {
 
 pub fn snapshot_path_for(device_id: &str) -> anyhow::Result<PathBuf> {
     Ok(index_dir()?.join(format!("{}.kidx", escape_device_id(device_id))))
+}
+
+pub fn state_path_for(device_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(index_dir()?.join(format!("{}.state.json", escape_device_id(device_id))))
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct IndexStateV1 {
+    pub version: u32,
+    pub device_id: String,
+    pub last_success_time: Option<i64>,
+    pub last_failure_time: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_scan_duration_ms: Option<u64>,
+    pub last_scanner: Option<String>,
+    pub last_entry_count: Option<usize>,
+    pub stale_reason: Option<String>,
+    pub live_watch_state: Option<String>,
+    pub rules_fingerprint: Option<u64>,
+    pub snapshot_size: Option<u64>,
+}
+
+impl IndexStateV1 {
+    pub fn new(device_id: impl Into<String>) -> Self {
+        Self {
+            version: 1,
+            device_id: device_id.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn summary(&self) -> IndexStateSummary {
+        IndexStateSummary {
+            last_success_time: self.last_success_time,
+            last_failure_time: self.last_failure_time,
+            last_error: self.last_error.clone(),
+            last_scan_duration_ms: self.last_scan_duration_ms,
+            last_scanner: self.last_scanner.clone(),
+            snapshot_size: self.snapshot_size,
+            stale_reason: self.stale_reason.clone(),
+            live_watch_state: self.live_watch_state.clone(),
+        }
+    }
 }
 
 pub fn save_index(index: &SearchIndex) -> anyhow::Result<PathBuf> {
@@ -35,6 +80,62 @@ pub fn save_index(index: &SearchIndex) -> anyhow::Result<PathBuf> {
     }
     fs::rename(&tmp, &path)?;
     Ok(path)
+}
+
+pub fn save_index_state(state: &IndexStateV1) -> anyhow::Result<PathBuf> {
+    let path = state_path_for(&state.device_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("state.json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+pub fn load_index_state(device_id: &str) -> anyhow::Result<Option<IndexStateV1>> {
+    let path = state_path_for(device_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let state: IndexStateV1 = serde_json::from_slice(&fs::read(path)?)?;
+    anyhow::ensure!(
+        state.version == 1,
+        "unsupported index state version {}",
+        state.version
+    );
+    Ok(Some(state))
+}
+
+pub fn load_all_index_states() -> anyhow::Result<Vec<IndexStateV1>> {
+    let dir = index_dir()?;
+    let mut states = Vec::new();
+    if !dir.exists() {
+        return Ok(states);
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".state.json"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        match serde_json::from_slice::<IndexStateV1>(&fs::read(&path)?) {
+            Ok(state) if state.version == 1 => states.push(state),
+            Ok(state) => eprintln!(
+                "Failed to load index state {}: unsupported version {}",
+                path.display(),
+                state.version
+            ),
+            Err(err) => eprintln!("Failed to load index state {}: {err}", path.display()),
+        }
+    }
+    Ok(states)
 }
 
 pub fn load_all_indexes() -> anyhow::Result<Vec<SearchIndex>> {
@@ -68,6 +169,10 @@ pub fn delete_index(device_id: &str) -> anyhow::Result<()> {
     let path = snapshot_path_for(device_id)?;
     if path.exists() {
         fs::remove_file(path)?;
+    }
+    let state = state_path_for(device_id)?;
+    if state.exists() {
+        fs::remove_file(state)?;
     }
     Ok(())
 }
@@ -444,5 +549,21 @@ mod tests {
         write_index(&mut bytes, &index).unwrap();
 
         assert!(read_index(&bytes[..]).is_err());
+    }
+
+    #[test]
+    fn index_state_summary_carries_v4_health_fields() {
+        let mut state = IndexStateV1::new("partuuid:test");
+        state.last_success_time = Some(10);
+        state.last_error = Some("boom".into());
+        state.last_scanner = Some("scannerd".into());
+        state.snapshot_size = Some(42);
+        state.stale_reason = Some("watch_desync".into());
+        let summary = state.summary();
+        assert_eq!(summary.last_success_time, Some(10));
+        assert_eq!(summary.last_error.as_deref(), Some("boom"));
+        assert_eq!(summary.last_scanner.as_deref(), Some("scannerd"));
+        assert_eq!(summary.snapshot_size, Some(42));
+        assert_eq!(summary.stale_reason.as_deref(), Some("watch_desync"));
     }
 }

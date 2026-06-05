@@ -3,10 +3,12 @@ use serde_json::Value;
 
 use crate::config::AppConfig;
 use crate::device::DeviceInfo;
+use crate::doctor::DoctorReport;
 use crate::index::{SearchHit, SearchIndex, SearchRequest};
 use crate::model::{FsType, SortDirection, SortKey};
 
 pub type ScanJobId = u64;
+pub type ScannerJobId = u64;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientRequest {
@@ -52,7 +54,7 @@ pub enum DaemonEvent {
     DeviceListRefreshed,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanState {
     Queued,
@@ -68,6 +70,12 @@ pub struct DaemonStatus {
     pub index_count: usize,
     pub device_count: usize,
     pub scanner_socket: String,
+    pub scanner_status: Option<ScannerStatusDetail>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DaemonDoctorResult {
+    pub report: DoctorReport,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -97,6 +105,40 @@ pub struct IndexSummary {
     pub entry_count: usize,
     pub last_indexed_time: i64,
     pub stale: bool,
+    pub state: Option<IndexStateSummary>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct IndexStateSummary {
+    pub last_success_time: Option<i64>,
+    pub last_failure_time: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_scan_duration_ms: Option<u64>,
+    pub last_scanner: Option<String>,
+    pub snapshot_size: Option<u64>,
+    pub stale_reason: Option<String>,
+    pub live_watch_state: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WatchSummary {
+    pub device_id: String,
+    pub mounted: bool,
+    pub enabled: bool,
+    pub state: String,
+    pub watched_directories: usize,
+    pub dirty: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IndexHealth {
+    pub summary: IndexSummary,
+    pub mounted: bool,
+    pub mount_point: String,
+    pub snapshot_size: Option<u64>,
+    pub watch: Option<WatchSummary>,
+    pub btrfs_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -143,6 +185,11 @@ pub struct SearchQueryResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SearchExplainParams {
+    pub query: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IndexForgetParams {
     pub device_id: String,
 }
@@ -155,13 +202,38 @@ pub struct IndexStartScanParams {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IndexStartScanResult {
     pub job_id: ScanJobId,
-    pub summary: IndexSummary,
+    pub device_id: String,
+    pub state: ScanState,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScanJobSummary {
+    pub job_id: ScanJobId,
+    pub device_id: String,
+    pub state: ScanState,
+    pub progress: u8,
+    pub message: String,
+    pub started_time: Option<i64>,
+    pub finished_time: Option<i64>,
+    pub result: Option<IndexSummary>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IndexCancelScanParams {
     pub job_id: Option<ScanJobId>,
     pub device_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IndexJobStatusParams {
+    pub job_id: ScanJobId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IndexCancelScanResult {
+    pub cancelled: bool,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -207,13 +279,50 @@ pub struct ScannerStartScanParams {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScannerStartScanResult {
+    pub job_id: ScannerJobId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerTakeResultParams {
+    pub job_id: ScannerJobId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerTakeResultResult {
     pub record_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerCancelScanParams {
+    pub job_id: ScannerJobId,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScannerStatusResult {
     pub authorized: bool,
-    pub active: bool,
+    pub active_jobs: Vec<ScannerJobSummary>,
+    pub idle_timeout_seconds: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ScannerStatusDetail {
+    pub socket: String,
+    pub reachable: bool,
+    pub authorized: bool,
+    pub using_helper_fallback: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerJobSummary {
+    pub job_id: ScannerJobId,
+    pub device_path: String,
+    pub fs_type: FsType,
+    pub state: ScanState,
+    pub progress: u8,
+    pub record_count: Option<usize>,
+    pub error: Option<String>,
 }
 
 impl DeviceSummary {
@@ -247,6 +356,13 @@ impl IndexSummary {
             entry_count: index.records.len(),
             last_indexed_time: index.last_indexed_time,
             stale,
+            state: None,
         }
+    }
+
+    pub fn with_state(mut self, state: IndexStateSummary) -> Self {
+        self.stale |= state.stale_reason.is_some();
+        self.state = Some(state);
+        self
     }
 }

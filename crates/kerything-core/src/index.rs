@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
 use crate::model::{DeviceMetadata, ROOT_PARENT, ScanDatabase, SortDirection, SortKey};
 
@@ -77,6 +79,34 @@ impl PartialEq for SearchHit {
 
 impl Eq for SearchHit {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveRecordMetadata {
+    pub size: u64,
+    pub mtime: i64,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiveUpdateEvent {
+    Created {
+        internal_path: String,
+        metadata: LiveRecordMetadata,
+    },
+    Removed {
+        internal_path: String,
+    },
+    Renamed {
+        old_internal_path: String,
+        new_internal_path: String,
+        metadata: LiveRecordMetadata,
+    },
+    Metadata {
+        internal_path: String,
+        metadata: LiveRecordMetadata,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchFileType {
@@ -128,21 +158,75 @@ impl SearchFilters {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SearchTerm {
-    Contains(String),
-    Phrase(String),
-    Wildcard(String),
+pub enum SearchClause {
+    NameContains(String),
+    NamePhrase(String),
+    NameWildcard(String),
+    Extension(Vec<String>),
+    FileType(SearchFileType),
+    PathContains(String),
+    Size(SizeFilter),
+    Mtime(TimeFilter),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct SizeFilter {
+    pub min: Option<u64>,
+    pub max: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct TimeFilter {
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct SearchExplanation {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub summary: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct SearchRequest {
-    pub terms: Vec<SearchTerm>,
-    pub filters: SearchFilters,
+    pub include: Vec<SearchClause>,
+    pub exclude: Vec<SearchClause>,
 }
 
 impl SearchRequest {
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty() && self.filters.is_empty()
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    pub fn add_filters(&mut self, filters: SearchFilters) {
+        if !filters.extensions.is_empty() {
+            self.include
+                .push(SearchClause::Extension(filters.extensions.clone()));
+        }
+        if let Some(file_type) = filters.file_type {
+            self.include.push(SearchClause::FileType(file_type));
+        }
+        for path in filters.path_contains {
+            self.include.push(SearchClause::PathContains(path));
+        }
+    }
+
+    pub fn filters(&self) -> SearchFilters {
+        let mut filters = SearchFilters::default();
+        for clause in self.include.iter().chain(self.exclude.iter()) {
+            match clause {
+                SearchClause::Extension(exts) => {
+                    for ext in exts {
+                        filters.add_extensions(ext);
+                    }
+                }
+                SearchClause::FileType(file_type) => filters.file_type = Some(*file_type),
+                SearchClause::PathContains(value) => filters.add_path_contains(value),
+                _ => {}
+            }
+        }
+        filters
     }
 }
 
@@ -173,32 +257,356 @@ pub fn parse_search_query(query: &str) -> Result<SearchRequest, SearchParseError
         if token.value.is_empty() {
             continue;
         }
-        if !token.quoted {
-            let lowered = token.value.to_ascii_lowercase();
-            if lowered.starts_with("ext:") {
-                request.filters.add_extensions(&token.value[4..]);
-                continue;
-            }
-            if lowered.starts_with("path:") {
-                request.filters.add_path_contains(&token.value[5..]);
-                continue;
-            }
-            if lowered.starts_with("type:") {
-                request.filters.file_type = Some(parse_file_type(&token.value[5..])?);
-                continue;
-            }
+        let (negated, value) = split_negation(&token.value, token.quoted);
+        if value.is_empty() {
+            continue;
         }
-
-        let folded = token.value.to_lowercase();
-        if folded.contains('*') {
-            request.terms.push(SearchTerm::Wildcard(folded));
-        } else if token.quoted {
-            request.terms.push(SearchTerm::Phrase(folded));
+        let clause = parse_clause(value, token.quoted)?;
+        if negated {
+            request.exclude.push(clause);
         } else {
-            request.terms.push(SearchTerm::Contains(folded));
+            request.include.push(clause);
         }
     }
     Ok(request)
+}
+
+pub fn explain_search_query(query: &str) -> Result<SearchExplanation, SearchParseError> {
+    let request = parse_search_query(query)?;
+    let include: Vec<_> = request.include.iter().map(clause_label).collect();
+    let exclude: Vec<_> = request.exclude.iter().map(clause_label).collect();
+    let mut parts = Vec::new();
+    if !include.is_empty() {
+        parts.push(format!("include {}", include.join(", ")));
+    }
+    if !exclude.is_empty() {
+        parts.push(format!("exclude {}", exclude.join(", ")));
+    }
+    Ok(SearchExplanation {
+        include,
+        exclude,
+        summary: if parts.is_empty() {
+            "match everything".to_owned()
+        } else {
+            parts.join("; ")
+        },
+    })
+}
+
+fn split_negation(value: &str, quoted: bool) -> (bool, &str) {
+    if quoted {
+        return (false, value);
+    }
+    if let Some(rest) = value.strip_prefix('!')
+        && !rest.is_empty()
+    {
+        return (true, rest);
+    }
+    if let Some(rest) = value.strip_prefix('-')
+        && !rest.is_empty()
+    {
+        return (true, rest);
+    }
+    (false, value)
+}
+
+fn parse_clause(value: &str, quoted: bool) -> Result<SearchClause, SearchParseError> {
+    if !quoted {
+        let lowered = value.to_ascii_lowercase();
+        if lowered.starts_with("ext:") {
+            let mut filters = SearchFilters::default();
+            filters.add_extensions(&value[4..]);
+            if filters.extensions.is_empty() {
+                return Err(SearchParseError::new(
+                    "ext: requires at least one extension",
+                ));
+            }
+            return Ok(SearchClause::Extension(filters.extensions));
+        }
+        if lowered.starts_with("path:") {
+            let needle = value[5..].trim().to_lowercase();
+            if needle.is_empty() {
+                return Err(SearchParseError::new("path: requires text to match"));
+            }
+            return Ok(SearchClause::PathContains(needle));
+        }
+        if lowered.starts_with("type:") {
+            return Ok(SearchClause::FileType(parse_file_type(&value[5..])?));
+        }
+        if lowered.starts_with("size:") {
+            return Ok(SearchClause::Size(parse_size_filter(&value[5..])?));
+        }
+        if lowered.starts_with("mtime:") {
+            return Ok(SearchClause::Mtime(parse_time_filter(&value[6..])?));
+        }
+    }
+
+    let folded = value.to_lowercase();
+    if folded.contains('*') {
+        Ok(SearchClause::NameWildcard(folded))
+    } else if quoted {
+        Ok(SearchClause::NamePhrase(folded))
+    } else {
+        Ok(SearchClause::NameContains(folded))
+    }
+}
+
+fn clause_label(clause: &SearchClause) -> String {
+    match clause {
+        SearchClause::NameContains(value) => format!("name contains '{value}'"),
+        SearchClause::NamePhrase(value) => format!("name phrase '{value}'"),
+        SearchClause::NameWildcard(value) => format!("name wildcard '{value}'"),
+        SearchClause::Extension(values) => format!("extension {}", values.join(",")),
+        SearchClause::FileType(value) => format!("type {}", search_file_type_name(*value)),
+        SearchClause::PathContains(value) => format!("path contains '{value}'"),
+        SearchClause::Size(value) => format!("size {}", range_label(value.min, value.max)),
+        SearchClause::Mtime(value) => format!("mtime {}", range_label(value.min, value.max)),
+    }
+}
+
+fn range_label<T: std::fmt::Display>(min: Option<T>, max: Option<T>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("{min}..{max}"),
+        (Some(min), None) => format!(">={min}"),
+        (None, Some(max)) => format!("<={max}"),
+        (None, None) => "any".to_owned(),
+    }
+}
+
+fn search_file_type_name(file_type: SearchFileType) -> &'static str {
+    match file_type {
+        SearchFileType::File => "file",
+        SearchFileType::Dir => "dir",
+        SearchFileType::Symlink => "symlink",
+    }
+}
+
+fn parse_size_filter(value: &str) -> Result<SizeFilter, SearchParseError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(SearchParseError::new("size: requires a value"));
+    }
+    if let Some((start, end)) = value.split_once("..") {
+        return Ok(SizeFilter {
+            min: Some(parse_size_value(start)?),
+            max: Some(parse_size_value(end)?),
+        });
+    }
+    if let Some(rest) = value.strip_prefix(">=") {
+        return Ok(SizeFilter {
+            min: Some(parse_size_value(rest)?),
+            max: None,
+        });
+    }
+    if let Some(rest) = value.strip_prefix('>') {
+        return Ok(SizeFilter {
+            min: Some(parse_size_value(rest)?.saturating_add(1)),
+            max: None,
+        });
+    }
+    if let Some(rest) = value.strip_prefix("<=") {
+        return Ok(SizeFilter {
+            min: None,
+            max: Some(parse_size_value(rest)?),
+        });
+    }
+    if let Some(rest) = value.strip_prefix('<') {
+        return Ok(SizeFilter {
+            min: None,
+            max: Some(parse_size_value(rest)?.saturating_sub(1)),
+        });
+    }
+    let exact = parse_size_value(value)?;
+    Ok(SizeFilter {
+        min: Some(exact),
+        max: Some(exact),
+    })
+}
+
+fn parse_size_value(value: &str) -> Result<u64, SearchParseError> {
+    let value = value.trim();
+    let split = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = value[..split]
+        .parse::<u64>()
+        .map_err(|_| SearchParseError::new(format!("invalid size value '{value}'")))?;
+    let unit = value[split..].trim().to_ascii_lowercase();
+    let multiplier = match unit.as_str() {
+        "" | "b" => 1,
+        "kb" => 1_000,
+        "kib" => 1024,
+        "mb" => 1_000_000,
+        "mib" => 1024 * 1024,
+        "gb" => 1_000_000_000,
+        "gib" => 1024 * 1024 * 1024,
+        "tb" => 1_000_000_000_000,
+        "tib" => 1024_u64.pow(4),
+        other => {
+            return Err(SearchParseError::new(format!(
+                "unsupported size unit '{other}'"
+            )));
+        }
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| SearchParseError::new(format!("size value '{value}' is too large")))
+}
+
+fn parse_time_filter(value: &str) -> Result<TimeFilter, SearchParseError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(SearchParseError::new("mtime: requires a value"));
+    }
+    if value.eq_ignore_ascii_case("today") {
+        let (min, max) = local_day_range(0)?;
+        return Ok(TimeFilter {
+            min: Some(min),
+            max: Some(max),
+        });
+    }
+    if value.eq_ignore_ascii_case("yesterday") {
+        let (min, max) = local_day_range(-1)?;
+        return Ok(TimeFilter {
+            min: Some(min),
+            max: Some(max),
+        });
+    }
+    if let Some((start, end)) = value.split_once("..") {
+        return Ok(TimeFilter {
+            min: Some(parse_date_start(start)?),
+            max: Some(parse_date_end(end)?),
+        });
+    }
+    if let Some(rest) = value.strip_prefix(">=") {
+        return Ok(TimeFilter {
+            min: Some(parse_time_bound(rest, BoundKind::Start)?),
+            max: None,
+        });
+    }
+    if let Some(rest) = value.strip_prefix('>') {
+        return Ok(TimeFilter {
+            min: Some(parse_time_bound(rest, BoundKind::Start)?),
+            max: None,
+        });
+    }
+    if let Some(rest) = value.strip_prefix("<=") {
+        return Ok(TimeFilter {
+            min: None,
+            max: Some(parse_time_bound(rest, BoundKind::End)?),
+        });
+    }
+    if let Some(rest) = value.strip_prefix('<') {
+        if let Some(days) = parse_relative_days(rest) {
+            return Ok(TimeFilter {
+                min: Some(now_unix() - days * 86_400),
+                max: Some(now_unix()),
+            });
+        }
+        return Ok(TimeFilter {
+            min: None,
+            max: Some(parse_time_bound(rest, BoundKind::Start)?),
+        });
+    }
+    let (min, max) = date_range(value)?;
+    Ok(TimeFilter {
+        min: Some(min),
+        max: Some(max),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum BoundKind {
+    Start,
+    End,
+}
+
+fn parse_time_bound(value: &str, kind: BoundKind) -> Result<i64, SearchParseError> {
+    if let Some(days) = parse_relative_days(value) {
+        let boundary = now_unix() - days * 86_400;
+        return Ok(boundary);
+    }
+    match kind {
+        BoundKind::Start => parse_date_start(value),
+        BoundKind::End => parse_date_end(value),
+    }
+}
+
+fn parse_relative_days(value: &str) -> Option<i64> {
+    let value = value.trim().to_ascii_lowercase();
+    let days = value.strip_suffix('d')?.parse::<i64>().ok()?;
+    (days >= 0).then_some(days)
+}
+
+fn date_range(value: &str) -> Result<(i64, i64), SearchParseError> {
+    Ok((parse_date_start(value)?, parse_date_end(value)?))
+}
+
+fn parse_date_start(value: &str) -> Result<i64, SearchParseError> {
+    date_to_unix(value, Time::MIDNIGHT)
+}
+
+fn parse_date_end(value: &str) -> Result<i64, SearchParseError> {
+    date_to_unix(
+        value,
+        Time::from_hms(23, 59, 59).map_err(|err| SearchParseError::new(err.to_string()))?,
+    )
+}
+
+fn date_to_unix(value: &str, time: Time) -> Result<i64, SearchParseError> {
+    let date = parse_date(value)?;
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    Ok(PrimitiveDateTime::new(date, time)
+        .assume_offset(offset)
+        .unix_timestamp())
+}
+
+fn parse_date(value: &str) -> Result<Date, SearchParseError> {
+    let mut parts = value.trim().split('-');
+    let year = parts
+        .next()
+        .and_then(|part| part.parse::<i32>().ok())
+        .ok_or_else(|| SearchParseError::new(format!("invalid date '{value}'")))?;
+    let month = parts
+        .next()
+        .and_then(|part| part.parse::<u8>().ok())
+        .and_then(|month| Month::try_from(month).ok())
+        .ok_or_else(|| SearchParseError::new(format!("invalid date '{value}'")))?;
+    let day = parts
+        .next()
+        .and_then(|part| part.parse::<u8>().ok())
+        .ok_or_else(|| SearchParseError::new(format!("invalid date '{value}'")))?;
+    if parts.next().is_some() {
+        return Err(SearchParseError::new(format!("invalid date '{value}'")));
+    }
+    Date::from_calendar_date(year, month, day)
+        .map_err(|_| SearchParseError::new(format!("invalid date '{value}'")))
+}
+
+fn local_day_range(day_offset: i64) -> Result<(i64, i64), SearchParseError> {
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let date = OffsetDateTime::now_utc()
+        .to_offset(offset)
+        .date()
+        .checked_add(Duration::days(day_offset))
+        .ok_or_else(|| SearchParseError::new("date offset is out of range"))?;
+    let start = PrimitiveDateTime::new(date, Time::MIDNIGHT)
+        .assume_offset(offset)
+        .unix_timestamp();
+    let end = PrimitiveDateTime::new(
+        date,
+        Time::from_hms(23, 59, 59).map_err(|err| SearchParseError::new(err.to_string()))?,
+    )
+    .assume_offset(offset)
+    .unix_timestamp();
+    Ok((start, end))
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl SearchIndex {
@@ -299,6 +707,223 @@ impl SearchIndex {
         }
     }
 
+    pub fn record_by_internal_path(&self, internal_path: &str) -> Option<u32> {
+        let normalized = normalize_internal_path(internal_path);
+        self.internal_paths
+            .iter()
+            .position(|path| path == &normalized)
+            .and_then(|idx| u32::try_from(idx).ok())
+    }
+
+    pub fn apply_live_event(&mut self, event: LiveUpdateEvent) -> anyhow::Result<bool> {
+        let changed = match event {
+            LiveUpdateEvent::Created {
+                internal_path,
+                metadata,
+            } => self.add_live_record(&internal_path, &metadata)?,
+            LiveUpdateEvent::Removed { internal_path } => self
+                .record_by_internal_path(&internal_path)
+                .map(|idx| self.remove_subtree(idx))
+                .transpose()?
+                .unwrap_or(false),
+            LiveUpdateEvent::Renamed {
+                old_internal_path,
+                new_internal_path,
+                metadata,
+            } => {
+                if let Some(idx) = self.record_by_internal_path(&old_internal_path) {
+                    self.rename_live_record(idx, &new_internal_path, &metadata)?
+                } else {
+                    self.add_live_record(&new_internal_path, &metadata)?
+                }
+            }
+            LiveUpdateEvent::Metadata {
+                internal_path,
+                metadata,
+            } => self
+                .record_by_internal_path(&internal_path)
+                .map(|idx| self.refresh_record_metadata(idx, &metadata))
+                .unwrap_or(false),
+        };
+        if changed {
+            self.generation = self.generation.saturating_add(1);
+            self.rebuild_accelerators();
+        }
+        Ok(changed)
+    }
+
+    pub fn remove_subtree(&mut self, record_idx: u32) -> anyhow::Result<bool> {
+        if (record_idx as usize) >= self.records.len() {
+            return Ok(false);
+        }
+        let mut keep = vec![true; self.records.len()];
+        let mut stack = vec![record_idx];
+        while let Some(idx) = stack.pop() {
+            if (idx as usize) >= keep.len() || !keep[idx as usize] {
+                continue;
+            }
+            keep[idx as usize] = false;
+            for (child_idx, rec) in self.records.iter().enumerate() {
+                if rec.parent == idx {
+                    stack.push(child_idx as u32);
+                }
+            }
+        }
+        self.rebuild_from_keep(&keep)?;
+        Ok(true)
+    }
+
+    pub fn refresh_record_metadata(
+        &mut self,
+        record_idx: u32,
+        metadata: &LiveRecordMetadata,
+    ) -> bool {
+        let Some(record) = self.records.get_mut(record_idx as usize) else {
+            return false;
+        };
+        record.size = metadata.size;
+        record.mtime = metadata.mtime;
+        record.flags = live_flags(metadata);
+        true
+    }
+
+    fn add_live_record(
+        &mut self,
+        internal_path: &str,
+        metadata: &LiveRecordMetadata,
+    ) -> anyhow::Result<bool> {
+        let internal_path = normalize_internal_path(internal_path);
+        if let Some(idx) = self.record_by_internal_path(&internal_path) {
+            return Ok(self.refresh_record_metadata(idx, metadata));
+        }
+        let (parent_path, name) = split_internal_path(&internal_path);
+        if name.is_empty() {
+            return Ok(false);
+        }
+        let parent = self
+            .record_by_internal_path(parent_path)
+            .unwrap_or(ROOT_PARENT);
+        self.push_indexed_record(parent, name, metadata)?;
+        Ok(true)
+    }
+
+    fn rename_live_record(
+        &mut self,
+        record_idx: u32,
+        new_internal_path: &str,
+        metadata: &LiveRecordMetadata,
+    ) -> anyhow::Result<bool> {
+        let new_internal_path = normalize_internal_path(new_internal_path);
+        let (parent_path, name) = split_internal_path(&new_internal_path);
+        if name.is_empty() {
+            return Ok(false);
+        }
+        let parent = self
+            .record_by_internal_path(parent_path)
+            .unwrap_or(ROOT_PARENT);
+        let name_offset = u32::try_from(self.string_pool.len())?;
+        let name_len = u32::try_from(name.len())?;
+        self.string_pool.extend_from_slice(name.as_bytes());
+        let folded = name.to_lowercase();
+        let folded_offset = u32::try_from(self.folded_pool.len())?;
+        let folded_len = u32::try_from(folded.len())?;
+        self.folded_pool.extend_from_slice(folded.as_bytes());
+
+        let Some(record) = self.records.get_mut(record_idx as usize) else {
+            return Ok(false);
+        };
+        record.parent = parent;
+        record.name_offset = name_offset;
+        record.name_len = name_len;
+        record.folded_offset = folded_offset;
+        record.folded_len = folded_len;
+        record.size = metadata.size;
+        record.mtime = metadata.mtime;
+        record.flags = live_flags(metadata);
+        Ok(true)
+    }
+
+    fn push_indexed_record(
+        &mut self,
+        parent: u32,
+        name: &str,
+        metadata: &LiveRecordMetadata,
+    ) -> anyhow::Result<u32> {
+        let name_offset = u32::try_from(self.string_pool.len())?;
+        let name_len = u32::try_from(name.len())?;
+        self.string_pool.extend_from_slice(name.as_bytes());
+        let folded = name.to_lowercase();
+        let folded_offset = u32::try_from(self.folded_pool.len())?;
+        let folded_len = u32::try_from(folded.len())?;
+        self.folded_pool.extend_from_slice(folded.as_bytes());
+        let idx = u32::try_from(self.records.len())?;
+        self.records.push(IndexedRecord {
+            parent,
+            size: metadata.size,
+            mtime: metadata.mtime,
+            name_offset,
+            name_len,
+            folded_offset,
+            folded_len,
+            flags: live_flags(metadata),
+        });
+        Ok(idx)
+    }
+
+    fn rebuild_from_keep(&mut self, keep: &[bool]) -> anyhow::Result<()> {
+        let mut old_to_new = vec![None; self.records.len()];
+        let mut records = Vec::new();
+        let mut string_pool = Vec::new();
+        let mut folded_pool = Vec::new();
+        for (old_idx, should_keep) in keep.iter().copied().enumerate() {
+            if !should_keep {
+                continue;
+            }
+            let new_idx = u32::try_from(records.len())?;
+            old_to_new[old_idx] = Some(new_idx);
+            let old = &self.records[old_idx];
+            let name = self.name(old_idx as u32);
+            let folded = name.to_lowercase();
+            let name_offset = u32::try_from(string_pool.len())?;
+            let name_len = u32::try_from(name.len())?;
+            string_pool.extend_from_slice(name.as_bytes());
+            let folded_offset = u32::try_from(folded_pool.len())?;
+            let folded_len = u32::try_from(folded.len())?;
+            folded_pool.extend_from_slice(folded.as_bytes());
+            records.push(IndexedRecord {
+                parent: old.parent,
+                size: old.size,
+                mtime: old.mtime,
+                name_offset,
+                name_len,
+                folded_offset,
+                folded_len,
+                flags: old.flags,
+            });
+        }
+        for (old_idx, should_keep) in keep.iter().copied().enumerate() {
+            if !should_keep {
+                continue;
+            }
+            let Some(new_idx) = old_to_new[old_idx] else {
+                continue;
+            };
+            let old_parent = self.records[old_idx].parent;
+            records[new_idx as usize].parent = if old_parent == ROOT_PARENT {
+                ROOT_PARENT
+            } else {
+                old_to_new
+                    .get(old_parent as usize)
+                    .and_then(|value| *value)
+                    .unwrap_or(ROOT_PARENT)
+            };
+        }
+        self.records = records;
+        self.string_pool = string_pool;
+        self.folded_pool = folded_pool;
+        Ok(())
+    }
+
     pub fn display_prefix(&self, mounted: bool, primary_mount_point: &str) -> String {
         if mounted && !primary_mount_point.trim().is_empty() {
             primary_mount_point.trim_end_matches('/').to_owned()
@@ -323,11 +948,11 @@ impl SearchIndex {
 
     pub fn search(&self, query: &str, sort_key: SortKey, direction: SortDirection) -> Vec<u32> {
         let request = parse_search_query(query).unwrap_or_else(|_| SearchRequest {
-            terms: query
+            include: query
                 .split_whitespace()
-                .map(|s| SearchTerm::Contains(s.to_lowercase()))
+                .map(|s| SearchClause::NameContains(s.to_lowercase()))
                 .collect(),
-            filters: SearchFilters::default(),
+            exclude: Vec::new(),
         });
         self.search_request(&request, sort_key, direction)
     }
@@ -350,12 +975,21 @@ impl SearchIndex {
         };
 
         if !request.is_empty() {
-            let rank = self.rank_for(sort_key);
-            hits.par_sort_unstable_by(|a, b| {
-                rank[*a as usize]
-                    .cmp(&rank[*b as usize])
-                    .then_with(|| a.cmp(b))
-            });
+            if sort_key == SortKey::Relevance {
+                hits.par_sort_unstable_by(|a, b| {
+                    self.relevance_score(*a, request)
+                        .cmp(&self.relevance_score(*b, request))
+                        .then_with(|| self.folded_name(*a).cmp(self.folded_name(*b)))
+                        .then_with(|| a.cmp(b))
+                });
+            } else {
+                let rank = self.rank_for(sort_key);
+                hits.par_sort_unstable_by(|a, b| {
+                    rank[*a as usize]
+                        .cmp(&rank[*b as usize])
+                        .then_with(|| a.cmp(b))
+                });
+            }
         }
 
         if direction == SortDirection::Desc {
@@ -365,61 +999,49 @@ impl SearchIndex {
     }
 
     fn matches_request(&self, record_idx: u32, request: &SearchRequest) -> bool {
-        let name = self.folded_name(record_idx);
-        for term in &request.terms {
-            match term {
-                SearchTerm::Contains(needle) | SearchTerm::Phrase(needle) => {
-                    if !name.contains(needle) {
-                        return false;
-                    }
-                }
-                SearchTerm::Wildcard(pattern) => {
-                    if !wildcard_matches(pattern, name) {
-                        return false;
-                    }
-                }
+        for clause in &request.include {
+            if !self.matches_clause(record_idx, clause) {
+                return false;
             }
         }
 
+        for clause in &request.exclude {
+            if self.matches_clause(record_idx, clause) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn matches_clause(&self, record_idx: u32, clause: &SearchClause) -> bool {
+        let name = self.folded_name(record_idx);
         let rec = &self.records[record_idx as usize];
-        if let Some(file_type) = request.filters.file_type {
-            let matches = match file_type {
+        match clause {
+            SearchClause::NameContains(needle) | SearchClause::NamePhrase(needle) => {
+                name.contains(needle)
+            }
+            SearchClause::NameWildcard(pattern) => wildcard_matches(pattern, name),
+            SearchClause::Extension(extensions) => file_extension(name)
+                .map(|ext| extensions.iter().any(|wanted| wanted == ext))
+                .unwrap_or(false),
+            SearchClause::FileType(file_type) => match file_type {
                 SearchFileType::Dir => rec.is_dir(),
                 SearchFileType::Symlink => rec.is_symlink(),
                 SearchFileType::File => !rec.is_dir() && !rec.is_symlink(),
-            };
-            if !matches {
-                return false;
+            },
+            SearchClause::PathContains(needle) => self
+                .internal_path(record_idx)
+                .to_lowercase()
+                .contains(needle),
+            SearchClause::Size(filter) => {
+                filter.min.map(|min| rec.size >= min).unwrap_or(true)
+                    && filter.max.map(|max| rec.size <= max).unwrap_or(true)
+            }
+            SearchClause::Mtime(filter) => {
+                filter.min.map(|min| rec.mtime >= min).unwrap_or(true)
+                    && filter.max.map(|max| rec.mtime <= max).unwrap_or(true)
             }
         }
-
-        if !request.filters.extensions.is_empty() {
-            let Some(ext) = file_extension(name) else {
-                return false;
-            };
-            if !request
-                .filters
-                .extensions
-                .iter()
-                .any(|wanted| wanted == ext)
-            {
-                return false;
-            }
-        }
-
-        if !request.filters.path_contains.is_empty() {
-            let path = self.internal_path(record_idx).to_lowercase();
-            if !request
-                .filters
-                .path_contains
-                .iter()
-                .all(|needle| path.contains(needle))
-            {
-                return false;
-            }
-        }
-
-        true
     }
 
     fn build_path_for(&self, record_idx: u32, depth: usize) -> String {
@@ -522,6 +1144,7 @@ impl SearchIndex {
 
     fn pick_order(&self, sort_key: SortKey) -> &Vec<u32> {
         match sort_key {
+            SortKey::Relevance => &self.order_by_name,
             SortKey::Name => &self.order_by_name,
             SortKey::Path => &self.order_by_path,
             SortKey::Size => &self.order_by_size,
@@ -591,6 +1214,65 @@ impl SearchIndex {
             (0..self.records.len() as u32).collect()
         }
     }
+
+    fn relevance_score(&self, record_idx: u32, request: &SearchRequest) -> RelevanceScore {
+        let name = self.folded_name(record_idx);
+        let path_depth = self
+            .internal_path(record_idx)
+            .trim_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .count() as u32;
+        let mut match_score = 100u32;
+
+        for clause in &request.include {
+            match clause {
+                SearchClause::NameContains(needle) | SearchClause::NamePhrase(needle) => {
+                    let score = if name == needle {
+                        0
+                    } else if name.starts_with(needle) {
+                        10
+                    } else if name.contains(needle) {
+                        20
+                    } else {
+                        80
+                    };
+                    match_score = match_score.min(score);
+                }
+                SearchClause::NameWildcard(pattern) => {
+                    if wildcard_matches(pattern, name) {
+                        match_score = match_score.min(if pattern.trim_matches('*') == name {
+                            5
+                        } else if pattern.ends_with('*')
+                            && name.starts_with(pattern.trim_end_matches('*'))
+                        {
+                            15
+                        } else {
+                            30
+                        });
+                    }
+                }
+                SearchClause::Extension(_)
+                | SearchClause::FileType(_)
+                | SearchClause::PathContains(_)
+                | SearchClause::Size(_)
+                | SearchClause::Mtime(_) => {}
+            }
+        }
+
+        RelevanceScore {
+            match_score,
+            name_len: name.len() as u32,
+            path_depth,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct RelevanceScore {
+    match_score: u32,
+    name_len: u32,
+    path_depth: u32,
 }
 
 pub fn merge_search(
@@ -601,11 +1283,11 @@ pub fn merge_search(
     direction: SortDirection,
 ) -> Vec<SearchHit> {
     let request = parse_search_query(query).unwrap_or_else(|_| SearchRequest {
-        terms: query
+        include: query
             .split_whitespace()
-            .map(|s| SearchTerm::Contains(s.to_lowercase()))
+            .map(|s| SearchClause::NameContains(s.to_lowercase()))
             .collect(),
-        filters: SearchFilters::default(),
+        exclude: Vec::new(),
     });
     merge_search_request(indexes, device_filter, &request, sort_key, direction)
 }
@@ -644,7 +1326,9 @@ pub fn merge_search_request(
             .iter()
             .find(|idx| idx.metadata.device_id == b.device_id);
         match (ia, ib) {
-            (Some(ia), Some(ib)) => compare_hits(ia, a.record_idx, ib, b.record_idx, sort_key),
+            (Some(ia), Some(ib)) => {
+                compare_hits(ia, a.record_idx, ib, b.record_idx, sort_key, request)
+            }
             _ => a
                 .device_id
                 .cmp(&b.device_id)
@@ -664,10 +1348,15 @@ fn compare_hits(
     b_idx: &SearchIndex,
     b: u32,
     sort_key: SortKey,
+    request: &SearchRequest,
 ) -> Ordering {
     let ar = &a_idx.records[a as usize];
     let br = &b_idx.records[b as usize];
     let ord = match sort_key {
+        SortKey::Relevance => a_idx
+            .relevance_score(a, request)
+            .cmp(&b_idx.relevance_score(b, request))
+            .then_with(|| a_idx.folded_name(a).cmp(b_idx.folded_name(b))),
         SortKey::Name => a_idx.folded_name(a).cmp(b_idx.folded_name(b)),
         SortKey::Path => a_idx.internal_path(a).cmp(b_idx.internal_path(b)),
         SortKey::Size => ar
@@ -756,12 +1445,12 @@ fn normalize_extension(value: &str) -> String {
 
 fn request_candidate_tokens(request: &SearchRequest) -> Vec<String> {
     let mut out = Vec::new();
-    for term in &request.terms {
-        match term {
-            SearchTerm::Contains(value) | SearchTerm::Phrase(value) => {
+    for clause in &request.include {
+        match clause {
+            SearchClause::NameContains(value) | SearchClause::NamePhrase(value) => {
                 out.push(value.clone());
             }
-            SearchTerm::Wildcard(pattern) => {
+            SearchClause::NameWildcard(pattern) => {
                 out.extend(
                     pattern
                         .split('*')
@@ -769,6 +1458,11 @@ fn request_candidate_tokens(request: &SearchRequest) -> Vec<String> {
                         .map(str::to_owned),
                 );
             }
+            SearchClause::Extension(_)
+            | SearchClause::FileType(_)
+            | SearchClause::PathContains(_)
+            | SearchClause::Size(_)
+            | SearchClause::Mtime(_) => {}
         }
     }
     out
@@ -825,6 +1519,52 @@ pub fn join_prefix(prefix: &str, internal_path: &str) -> String {
     } else {
         format!("{}{}", prefix.trim_end_matches('/'), internal_path)
     }
+}
+
+fn normalize_internal_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len().max(1));
+    if !path.starts_with('/') {
+        out.push('/');
+    }
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                out.push('/');
+            }
+            prev_slash = true;
+        } else {
+            out.push(ch);
+            prev_slash = false;
+        }
+    }
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    if out.is_empty() { "/".to_owned() } else { out }
+}
+
+fn split_internal_path(path: &str) -> (&str, &str) {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() || path == "/" {
+        return ("/", "");
+    }
+    let Some(pos) = path.rfind('/') else {
+        return ("/", path);
+    };
+    let parent = if pos == 0 { "/" } else { &path[..pos] };
+    (parent, &path[pos + 1..])
+}
+
+fn live_flags(metadata: &LiveRecordMetadata) -> u8 {
+    let mut flags = 0;
+    if metadata.is_dir {
+        flags |= crate::model::FLAG_IS_DIR;
+    }
+    if metadata.is_symlink {
+        flags |= crate::model::FLAG_IS_SYMLINK;
+    }
+    flags
 }
 
 fn folded_slice<'a>(pool: &'a [u8], rec: &IndexedRecord) -> &'a str {
@@ -966,5 +1706,80 @@ mod tests {
     #[test]
     fn invalid_query_reports_error() {
         assert!(parse_search_query("\"unterminated").is_err());
+    }
+
+    #[test]
+    fn negation_filters_matching_names() {
+        let idx = sample_index();
+        let request = parse_search_query("*.rs !lib").unwrap();
+        let hits = idx.search_request(&request, SortKey::Path, SortDirection::Asc);
+        assert_eq!(hits, vec![4]);
+    }
+
+    #[test]
+    fn size_filter_works() {
+        let idx = sample_index();
+        let request = parse_search_query("type:file size:<35").unwrap();
+        let hits = idx.search_request(&request, SortKey::Path, SortDirection::Asc);
+        assert_eq!(hits, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn mtime_date_range_filter_works() {
+        let idx = sample_index();
+        let request = parse_search_query("mtime:1970-01-01..2100-01-01").unwrap();
+        let hits = idx.search_request(&request, SortKey::Path, SortDirection::Asc);
+        assert_eq!(hits.len(), idx.records.len());
+    }
+
+    #[test]
+    fn relevance_prefers_exact_and_prefix_names() {
+        let idx = sample_index();
+        let request = parse_search_query("main").unwrap();
+        let hits = idx.search_request(&request, SortKey::Relevance, SortDirection::Asc);
+        assert_eq!(hits.first().copied(), Some(4));
+    }
+
+    #[test]
+    fn live_update_create_rename_and_remove_work() {
+        let mut idx = sample_index();
+        assert!(
+            idx.apply_live_event(LiveUpdateEvent::Created {
+                internal_path: "/src/new.rs".into(),
+                metadata: LiveRecordMetadata {
+                    size: 7,
+                    mtime: 9,
+                    is_dir: false,
+                    is_symlink: false,
+                },
+            })
+            .unwrap()
+        );
+        let new_idx = idx.record_by_internal_path("/src/new.rs").unwrap();
+        assert_eq!(idx.name(new_idx), "new.rs");
+
+        assert!(
+            idx.apply_live_event(LiveUpdateEvent::Renamed {
+                old_internal_path: "/src/new.rs".into(),
+                new_internal_path: "/src/new_name.rs".into(),
+                metadata: LiveRecordMetadata {
+                    size: 8,
+                    mtime: 10,
+                    is_dir: false,
+                    is_symlink: false,
+                },
+            })
+            .unwrap()
+        );
+        assert!(idx.record_by_internal_path("/src/new.rs").is_none());
+        assert!(idx.record_by_internal_path("/src/new_name.rs").is_some());
+
+        assert!(
+            idx.apply_live_event(LiveUpdateEvent::Removed {
+                internal_path: "/src/new_name.rs".into(),
+            })
+            .unwrap()
+        );
+        assert!(idx.record_by_internal_path("/src/new_name.rs").is_none());
     }
 }

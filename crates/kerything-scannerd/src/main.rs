@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -5,14 +6,21 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
 use kerything_core::daemon_model::{
-    ScannerAuthorizeResult, ScannerStartScanParams, ScannerStartScanResult, ScannerStatusResult,
+    ScanState, ScannerAuthorizeResult, ScannerCancelScanParams, ScannerJobId, ScannerJobSummary,
+    ScannerStartScanParams, ScannerStartScanResult, ScannerStatusResult, ScannerTakeResultParams,
+    ScannerTakeResultResult,
 };
 use kerything_core::ipc::{IpcFrame, params_as, read_frame, write_frame};
-use kerything_core::scanner::{scan_device, validate_device_path};
+use kerything_core::model::{FsType, ScanDatabase};
+use kerything_core::scanner::{ScanCancellation, scan_device, validate_device_path};
 use kerything_core::{VERSION, stream};
 use serde_json::{Value, json};
 
@@ -71,7 +79,7 @@ fn print_usage() {
     );
 }
 
-fn serve(socket_path: PathBuf, _idle_timeout: Duration) -> anyhow::Result<()> {
+fn serve(socket_path: PathBuf, idle_timeout: Duration) -> anyhow::Result<()> {
     let listener = if let Some(listener) = inherited_systemd_listener()? {
         eprintln!("kerything-scannerd: using inherited systemd socket");
         listener
@@ -92,7 +100,7 @@ fn serve(socket_path: PathBuf, _idle_timeout: Duration) -> anyhow::Result<()> {
         match stream {
             Ok(stream) => {
                 thread::spawn(move || {
-                    if let Err(err) = handle_client(stream) {
+                    if let Err(err) = handle_client(stream, idle_timeout) {
                         eprintln!("kerything-scannerd: client error: {err:#}");
                     }
                 });
@@ -147,15 +155,19 @@ fn inherited_systemd_listener() -> anyhow::Result<Option<UnixListener>> {
     Ok(Some(listener))
 }
 
-fn handle_client(mut stream: UnixStream) -> anyhow::Result<()> {
+fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Result<()> {
     let peer = peer_credentials(&stream)?;
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let jobs: Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>> = Arc::new(Mutex::new(HashMap::new()));
+    let next_job = Arc::new(AtomicU64::new(1));
     let mut authorized = false;
+    let mut last_error: Option<String> = None;
 
     while let Some(frame) = read_frame(&mut stream)? {
         let id = frame.header.id;
         let Some(id) = id else {
-            write_frame(
-                &mut stream,
+            write_locked(
+                &writer,
                 &IpcFrame::error(None, "invalid_request", "request id is required"),
             )?;
             continue;
@@ -181,20 +193,26 @@ fn handle_client(mut stream: UnixStream) -> anyhow::Result<()> {
             "scanner.status" => Ok((
                 serde_json::to_value(ScannerStatusResult {
                     authorized,
-                    active: false,
+                    active_jobs: job_summaries(&jobs),
+                    idle_timeout_seconds: idle_timeout.as_secs(),
+                    last_error: last_error.clone(),
                 })?,
                 Vec::new(),
             )),
-            "scanner.cancel_scan" => Ok((
-                json!({"cancelled": false, "message": "no cancellable scan is active on this connection"}),
-                Vec::new(),
-            )),
+            "scanner.cancel_scan" => cancel_scan(&frame, &jobs),
             "scanner.shutdown_idle" => Ok((json!({"accepted": true}), Vec::new())),
             "scanner.start_scan" => {
                 if !authorized {
                     Err(anyhow::anyhow!("scanner connection is not authorized"))
                 } else {
-                    start_scan(&mut stream, &frame)
+                    start_scan(&frame, &writer, &jobs, &next_job)
+                }
+            }
+            "scanner.take_result" => {
+                if !authorized {
+                    Err(anyhow::anyhow!("scanner connection is not authorized"))
+                } else {
+                    take_result(&frame, &jobs)
                 }
             }
             other => Err(anyhow::anyhow!("unknown method: {other}")),
@@ -202,9 +220,12 @@ fn handle_client(mut stream: UnixStream) -> anyhow::Result<()> {
 
         let response = match response {
             Ok((result, payload)) => IpcFrame::ok(id, result, payload),
-            Err(err) => IpcFrame::error(Some(id), "request_failed", format!("{err:#}")),
+            Err(err) => {
+                last_error = Some(format!("{err:#}"));
+                IpcFrame::error(Some(id), "request_failed", format!("{err:#}"))
+            }
         };
-        write_frame(&mut stream, &response)?;
+        write_locked(&writer, &response)?;
 
         if method == "scanner.shutdown_idle" {
             break;
@@ -213,7 +234,12 @@ fn handle_client(mut stream: UnixStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn start_scan(stream: &mut UnixStream, frame: &IpcFrame) -> anyhow::Result<(Value, Vec<u8>)> {
+fn start_scan(
+    frame: &IpcFrame,
+    writer: &Arc<Mutex<UnixStream>>,
+    jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
+    next_job: &Arc<AtomicU64>,
+) -> anyhow::Result<(Value, Vec<u8>)> {
     let params: ScannerStartScanParams = params_as(frame)?;
     anyhow::ensure!(
         params.fs_type.is_supported_for_scan(),
@@ -221,28 +247,226 @@ fn start_scan(stream: &mut UnixStream, frame: &IpcFrame) -> anyhow::Result<(Valu
         params.fs_type
     );
     let device = validate_device_path(&params.device_path)?;
+    let job_id = next_job.fetch_add(1, Ordering::Relaxed);
+    let cancellation = ScanCancellation::new();
+    let device_path = device.display().to_string();
+    let fs_type = params.fs_type;
+    jobs.lock().unwrap().insert(
+        job_id,
+        ScannerJob {
+            summary: ScannerJobSummary {
+                job_id,
+                device_path: device_path.clone(),
+                fs_type,
+                state: ScanState::Running,
+                progress: 0,
+                record_count: None,
+                error: None,
+            },
+            cancellation: cancellation.clone(),
+            payload: None,
+        },
+    );
+
+    let worker_jobs = jobs.clone();
+    let worker_writer = writer.clone();
+    thread::spawn(move || {
+        let result = run_scan_job(
+            job_id,
+            &device,
+            fs_type,
+            &worker_jobs,
+            &worker_writer,
+            cancellation,
+        );
+        if let Err(err) = result {
+            finish_job_failed(job_id, &worker_jobs, &worker_writer, format!("{err:#}"));
+        }
+    });
+
+    Ok((
+        serde_json::to_value(ScannerStartScanResult { job_id })?,
+        Vec::new(),
+    ))
+}
+
+fn run_scan_job(
+    job_id: ScannerJobId,
+    device: &Path,
+    fs_type: FsType,
+    jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    cancellation: ScanCancellation,
+) -> anyhow::Result<()> {
+    let device_path = device.display().to_string();
     let mut progress = |done: u64, total: u64| {
         let total = total.max(1);
         let percent = (((done.min(total) * 100) + total / 2) / total).min(100) as u8;
-        let _ = write_frame(
-            &mut *stream,
+        update_job_progress(job_id, jobs, percent);
+        let _ = write_locked(
+            writer,
             &IpcFrame::event(
-                "scan_progress",
+                "scanner.scan_progress",
                 json!({
-                    "device_path": device.display().to_string(),
+                    "job_id": job_id,
+                    "device_path": device_path,
                     "percent": percent,
                 }),
             ),
         );
     };
-    let db = scan_device(&device, params.fs_type, &mut progress)?;
+    let db = scan_device(device, fs_type, &mut progress, &cancellation)?;
+    finish_job_success(job_id, jobs, writer, db)
+}
+
+fn cancel_scan(
+    frame: &IpcFrame,
+    jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
+) -> anyhow::Result<(Value, Vec<u8>)> {
+    let params: ScannerCancelScanParams = params_as(frame)?;
+    let mut jobs = jobs.lock().unwrap();
+    let Some(job) = jobs.get_mut(&params.job_id) else {
+        return Ok((
+            json!({"cancelled": false, "message": "unknown scanner job"}),
+            Vec::new(),
+        ));
+    };
+    job.cancellation.cancel();
+    if job.summary.state == ScanState::Running {
+        job.summary.state = ScanState::Cancelled;
+        job.summary.error = Some("scan cancelled".into());
+    }
+    Ok((
+        json!({"cancelled": true, "message": "cancel requested"}),
+        Vec::new(),
+    ))
+}
+
+fn take_result(
+    frame: &IpcFrame,
+    jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
+) -> anyhow::Result<(Value, Vec<u8>)> {
+    let params: ScannerTakeResultParams = params_as(frame)?;
+    let mut jobs = jobs.lock().unwrap();
+    let Some(job) = jobs.get_mut(&params.job_id) else {
+        anyhow::bail!("unknown scanner job {}", params.job_id);
+    };
+    match job.summary.state {
+        ScanState::Finished => {
+            let payload = job
+                .payload
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("scanner result was already taken"))?;
+            let record_count = job.summary.record_count.unwrap_or(0);
+            Ok((
+                serde_json::to_value(ScannerTakeResultResult { record_count })?,
+                payload,
+            ))
+        }
+        ScanState::Failed => anyhow::bail!(
+            "{}",
+            job.summary
+                .error
+                .clone()
+                .unwrap_or_else(|| "scanner job failed".into())
+        ),
+        ScanState::Cancelled => anyhow::bail!("scanner job was cancelled"),
+        ScanState::Queued | ScanState::Running => anyhow::bail!("scanner job is not finished"),
+    }
+}
+
+fn update_job_progress(
+    job_id: ScannerJobId,
+    jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
+    percent: u8,
+) {
+    if let Some(job) = jobs.lock().unwrap().get_mut(&job_id)
+        && job.summary.state == ScanState::Running
+    {
+        job.summary.progress = percent;
+    }
+}
+
+fn finish_job_success(
+    job_id: ScannerJobId,
+    jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    db: ScanDatabase,
+) -> anyhow::Result<()> {
     let record_count = db.records.len();
     let mut payload = Vec::new();
     stream::write_scan_stream(&mut payload, &db)?;
-    Ok((
-        serde_json::to_value(ScannerStartScanResult { record_count })?,
-        payload,
-    ))
+    if let Some(job) = jobs.lock().unwrap().get_mut(&job_id) {
+        if job.summary.state == ScanState::Cancelled {
+            let _ = write_locked(
+                writer,
+                &IpcFrame::event(
+                    "scanner.scan_cancelled",
+                    json!({"job_id": job_id, "device_path": job.summary.device_path}),
+                ),
+            );
+            return Ok(());
+        }
+        job.summary.state = ScanState::Finished;
+        job.summary.progress = 100;
+        job.summary.record_count = Some(record_count);
+        job.payload = Some(payload);
+    }
+    write_locked(
+        writer,
+        &IpcFrame::event(
+            "scanner.scan_finished",
+            json!({"job_id": job_id, "record_count": record_count}),
+        ),
+    )?;
+    Ok(())
+}
+
+fn finish_job_failed(
+    job_id: ScannerJobId,
+    jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
+    writer: &Arc<Mutex<UnixStream>>,
+    message: String,
+) {
+    let state = if message.contains("scan cancelled") {
+        ScanState::Cancelled
+    } else {
+        ScanState::Failed
+    };
+    if let Some(job) = jobs.lock().unwrap().get_mut(&job_id) {
+        job.summary.state = state;
+        job.summary.error = Some(message.clone());
+    }
+    let event = if state == ScanState::Cancelled {
+        "scanner.scan_cancelled"
+    } else {
+        "scanner.scan_failed"
+    };
+    let _ = write_locked(
+        writer,
+        &IpcFrame::event(event, json!({"job_id": job_id, "message": message})),
+    );
+}
+
+fn job_summaries(jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>) -> Vec<ScannerJobSummary> {
+    let mut summaries: Vec<_> = jobs
+        .lock()
+        .unwrap()
+        .values()
+        .map(|job| job.summary.clone())
+        .collect();
+    summaries.sort_by_key(|job| job.job_id);
+    summaries
+}
+
+fn write_locked(writer: &Arc<Mutex<UnixStream>>, frame: &IpcFrame) -> anyhow::Result<()> {
+    write_frame(&mut *writer.lock().unwrap(), frame)
+}
+
+struct ScannerJob {
+    summary: ScannerJobSummary,
+    cancellation: ScanCancellation,
+    payload: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug)]

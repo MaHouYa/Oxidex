@@ -7,7 +7,7 @@ use ntfs::structured_values::{NtfsFileAttributeFlags, NtfsFileName, NtfsFileName
 use ntfs::{Ntfs, NtfsAttributeType, NtfsFileFlags};
 
 use crate::model::{FsType, ROOT_PARENT, ScanDatabase};
-use crate::scanner::ProgressCallback;
+use crate::scanner::{ProgressCallback, ScanCancellation};
 
 const ROOT_MFT_RECORD: u64 = 5;
 
@@ -30,7 +30,11 @@ struct NameInfo {
     attrs: NtfsFileAttributeFlags,
 }
 
-pub fn scan(path: &Path, progress: &mut ProgressCallback<'_>) -> anyhow::Result<ScanDatabase> {
+pub fn scan(
+    path: &Path,
+    progress: &mut ProgressCallback<'_>,
+    cancellation: &ScanCancellation,
+) -> anyhow::Result<ScanDatabase> {
     progress(0, 1);
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -59,6 +63,7 @@ pub fn scan(path: &Path, progress: &mut ProgressCallback<'_>) -> anyhow::Result<
 
     for record_number in 0..record_count {
         if record_number & 4095 == 0 {
+            cancellation.ensure_not_cancelled()?;
             progress(record_number, record_count.max(1));
         }
 

@@ -17,7 +17,9 @@ Kerything is a community project and is not affiliated with Voidtools.
 - NTFS V1 scanner reads MFT metadata, preserves hard-link names as separate entries, filters duplicate DOS 8.3 aliases, and hides early `$` system files.
 - EXT4 V1 scanner reads filesystem metadata, inode metadata, and directory entries through a Rust-native crate.
 - Btrfs V2 scanner reads the default/main root through Rust-native Btrfs metadata APIs and rejects unsupported multi-device layouts clearly.
-- Search uses Unicode lowercase folding plus byte trigrams for tokens of length three or more, with substring refinement, short-token fallback, wildcards, quoted phrases, and `ext:`/`type:`/`path:` filters.
+- Search uses Unicode lowercase folding plus byte trigrams for positive name tokens of length three or more, with substring refinement, short-token fallback, relevance sorting, wildcards, quoted phrases, negation, and `ext:`/`type:`/`path:`/`size:`/`mtime:` filters.
+- V4 daemon scans are queued, asynchronous, cancellable, and tracked through job status. Mounted indexed filesystems can be kept fresh with unprivileged `notify`/inotify updates.
+- `kerything-cli doctor` diagnoses daemon, scanner socket, Polkit, config, index, systemd, and security setup problems even when `kerythingd` is not running.
 - Multi-device search, device-scope filtering, result sorting, mounted/unmounted path display, and persisted snapshot reload on restart.
 - Guaranteed actions: open file, open containing folder, copy file name/path, right-click context actions, and properties.
 
@@ -39,9 +41,9 @@ The Cargo workspace contains these primary crates:
 - `crates/kerything-scanner-helper`: the compatibility privileged scanner CLI kept for one release.
 - `crates/kerything-core`: shared device discovery, scan stream, indexing, search, snapshots, path resolution, and scanner backends.
 
-`kerythingd` discovers known devices from `/dev/disk/by-*`, `/run/udev/data`, and `/proc/self/mountinfo`. It stores snapshots in the user data directory and connects to `kerything-scannerd` only when a raw rescan is requested. If the scanner daemon is not reachable, it can still fall back to the compatibility helper.
+`kerythingd` discovers known devices from `/dev/disk/by-*`, `/run/udev/data`, and `/proc/self/mountinfo`. It stores snapshots in the user data directory, keeps index health sidecars beside snapshots, owns the scan job queue, and connects to `kerything-scannerd` only when a raw rescan is requested. If the scanner daemon is not reachable, it can still fall back to the compatibility helper.
 
-`kerything-scannerd` validates the device path, resolves symlinks, rejects unsafe inputs, scans the requested filesystem, reports progress as structured IPC events, and returns the existing binary scan stream as a framed payload.
+`kerything-scannerd` validates the device path, resolves symlinks, rejects unsafe inputs, starts cancellable scanner jobs, reports progress as structured IPC events, and returns the existing binary scan stream through `scanner.take_result`.
 
 The GUI defaults to daemon mode. Use the standalone fallback when developing or recovering from daemon setup problems:
 
@@ -101,11 +103,17 @@ CLI examples:
 
 ```shell
 kerything-cli search "ext:rs path:src main"
+kerything-cli search --sort relevance --limit 100 "main !target"
 kerything-cli search --json "foo"
+kerything-cli explain 'ext:rs path:src "scan stream"'
 kerything-cli rofi "foo"
+kerything-cli rofi --show-id "foo"
 kerything-cli indexes
 kerything-cli devices
-kerything-cli scan partuuid:...
+kerything-cli scan partuuid:... --wait
+kerything-cli jobs
+kerything-cli cancel 1
+kerything-cli doctor
 kerything-cli config get
 kerything-cli config set ui.theme dark
 ```
@@ -146,15 +154,33 @@ For local scanner testing, `kerythingd` first tries `/run/kerything/scannerd.soc
 
 ## Search Syntax
 
-Plain whitespace-separated terms match file names as case-insensitive substrings. V2 also supports:
+Plain whitespace-separated terms match file names as case-insensitive substrings. V4 supports:
 
 - Wildcards: `*.rs`, `foo*`, `*backup*`
 - Quoted phrases: `"exact phrase"`
 - Extensions: `ext:rs`, `ext:.RS`, `ext:rs,txt`
 - File types: `type:file`, `type:dir`, `type:symlink`
 - Path filters: `path:src`
+- Negation: `!foo`, `-cache`, `!ext:o`, `!path:target`
+- Sizes: `size:0`, `size:>10mb`, `size:<4kb`, `size:1mb..100mb`
+- Modification time: `mtime:today`, `mtime:yesterday`, `mtime:<7d`, `mtime:2026-01-01..2026-06-01`
 
-Typed filters and the GUI filter panel combine with AND semantics. Regex and OR/negation are intentionally outside V2-basic.
+Typed filters and the GUI filter panel combine with AND semantics. Regex and OR groups remain outside V4.
+
+## V4 Live Updates And Diagnostics
+
+V4 keeps raw unmounted scans as explicit rescan jobs, but mounted indexed devices can be watched by the unprivileged user daemon. The watcher uses normal Linux filename notifications through the Rust `notify` crate, updates the in-memory index for create/delete/rename/metadata events, and flushes dirty snapshots after a short debounce. If notification overflow or ambiguous state is detected, the index is marked stale and a raw rescan is recommended.
+
+Use doctor after installation or when scanning fails:
+
+```shell
+kerything-cli doctor
+kerything-cli doctor --scanner
+kerything-cli doctor --security
+kerything-cli doctor --json
+```
+
+Doctor checks the user daemon socket, scanner socket permissions, `kerything` group membership, Polkit action registration, config validity, index loading, packaged systemd units, and helper fallback availability.
 
 ## Arch Package
 
@@ -228,7 +254,7 @@ V2-basic does not recurse into additional subvolumes or snapshots. Those entries
 - Scanner daemon responses use framed IPC; only the final scan response carries binary `ScanStreamV1`.
 - Path/device validation in the helper and scanner daemon is security-sensitive.
 - Old C++ snapshots are intentionally ignored.
-- Live fanotify updates, native rofi plugin ABI support, D-Bus APIs, full Btrfs subvolume traversal, regex search, OR/negation query syntax, and rich drag-out/file-URI clipboard support are outside the V3 guarantee.
+- Raw filesystem-specific delta scanning, NTFS USN Journal support, EXT4 journal parsing, Btrfs generation/transid scanning, open history/frecency, native rofi plugin ABI support, D-Bus APIs, full Btrfs subvolume traversal, Snapshot Format V2, regex search, OR groups, and rich drag-out/file-URI clipboard support are outside V4.
 
 ## License
 

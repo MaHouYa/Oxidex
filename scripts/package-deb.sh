@@ -101,6 +101,20 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 
+cat <<'MSG'
+Kerything installed.
+
+To let your user daemon connect to the privileged scanner daemon, add your user
+to the kerything group, then log out and back in or run newgrp:
+
+  sudo usermod -aG kerything "$USER"
+  newgrp kerything
+
+Check the setup with:
+
+  kerything-cli doctor
+MSG
+
 exit 0
 EOF
 chmod 755 "$PKG_DIR/DEBIAN/postinst"

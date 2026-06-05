@@ -6,9 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use btrfs_fs::{FileKind, Filesystem};
 
 use crate::model::{FsType, ROOT_PARENT, ScanDatabase};
-use crate::scanner::ProgressCallback;
+use crate::scanner::{ProgressCallback, ScanCancellation};
 
-pub fn scan(path: &Path, progress: &mut ProgressCallback<'_>) -> anyhow::Result<ScanDatabase> {
+pub fn scan(
+    path: &Path,
+    progress: &mut ProgressCallback<'_>,
+    cancellation: &ScanCancellation,
+) -> anyhow::Result<ScanDatabase> {
     progress(0, 1);
     let file = File::open(path)?;
     let fs = Filesystem::open(file)?;
@@ -19,12 +23,13 @@ pub fn scan(path: &Path, progress: &mut ProgressCallback<'_>) -> anyhow::Result<
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .map_err(|err| anyhow::anyhow!("failed to create Btrfs scanner runtime: {err}"))?;
-    runtime.block_on(scan_default_root(fs, progress))
+    runtime.block_on(scan_default_root(fs, progress, cancellation))
 }
 
 async fn scan_default_root(
     fs: Filesystem<File>,
     progress: &mut ProgressCallback<'_>,
+    cancellation: &ScanCancellation,
 ) -> anyhow::Result<ScanDatabase> {
     let root = fs.root();
     let mut db = ScanDatabase::new(FsType::Btrfs);
@@ -43,8 +48,10 @@ async fn scan_default_root(
     let mut seen = 0u64;
 
     while let Some((dir, parent_idx)) = queue.pop_front() {
+        cancellation.ensure_not_cancelled()?;
         let entries = fs.readdirplus(dir, 0).await?;
         for (entry, stat) in entries {
+            cancellation.ensure_not_cancelled()?;
             if entry.name == b"." || entry.name == b".." {
                 continue;
             }
@@ -126,7 +133,7 @@ mod tests {
         }
 
         let mut progress = |_: u64, _: u64| {};
-        let result = scan(&image, &mut progress);
+        let result = scan(&image, &mut progress, &ScanCancellation::new());
         let _ = fs::remove_dir_all(&base);
 
         let db = result?;
@@ -170,7 +177,7 @@ mod tests {
         }
 
         let mut progress = |_: u64, _: u64| {};
-        let result = scan(&image, &mut progress);
+        let result = scan(&image, &mut progress, &ScanCancellation::new());
         let _ = fs::remove_dir_all(&base);
 
         let db = result?;

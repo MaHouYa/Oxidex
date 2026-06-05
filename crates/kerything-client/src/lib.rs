@@ -2,10 +2,13 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use kerything_core::daemon_model::{
-    ConfigGetResult, ConfigSetParams, DaemonStatus, DeviceSummary, IndexForgetParams,
+    ConfigGetResult, ConfigSetParams, DaemonDoctorResult, DaemonStatus, DeviceSummary,
+    IndexCancelScanParams, IndexCancelScanResult, IndexForgetParams, IndexJobStatusParams,
     IndexStartScanParams, IndexStartScanResult, IndexSummary, ResolvePathParams, ResolvedPath,
-    SearchQueryParams, SearchQueryResult,
+    ScanJobId, ScanJobSummary, SearchExplainParams, SearchQueryParams, SearchQueryResult,
+    WatchSummary,
 };
+use kerything_core::index::SearchExplanation;
 use kerything_core::ipc::{IpcFrame, read_frame, result_as, write_frame};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -108,8 +111,47 @@ impl KerythingClient {
         )
     }
 
+    pub fn jobs(&mut self) -> anyhow::Result<Vec<ScanJobSummary>> {
+        self.request("index.job_list", &json!({}))
+    }
+
+    pub fn job_status(&mut self, job_id: ScanJobId) -> anyhow::Result<ScanJobSummary> {
+        self.request("index.job_status", &IndexJobStatusParams { job_id })
+    }
+
+    pub fn cancel_scan(
+        &mut self,
+        job_id: Option<ScanJobId>,
+        device_id: Option<&str>,
+    ) -> anyhow::Result<IndexCancelScanResult> {
+        self.request(
+            "index.cancel_scan",
+            &IndexCancelScanParams {
+                job_id,
+                device_id: device_id.map(str::to_owned),
+            },
+        )
+    }
+
     pub fn search(&mut self, params: &SearchQueryParams) -> anyhow::Result<SearchQueryResult> {
         self.request("search.query", params)
+    }
+
+    pub fn explain(&mut self, query: &str) -> anyhow::Result<SearchExplanation> {
+        self.request(
+            "search.explain",
+            &SearchExplainParams {
+                query: query.to_owned(),
+            },
+        )
+    }
+
+    pub fn doctor(&mut self) -> anyhow::Result<DaemonDoctorResult> {
+        self.request("daemon.doctor", &json!({}))
+    }
+
+    pub fn watch_status(&mut self) -> anyhow::Result<Vec<WatchSummary>> {
+        self.request("watch.status", &json!({}))
     }
 
     pub fn config_get(&mut self) -> anyhow::Result<ConfigGetResult> {

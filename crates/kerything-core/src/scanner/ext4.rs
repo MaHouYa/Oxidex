@@ -5,9 +5,13 @@ use std::path::Path;
 use ext4::{Enhanced, FileType};
 
 use crate::model::{FsType, ROOT_PARENT, ScanDatabase};
-use crate::scanner::ProgressCallback;
+use crate::scanner::{ProgressCallback, ScanCancellation};
 
-pub fn scan(path: &Path, progress: &mut ProgressCallback<'_>) -> anyhow::Result<ScanDatabase> {
+pub fn scan(
+    path: &Path,
+    progress: &mut ProgressCallback<'_>,
+    cancellation: &ScanCancellation,
+) -> anyhow::Result<ScanDatabase> {
     progress(0, 1);
     let file = File::open(path)?;
     // Kerything is a read-only filename indexer. Directory metadata checksums are useful
@@ -27,6 +31,7 @@ pub fn scan(path: &Path, progress: &mut ProgressCallback<'_>) -> anyhow::Result<
     let mut seen = 0u64;
 
     volume.walk(&root, "/", &mut |_, raw_path, inode, enhanced| {
+        cancellation.ensure_not_cancelled()?;
         let path = normalize_path(raw_path);
         if path == "/" {
             return Ok(true);
@@ -130,7 +135,7 @@ mod tests {
         }
 
         let mut progress = |_: u64, _: u64| {};
-        let result = scan(&image, &mut progress);
+        let result = scan(&image, &mut progress, &ScanCancellation::new());
         let _ = fs::remove_file(&image);
 
         let db = result?;

@@ -12,7 +12,7 @@ Kerything is currently a Rust 2024 Cargo workspace that rewrites the old Qt/KDE 
 - `crates/kerything-cli`: CLI and rofi/script integration client.
 - `crates/kerything-scanner-helper`: compatibility privileged scanner CLI launched through `pkexec`.
 
-`kerythingd` persists indexes under `$XDG_DATA_HOME/kerything/indexes/` and config under `$XDG_CONFIG_HOME/kerything/config.toml`. Runtime metadata formats live in `crates/kerything-core/src/stream.rs` and `crates/kerything-core/src/snapshot.rs`; search/index logic is in `crates/kerything-core/src/index.rs`; config and include/exclude rules are in `crates/kerything-core/src/config.rs` and `crates/kerything-core/src/rules.rs`; scanner backends are in `crates/kerything-core/src/scanner/`.
+`kerythingd` persists indexes under `$XDG_DATA_HOME/kerything/indexes/` and config under `$XDG_CONFIG_HOME/kerything/config.toml`. Runtime metadata formats live in `crates/kerything-core/src/stream.rs` and `crates/kerything-core/src/snapshot.rs`; V4 index health sidecars live beside snapshots as `*.state.json`; search/index logic is in `crates/kerything-core/src/index.rs`; config and include/exclude rules are in `crates/kerything-core/src/config.rs` and `crates/kerything-core/src/rules.rs`; scanner backends are in `crates/kerything-core/src/scanner/`; setup diagnostics are in `crates/kerything-core/src/doctor.rs`.
 
 Legacy C++/Qt/KDE directories and files may still be present in the tree for history or transition, but the active build is Rust/Cargo. Do not reintroduce Qt6, KDE Frameworks, KIO, Solid, D-Bus APIs/activation, libblkid, e2fsprogs/libext2fs runtime dependencies, `libbtrfs` bindings, or `wgpu` as a default renderer unless explicitly approved.
 
@@ -61,6 +61,7 @@ Run the CLI:
 
 ```bash
 cargo run --release -p kerything-cli -- search "ext:rs path:src main"
+cargo run --release -p kerything-cli -- doctor
 ```
 
 Run the scanner helper directly:
@@ -110,13 +111,13 @@ KERYTHING_PROGRESS <0-100>
 
 ## Testing Guidelines
 
-For GUI changes, manually verify daemon connection, standalone fallback, search, device filtering, row selection, sorting, open/open-folder actions, copy-name/copy-path actions, progress display, cancellation/error display, and snapshot reload after restart.
+For GUI changes, manually verify daemon connection, standalone fallback, search, device filtering, filter panel, row selection, sorting including relevance, open/open-folder actions, copy-name/copy-path actions, right-click context menu, properties, progress display, cancellation/error display, index health/watch status, and snapshot reload after restart.
 
-For search or snapshot changes, run unit tests and check path reconstruction, Unicode names, hard links, short-token fallback, trigram matching, wildcard matching, extension/type/path filters, deterministic sorting, multi-device merging, corruption rejection, and version mismatch behavior.
+For search or snapshot changes, run unit tests and check path reconstruction, Unicode names, hard links, short-token fallback, trigram matching, wildcard matching, negation, extension/type/path/size/mtime filters, relevance sorting, deterministic explicit sorting, multi-device merging, corruption rejection, sidecar state behavior, and version mismatch behavior.
 
 For scanner changes, validate both mounted and unmounted devices when possible. NTFS should scan MFT metadata and preserve hard-link names. EXT4 should read filesystem metadata, inode metadata, and directory-entry blocks; it must not scan regular file contents or do whole-disk byte-by-byte discovery. Btrfs V2-basic scans only the default/main root, treats other subvolumes as boundaries, and rejects unsupported multi-device layouts clearly.
 
-When changing daemon/client/IPC code, verify `kerythingd --foreground`, `kerything-cli devices`, `kerything-cli indexes`, `kerything-cli search`, and scanner authorization/error handling. `kerything-scannerd` should accept only scanner protocol methods, validate every scan request, and never expose arbitrary block reads.
+When changing daemon/client/IPC code, verify `kerythingd --foreground`, `kerything-cli devices`, `kerything-cli indexes`, `kerything-cli search`, `kerything-cli jobs`, `kerything-cli scan --wait`, `kerything-cli cancel`, `kerything-cli doctor`, and scanner authorization/error handling. `kerything-scannerd` should accept only scanner protocol methods, validate every scan request, start cancellable scanner jobs, expose final scan streams only through the framed `scanner.take_result` response, and never expose arbitrary block reads.
 
 When changing packaging, validate at least:
 

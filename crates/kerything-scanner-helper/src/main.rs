@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use kerything_core::model::FsType;
-use kerything_core::scanner::validate_device_path;
+use kerything_core::scanner::{ScanCancellation, validate_device_path};
 
 fn main() {
     if let Err(err) = run() {
@@ -32,9 +32,14 @@ fn run() -> anyhow::Result<()> {
 
     let mut reporter = ProgressReporter::new();
     eprintln!("Scanning {} ({})", device.display(), fs_type);
-    let db = kerything_core::scanner::scan_device(&device, fs_type, &mut |done, total| {
-        reporter.report(done, total);
-    })?;
+    let db = kerything_core::scanner::scan_device(
+        &device,
+        fs_type,
+        &mut |done, total| {
+            reporter.report(done, total);
+        },
+        &ScanCancellation::new(),
+    )?;
     reporter.report(1, 1);
 
     let stdout = io::stdout();

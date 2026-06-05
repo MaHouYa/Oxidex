@@ -134,18 +134,21 @@ pub struct DeviceMetadata {
     pub partuuid: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortKey {
+    #[default]
+    Relevance,
     Name,
     Path,
     Size,
     Mtime,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortDirection {
+    #[default]
     Asc,
     Desc,
 }

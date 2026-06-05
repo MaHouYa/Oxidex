@@ -15,19 +15,25 @@ pub struct AppConfig {
     #[serde(default)]
     pub indexing: IndexingConfig,
     #[serde(default)]
+    pub rofi: RofiConfig,
+    #[serde(default)]
     pub devices: Vec<DeviceConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct UiConfig {
+    #[serde(default)]
     pub theme: ThemeMode,
+    #[serde(default = "default_true")]
     pub show_filter_panel: bool,
+    #[serde(default = "default_true")]
     pub remember_window_size: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
+    #[default]
     System,
     Light,
     Dark,
@@ -35,16 +41,38 @@ pub enum ThemeMode {
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct SearchConfig {
+    #[serde(default = "default_sort")]
     pub default_sort: SortKey,
+    #[serde(default)]
     pub default_direction: SortDirection,
+    #[serde(default = "default_max_results")]
     pub max_results: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct IndexingConfig {
+    #[serde(default)]
     pub scan_on_startup: bool,
+    #[serde(default)]
     pub auto_rescan_removable: bool,
+    #[serde(default = "default_max_parallel_scans")]
     pub max_parallel_scans: usize,
+    #[serde(default = "default_true")]
+    pub watch_mounted: bool,
+    #[serde(default = "default_live_update_flush_seconds")]
+    pub live_update_flush_seconds: u64,
+    #[serde(default = "default_live_update_max_dirty_seconds")]
+    pub live_update_max_dirty_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct RofiConfig {
+    #[serde(default = "default_rofi_max_results")]
+    pub max_results: usize,
+    #[serde(default = "default_true")]
+    pub show_device_label: bool,
+    #[serde(default)]
+    pub show_full_path: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -76,6 +104,7 @@ impl Default for AppConfig {
             ui: UiConfig::default(),
             search: SearchConfig::default(),
             indexing: IndexingConfig::default(),
+            rofi: RofiConfig::default(),
             devices: Vec::new(),
         }
     }
@@ -94,9 +123,9 @@ impl Default for UiConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_sort: SortKey::Name,
+            default_sort: default_sort(),
             default_direction: SortDirection::Asc,
-            max_results: 20_000,
+            max_results: default_max_results(),
         }
     }
 }
@@ -106,7 +135,20 @@ impl Default for IndexingConfig {
         Self {
             scan_on_startup: false,
             auto_rescan_removable: false,
-            max_parallel_scans: 1,
+            max_parallel_scans: default_max_parallel_scans(),
+            watch_mounted: true,
+            live_update_flush_seconds: default_live_update_flush_seconds(),
+            live_update_max_dirty_seconds: default_live_update_max_dirty_seconds(),
+        }
+    }
+}
+
+impl Default for RofiConfig {
+    fn default() -> Self {
+        Self {
+            max_results: default_rofi_max_results(),
+            show_device_label: true,
+            show_full_path: false,
         }
     }
 }
@@ -168,6 +210,18 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         config.indexing.max_parallel_scans > 0,
         "indexing.max_parallel_scans must be greater than zero"
     );
+    anyhow::ensure!(
+        config.indexing.live_update_flush_seconds > 0,
+        "indexing.live_update_flush_seconds must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.indexing.live_update_max_dirty_seconds >= config.indexing.live_update_flush_seconds,
+        "indexing.live_update_max_dirty_seconds must be at least live_update_flush_seconds"
+    );
+    anyhow::ensure!(
+        config.rofi.max_results > 0,
+        "rofi.max_results must be greater than zero"
+    );
 
     for device in &config.devices {
         anyhow::ensure!(
@@ -184,6 +238,34 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_sort() -> SortKey {
+    SortKey::Relevance
+}
+
+fn default_max_results() -> usize {
+    20_000
+}
+
+fn default_max_parallel_scans() -> usize {
+    1
+}
+
+fn default_live_update_flush_seconds() -> u64 {
+    10
+}
+
+fn default_live_update_max_dirty_seconds() -> u64 {
+    60
+}
+
+fn default_rofi_max_results() -> usize {
+    200
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,10 +275,12 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.version, 1);
         assert_eq!(config.ui.theme, ThemeMode::System);
-        assert_eq!(config.search.default_sort, SortKey::Name);
+        assert_eq!(config.search.default_sort, SortKey::Relevance);
         assert_eq!(config.search.default_direction, SortDirection::Asc);
         assert_eq!(config.search.max_results, 20_000);
         assert_eq!(config.indexing.max_parallel_scans, 1);
+        assert!(config.indexing.watch_mounted);
+        assert_eq!(config.rofi.max_results, 200);
     }
 
     #[test]

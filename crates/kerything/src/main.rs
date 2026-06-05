@@ -15,7 +15,7 @@ use egui_extras::{Column, TableBuilder};
 use kerything_client::KerythingClient;
 use kerything_core::config::{ThemeMode, load_config};
 use kerything_core::daemon_model::{
-    DeviceSummary, IndexSummary, SearchQueryParams, SearchResultRow,
+    DeviceSummary, IndexSummary, ScanJobSummary, SearchQueryParams, SearchResultRow, WatchSummary,
 };
 use kerything_core::device::{DeviceInfo, list_known_devices};
 use kerything_core::index::{
@@ -94,15 +94,23 @@ enum AppEvent {
 struct DaemonGuiApp {
     client: Option<KerythingClient>,
     query: String,
+    filter_extensions: String,
+    filter_path: String,
+    filter_type: Option<SearchFileType>,
+    selected_scope: String,
     rows: Vec<SearchResultRow>,
     devices: Vec<DeviceSummary>,
     indexes: Vec<IndexSummary>,
+    jobs: Vec<ScanJobSummary>,
+    watches: Vec<WatchSummary>,
     selected_hit: Option<SearchHit>,
     sort_key: SortKey,
     sort_direction: SortDirection,
     status: String,
+    show_filters: bool,
     show_index_manager: bool,
     show_settings: bool,
+    properties_row: Option<SearchResultRow>,
     theme: ThemeMode,
 }
 
@@ -126,18 +134,31 @@ impl DaemonGuiApp {
             .unwrap_or(SortDirection::Asc);
         let devices = client.devices().unwrap_or_default();
         let indexes = client.indexes().unwrap_or_default();
+        let jobs = client.jobs().unwrap_or_default();
+        let watches = client.watch_status().unwrap_or_default();
         let mut app = Self {
             client: Some(client),
             query: String::new(),
+            filter_extensions: String::new(),
+            filter_path: String::new(),
+            filter_type: None,
+            selected_scope: String::new(),
             rows: Vec::new(),
             devices,
             indexes,
+            jobs,
+            watches,
             selected_hit: None,
             sort_key,
             sort_direction,
             status: "Connected to kerythingd.".into(),
+            show_filters: config
+                .as_ref()
+                .map(|config| config.config.ui.show_filter_panel)
+                .unwrap_or(true),
             show_index_manager: false,
             show_settings: false,
+            properties_row: None,
             theme,
         };
         app.recompute_rows();
@@ -145,14 +166,21 @@ impl DaemonGuiApp {
     }
 
     fn recompute_rows(&mut self) {
+        let request = match self.search_request() {
+            Ok(request) => request,
+            Err(err) => {
+                self.status = format!("Search error: {err}");
+                return;
+            }
+        };
         let Some(client) = self.client.as_mut() else {
             return;
         };
         let previous = self.selected_hit.clone();
         let result = client.search(&SearchQueryParams {
             query: self.query.clone(),
-            request: None,
-            device_filter: None,
+            request: Some(request),
+            device_filter: (!self.selected_scope.is_empty()).then_some(self.selected_scope.clone()),
             sort_key: self.sort_key,
             sort_direction: self.sort_direction,
             max_results: None,
@@ -178,14 +206,57 @@ impl DaemonGuiApp {
         let Some(client) = self.client.as_mut() else {
             return;
         };
-        match (client.devices(), client.indexes()) {
-            (Ok(devices), Ok(indexes)) => {
+        match (
+            client.devices(),
+            client.indexes(),
+            client.jobs(),
+            client.watch_status(),
+        ) {
+            (Ok(devices), Ok(indexes), Ok(jobs), Ok(watches)) => {
                 self.devices = devices;
                 self.indexes = indexes;
+                self.jobs = jobs;
+                self.watches = watches;
                 self.status = "Refreshed devices and indexes.".into();
             }
-            (Err(err), _) | (_, Err(err)) => self.status = format!("Refresh failed: {err:#}"),
+            (Err(err), _, _, _)
+            | (_, Err(err), _, _)
+            | (_, _, Err(err), _)
+            | (_, _, _, Err(err)) => self.status = format!("Refresh failed: {err:#}"),
         }
+    }
+
+    fn search_request(&self) -> Result<SearchRequest, kerything_core::index::SearchParseError> {
+        let mut request = parse_search_query(&self.query)?;
+        request.add_filters(self.panel_filters());
+        Ok(request)
+    }
+
+    fn panel_filters(&self) -> SearchFilters {
+        let mut filters = SearchFilters::default();
+        filters.add_extensions(&self.filter_extensions);
+        filters.add_path_contains(&self.filter_path);
+        filters.file_type = self.filter_type;
+        filters
+    }
+
+    fn filter_summary(&self) -> Option<String> {
+        let request = self.search_request().ok()?;
+        let filters = request.filters();
+        if filters.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !filters.extensions.is_empty() {
+            parts.push(format!("ext:{}", filters.extensions.join(",")));
+        }
+        if let Some(file_type) = filters.file_type {
+            parts.push(format!("type:{}", search_file_type_name(file_type)));
+        }
+        for path in filters.path_contains {
+            parts.push(format!("path:{path}"));
+        }
+        Some(format!("Active filters: {}", parts.join("  ")))
     }
 
     fn selected_row(&self) -> Option<&SearchResultRow> {
@@ -268,8 +339,8 @@ impl DaemonGuiApp {
         match client.start_scan(&device_id) {
             Ok(result) => {
                 self.status = format!(
-                    "Indexed {} with {} entries.",
-                    result.summary.device_id, result.summary.entry_count
+                    "Queued scan job {} for {}.",
+                    result.job_id, result.device_id
                 );
                 self.refresh_lists();
                 self.recompute_rows();
@@ -294,6 +365,9 @@ impl DaemonGuiApp {
                     .unwrap_or(false)
                 {
                     self.selected_hit = None;
+                }
+                if self.selected_scope == device_id {
+                    self.selected_scope.clear();
                 }
                 self.status = format!("Forgot {device_id}.");
             }
@@ -329,8 +403,15 @@ impl eframe::App for DaemonGuiApp {
             self.open_selected();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.egui_wants_keyboard_input() {
-            self.selected_hit = None;
-            self.show_settings = false;
+            if self.properties_row.is_some() {
+                self.properties_row = None;
+            } else if self.show_settings {
+                self.show_settings = false;
+            } else if self.show_filters {
+                self.show_filters = false;
+            } else {
+                self.selected_hit = None;
+            }
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
             && !ctx.egui_wants_keyboard_input()
@@ -355,15 +436,58 @@ impl eframe::App for DaemonGuiApp {
                 if ui.button("Settings").clicked() {
                     self.show_settings = true;
                 }
+                egui::ComboBox::from_id_salt("daemon-device-scope")
+                    .selected_text(daemon_scope_label(&self.selected_scope, &self.indexes))
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        let mut scope_changed = false;
+                        if ui
+                            .selectable_value(
+                                &mut self.selected_scope,
+                                String::new(),
+                                "All devices",
+                            )
+                            .clicked()
+                        {
+                            scope_changed = true;
+                        }
+                        for index in &self.indexes {
+                            let label = daemon_index_label(index);
+                            if ui
+                                .selectable_value(
+                                    &mut self.selected_scope,
+                                    index.device_id.clone(),
+                                    label,
+                                )
+                                .clicked()
+                            {
+                                scope_changed = true;
+                            }
+                        }
+                        if scope_changed {
+                            self.recompute_rows();
+                        }
+                    });
+                if ui.selectable_label(self.show_filters, "Filters").clicked() {
+                    self.show_filters = !self.show_filters;
+                }
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search files, e.g. *.rs ext:txt path:src type:dir")
+                        .hint_text(
+                            "Search files, e.g. *.rs ext:txt path:src type:dir !cache size:<10mb",
+                        )
                         .desired_width(f32::INFINITY),
                 );
                 if response.changed() {
                     self.recompute_rows();
                 }
             });
+            if self.show_filters {
+                self.daemon_filter_panel(ui);
+            }
+            if let Some(summary) = self.filter_summary() {
+                ui.small(summary);
+            }
         });
 
         egui::Panel::bottom("daemon-status").show_inside(ui, |ui| {
@@ -390,10 +514,61 @@ impl eframe::App for DaemonGuiApp {
         if self.show_settings {
             self.daemon_settings(&ctx);
         }
+        self.daemon_properties(&ctx);
     }
 }
 
 impl DaemonGuiApp {
+    fn daemon_filter_panel(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Ext");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.filter_extensions)
+                        .hint_text("rs,txt")
+                        .desired_width(140.0),
+                )
+                .changed();
+            ui.label("Type");
+            let before_type = self.filter_type;
+            egui::ComboBox::from_id_salt("daemon-type-filter")
+                .selected_text(file_type_label(self.filter_type))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.filter_type, None, "All");
+                    ui.selectable_value(&mut self.filter_type, Some(SearchFileType::File), "Files");
+                    ui.selectable_value(
+                        &mut self.filter_type,
+                        Some(SearchFileType::Dir),
+                        "Folders",
+                    );
+                    ui.selectable_value(
+                        &mut self.filter_type,
+                        Some(SearchFileType::Symlink),
+                        "Symlinks",
+                    );
+                });
+            changed |= before_type != self.filter_type;
+            ui.label("Path");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.filter_path)
+                        .hint_text("src")
+                        .desired_width(180.0),
+                )
+                .changed();
+            if ui.button("Clear").clicked() {
+                self.filter_extensions.clear();
+                self.filter_path.clear();
+                self.filter_type = None;
+                changed = true;
+            }
+        });
+        if changed {
+            self.recompute_rows();
+        }
+    }
+
     fn daemon_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let has_selection = self.selected_row().is_some();
         ui.horizontal(|ui| {
@@ -421,8 +596,21 @@ impl DaemonGuiApp {
             {
                 self.copy_selected_path(ctx);
             }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Properties"))
+                .clicked()
+            {
+                self.properties_row = self.selected_row().cloned();
+            }
             ui.separator();
             let mut sort_changed = false;
+            sort_changed |= sort_button(
+                ui,
+                &mut self.sort_key,
+                &mut self.sort_direction,
+                SortKey::Relevance,
+                "Relevance",
+            );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
@@ -543,6 +731,19 @@ impl DaemonGuiApp {
                             self.copy_selected_path(ctx);
                             ui.close();
                         }
+                        ui.separator();
+                        if ui.button("Rescan This Device").clicked() {
+                            self.scan_device(result.hit.device_id.clone());
+                            ui.close();
+                        }
+                        if ui.button("Forget This Index").clicked() {
+                            self.forget_index(result.hit.device_id.clone());
+                            ui.close();
+                        }
+                        if ui.button("Properties").clicked() {
+                            self.properties_row = Some(result.clone());
+                            ui.close();
+                        }
                     });
                     if response.double_clicked() {
                         self.selected_hit = Some(result.hit);
@@ -560,8 +761,34 @@ impl DaemonGuiApp {
             .open(&mut open)
             .default_width(980.0)
             .show(ctx, |ui| {
-                if ui.button("Refresh Devices").clicked() {
-                    self.refresh_lists();
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh Devices").clicked() {
+                        self.refresh_lists();
+                    }
+                    if ui.button("Refresh Jobs").clicked() {
+                        self.refresh_lists();
+                    }
+                });
+                for job in self.jobs.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Job {} {} {:?} {}%",
+                            job.job_id, job.device_id, job.state, job.progress
+                        ));
+                        ui.label(fit(&job.message, 42));
+                        if matches!(
+                            job.state,
+                            kerything_core::daemon_model::ScanState::Queued
+                                | kerything_core::daemon_model::ScanState::Running
+                        ) && ui.button("Cancel").clicked()
+                            && let Some(client) = self.client.as_mut()
+                        {
+                            match client.cancel_scan(Some(job.job_id), None) {
+                                Ok(result) => self.status = result.message,
+                                Err(err) => self.status = format!("Failed to cancel scan: {err:#}"),
+                            }
+                        }
+                    });
                 }
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -587,6 +814,22 @@ impl DaemonGuiApp {
                                         .map(|count| format!("{count} entries"))
                                         .unwrap_or_else(|| "not indexed".into()),
                                 );
+                                if let Some(index) = self
+                                    .indexes
+                                    .iter()
+                                    .find(|index| index.device_id == device.device_id)
+                                    && let Some(state) = &index.state
+                                {
+                                    if let Some(error) = &state.last_error {
+                                        ui.label(fit(error, 28));
+                                    } else if let Some(watch) = self
+                                        .watches
+                                        .iter()
+                                        .find(|watch| watch.device_id == device.device_id)
+                                    {
+                                        ui.label(fit(&watch.state, 16));
+                                    }
+                                }
                                 let label = if indexed_count.is_some() {
                                     "Rescan"
                                 } else {
@@ -628,6 +871,24 @@ impl DaemonGuiApp {
                     }
                 });
                 ui.separator();
+                ui.heading("Indexing");
+                if let Some(client) = self.client.as_mut()
+                    && let Ok(config) = client.config_get()
+                {
+                    ui.label(format!(
+                        "Mounted live updates: {}",
+                        yes_no(config.config.indexing.watch_mounted)
+                    ));
+                    ui.label(format!(
+                        "Max parallel scans: {}",
+                        config.config.indexing.max_parallel_scans
+                    ));
+                    ui.label(format!(
+                        "Rofi max results: {}",
+                        config.config.rofi.max_results
+                    ));
+                }
+                ui.separator();
                 ui.heading("Advanced");
                 if let Some(client) = self.client.as_mut()
                     && ui.button("Show Config Path").clicked()
@@ -639,6 +900,50 @@ impl DaemonGuiApp {
                 }
             });
         self.show_settings = open;
+    }
+
+    fn daemon_properties(&mut self, ctx: &egui::Context) {
+        let Some(row) = self.properties_row.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Properties")
+            .open(&mut open)
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                property_row(ui, "Name", &row.name);
+                property_row(ui, "Path", &row.display_path);
+                property_row(ui, "Internal Path", &row.internal_path);
+                property_row(ui, "Device", &row.device_label);
+                property_row(ui, "Device ID", &row.hit.device_id);
+                property_row(ui, "Record", &row.hit.record_idx.to_string());
+                property_row(ui, "Filesystem", row.fs_type.as_str());
+                property_row(ui, "Size", &format_size(row.size));
+                property_row(ui, "Modified", &format_time(row.mtime));
+                property_row(ui, "Directory", yes_no(row.is_dir));
+                property_row(ui, "Symlink", yes_no(row.is_symlink));
+                property_row(ui, "Mounted", yes_no(row.mounted));
+                property_row(ui, "Last Indexed", &format_time(row.last_indexed_time));
+                if let Some(index) = self
+                    .indexes
+                    .iter()
+                    .find(|index| index.device_id == row.hit.device_id)
+                    && let Some(state) = &index.state
+                {
+                    if let Some(scanner) = &state.last_scanner {
+                        property_row(ui, "Scanner", scanner);
+                    }
+                    if let Some(error) = &state.last_error {
+                        property_row(ui, "Last Error", error);
+                    }
+                    if let Some(stale) = &state.stale_reason {
+                        property_row(ui, "Stale", stale);
+                    }
+                }
+            });
+        if !open {
+            self.properties_row = None;
+        }
     }
 }
 
@@ -775,7 +1080,7 @@ impl KerythingApp {
 
     fn search_request(&self) -> Result<SearchRequest, kerything_core::index::SearchParseError> {
         let mut request = parse_search_query(&self.query)?;
-        request.filters.merge(self.panel_filters());
+        request.add_filters(self.panel_filters());
         Ok(request)
     }
 
@@ -1125,17 +1430,18 @@ impl KerythingApp {
 
     fn filter_summary(&self) -> Option<String> {
         let request = self.search_request().ok()?;
-        if request.filters.is_empty() {
+        let filters = request.filters();
+        if filters.is_empty() {
             return None;
         }
         let mut parts = Vec::new();
-        if !request.filters.extensions.is_empty() {
-            parts.push(format!("ext:{}", request.filters.extensions.join(",")));
+        if !filters.extensions.is_empty() {
+            parts.push(format!("ext:{}", filters.extensions.join(",")));
         }
-        if let Some(file_type) = request.filters.file_type {
+        if let Some(file_type) = filters.file_type {
             parts.push(format!("type:{}", search_file_type_name(file_type)));
         }
-        for path in request.filters.path_contains {
+        for path in filters.path_contains {
             parts.push(format!("path:{path}"));
         }
         Some(format!("Active filters: {}", parts.join("  ")))
@@ -1668,6 +1974,25 @@ fn scope_label(scope: &str, indexes: &[SearchIndex]) -> String {
         .find(|idx| idx.metadata.device_id == scope)
         .map(|idx| device_label(&idx.metadata))
         .unwrap_or_else(|| scope.to_owned())
+}
+
+fn daemon_scope_label(scope: &str, indexes: &[IndexSummary]) -> String {
+    if scope.is_empty() {
+        return "All devices".into();
+    }
+    indexes
+        .iter()
+        .find(|index| index.device_id == scope)
+        .map(daemon_index_label)
+        .unwrap_or_else(|| scope.to_owned())
+}
+
+fn daemon_index_label(index: &IndexSummary) -> String {
+    if !index.label.trim().is_empty() {
+        format!("{} ({})", index.label.trim(), index.device_id)
+    } else {
+        index.device_id.clone()
+    }
 }
 
 fn device_label(meta: &DeviceMetadata) -> String {
