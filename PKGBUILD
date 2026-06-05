@@ -9,7 +9,7 @@ arch=('x86_64')
 url="https://github.com/Reikooters/kerything"
 license=('GPL-3.0-or-later')
 depends=('gcc-libs' 'glibc' 'polkit' 'libx11' 'libxcb' 'libxkbcommon' 'wayland' 'libglvnd' 'fontconfig' 'xdg-utils' 'hicolor-icon-theme')
-makedepends=('cargo')
+makedepends=('cargo' 'clang')
 install=kerything.install
 
 # Disable the creation of the -debug package.

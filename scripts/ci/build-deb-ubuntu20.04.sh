@@ -7,6 +7,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates \
   build-essential \
+  libclang-dev \
   pkg-config \
   libssl-dev \
   libx11-dev \
