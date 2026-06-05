@@ -8,6 +8,8 @@ Kerything is a community project and is not affiliated with Voidtools.
 
 ![Screenshot](screenshot.png)
 
+For installation, first indexing, search examples, rofi usage, troubleshooting, and exporting debug logs, see the [Kerything User Guide](docs/user-guide.md).
+
 ## Features
 
 - Rust-native desktop GUI built with `eframe`/`egui`, using the `glow` backend by default.
@@ -129,7 +131,7 @@ rofi -dmenu -i -p Kerything < <(kerything-cli rofi "$query")
 Install Rust and the native libraries needed by `eframe`/`winit` for Linux desktop rendering. On Arch Linux:
 
 ```shell
-sudo pacman -S cargo polkit libx11 libxcb libxkbcommon wayland libglvnd fontconfig xdg-utils hicolor-icon-theme
+sudo pacman -S cargo clang polkit libx11 libxcb libxkbcommon wayland libglvnd fontconfig xdg-utils hicolor-icon-theme
 ```
 
 Build all Rust crates:
