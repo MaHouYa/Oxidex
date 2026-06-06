@@ -579,6 +579,31 @@ Attach the printed `.tar.gz` file to the bug report after reviewing it.
 
 If you can reproduce the bug manually, foreground logs are often easier to read.
 
+Oxidex supports a terminal debug mode on the GUI and both daemons:
+
+```sh
+oxidex --debug
+oxidexd --foreground --debug
+sudo oxidex-scannerd --foreground --debug
+```
+
+`--debug` is shorthand for debug-level terminal logs. You can choose a level explicitly:
+
+```sh
+oxidex --log-level trace
+oxidexd --foreground --log-level debug
+sudo oxidex-scannerd --foreground --log-level trace
+```
+
+If `RUST_LOG` is set, it overrides `--log-level`, so this also works:
+
+```sh
+RUST_LOG=debug oxidex
+RUST_LOG=trace oxidexd --foreground
+```
+
+When `oxidex --debug` auto-starts `oxidexd`, the daemon inherits the same terminal and also receives debug logging. In normal non-debug GUI startup, auto-started daemon output is still silenced so regular launches stay quiet.
+
 Stop the packaged user daemon if it is running:
 
 ```sh
@@ -588,19 +613,19 @@ systemctl --user stop oxidexd.service oxidexd.socket
 Run the user daemon in one terminal:
 
 ```sh
-RUST_BACKTRACE=1 oxidexd --foreground 2>&1 | tee /tmp/oxidexd.log
+RUST_BACKTRACE=1 oxidexd --foreground --debug 2>&1 | tee /tmp/oxidexd.log
 ```
 
 Run the scanner daemon in another terminal:
 
 ```sh
-sudo env RUST_BACKTRACE=1 oxidex-scannerd --foreground 2>&1 | tee /tmp/oxidex-scannerd.log
+sudo env RUST_BACKTRACE=1 oxidex-scannerd --foreground --debug 2>&1 | tee /tmp/oxidex-scannerd.log
 ```
 
 Run the GUI in a third terminal:
 
 ```sh
-RUST_BACKTRACE=1 oxidex 2>&1 | tee /tmp/oxidex-gui.log
+RUST_BACKTRACE=1 oxidex --debug 2>&1 | tee /tmp/oxidex-gui.log
 ```
 
 Then reproduce the issue and collect:

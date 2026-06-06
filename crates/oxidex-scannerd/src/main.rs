@@ -23,6 +23,7 @@ use oxidex_core::model::{FsType, ScanDatabase};
 use oxidex_core::scanner::{ScanCancellation, scan_device, validate_device_path};
 use oxidex_core::{VERSION, stream};
 use serde_json::{Value, json};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SOCKET: &str = "/run/oxidex/scannerd.sock";
 const POLKIT_ACTION: &str = "org.mahouya.oxidex.connect-scanner";
@@ -38,10 +39,13 @@ fn run() -> anyhow::Result<()> {
     let mut socket_path = PathBuf::from(DEFAULT_SOCKET);
     let mut foreground = false;
     let mut idle_timeout = 300u64;
+    let mut debug_mode = false;
+    let mut log_level: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--foreground" => foreground = true,
+            "--debug" => debug_mode = true,
             "--socket" => {
                 let Some(value) = args.next() else {
                     anyhow::bail!("--socket requires a path");
@@ -55,7 +59,10 @@ fn run() -> anyhow::Result<()> {
                 idle_timeout = value.parse()?;
             }
             "--log-level" => {
-                let _ = args.next();
+                let Some(value) = args.next() else {
+                    anyhow::bail!("--log-level requires a value");
+                };
+                log_level = Some(value);
             }
             "--help" | "-h" => {
                 print_usage();
@@ -64,10 +71,18 @@ fn run() -> anyhow::Result<()> {
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
+    init_terminal_logging("oxidex-scannerd", debug_mode, log_level.as_deref());
+    tracing::info!(
+        foreground,
+        debug_mode,
+        socket = %socket_path.display(),
+        idle_timeout_seconds = idle_timeout,
+        "starting oxidex-scannerd"
+    );
 
     if !foreground {
-        eprintln!(
-            "oxidex-scannerd: running in foreground; service managers should pass --foreground explicitly"
+        tracing::warn!(
+            "running in foreground; service managers should pass --foreground explicitly"
         );
     }
     serve(socket_path, Duration::from_secs(idle_timeout))
@@ -75,13 +90,32 @@ fn run() -> anyhow::Result<()> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: oxidex-scannerd [--foreground] [--socket <path>] [--idle-timeout-seconds 300] [--log-level <level>]"
+        "Usage: oxidex-scannerd [--foreground] [--debug] [--socket <path>] [--idle-timeout-seconds 300] [--log-level <level>]"
     );
+    eprintln!("Levels: trace, debug, info, warn, error. RUST_LOG overrides --log-level.");
+}
+
+fn init_terminal_logging(binary: &str, debug: bool, log_level: Option<&str>) {
+    let default_level = log_level.unwrap_or(if debug { "debug" } else { "info" });
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(default_level))
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    if let Err(err) = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
+        .try_init()
+    {
+        eprintln!("{binary}: failed to initialize terminal logging: {err}");
+    }
 }
 
 fn serve(socket_path: PathBuf, idle_timeout: Duration) -> anyhow::Result<()> {
     let listener = if let Some(listener) = inherited_systemd_listener()? {
-        eprintln!("oxidex-scannerd: using inherited systemd socket");
+        tracing::info!("using inherited systemd socket");
         listener
     } else {
         if let Some(parent) = socket_path.parent() {
@@ -92,20 +126,21 @@ fn serve(socket_path: PathBuf, idle_timeout: Duration) -> anyhow::Result<()> {
         }
         let listener = UnixListener::bind(&socket_path)?;
         configure_socket_permissions(&socket_path)?;
-        eprintln!("oxidex-scannerd: listening on {}", socket_path.display());
+        tracing::info!(socket = %socket_path.display(), "listening");
         listener
     };
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                tracing::debug!("accepted scanner daemon client connection");
                 thread::spawn(move || {
                     if let Err(err) = handle_client(stream, idle_timeout) {
-                        eprintln!("oxidex-scannerd: client error: {err:#}");
+                        tracing::warn!(error = %format!("{err:#}"), "scanner daemon client error");
                     }
                 });
             }
-            Err(err) => eprintln!("oxidex-scannerd: accept failed: {err}"),
+            Err(err) => tracing::warn!(error = %err, "accept failed"),
         }
     }
     Ok(())
@@ -118,12 +153,14 @@ fn configure_socket_permissions(socket_path: &Path) -> anyhow::Result<()> {
         if rc != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        tracing::debug!(socket = %socket_path.display(), gid, "configured scanner socket group");
     } else {
-        eprintln!(
-            "oxidex-scannerd: group 'oxidex' does not exist; socket will stay root-owned and unprivileged oxidexd may be unable to connect"
+        tracing::warn!(
+            "group 'oxidex' does not exist; socket will stay root-owned and unprivileged oxidexd may be unable to connect"
         );
     }
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
+    tracing::debug!(socket = %socket_path.display(), mode = "0660", "configured scanner socket permissions");
     Ok(())
 }
 
@@ -157,6 +194,12 @@ fn inherited_systemd_listener() -> anyhow::Result<Option<UnixListener>> {
 
 fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Result<()> {
     let peer = peer_credentials(&stream)?;
+    tracing::debug!(
+        peer_pid = peer.pid,
+        peer_uid = peer.uid,
+        peer_gid = peer.gid,
+        "scanner client connected"
+    );
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let jobs: Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>> = Arc::new(Mutex::new(HashMap::new()));
     let next_job = Arc::new(AtomicU64::new(1));
@@ -173,6 +216,7 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
             continue;
         };
         let method = frame.header.method.clone().unwrap_or_default();
+        tracing::debug!(id, method = %method, authorized, "scanner request received");
         let response = match method.as_str() {
             "scanner.hello" => Ok((
                 json!({"name": "oxidex-scannerd", "version": VERSION}),
@@ -181,6 +225,12 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
             "scanner.authorize" => {
                 authorize_peer(&peer)?;
                 authorized = true;
+                tracing::info!(
+                    peer_pid = peer.pid,
+                    peer_uid = peer.uid,
+                    peer_gid = peer.gid,
+                    "scanner client authorized"
+                );
                 Ok((
                     serde_json::to_value(ScannerAuthorizeResult {
                         authorized: true,
@@ -219,9 +269,23 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
         };
 
         let response = match response {
-            Ok((result, payload)) => IpcFrame::ok(id, result, payload),
+            Ok((result, payload)) => {
+                tracing::debug!(
+                    id,
+                    method = %method,
+                    payload_bytes = payload.len(),
+                    "scanner request completed"
+                );
+                IpcFrame::ok(id, result, payload)
+            }
             Err(err) => {
                 last_error = Some(format!("{err:#}"));
+                tracing::warn!(
+                    id,
+                    method = %method,
+                    error = %format!("{err:#}"),
+                    "scanner request failed"
+                );
                 IpcFrame::error(Some(id), "request_failed", format!("{err:#}"))
             }
         };
@@ -231,6 +295,11 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
             break;
         }
     }
+    tracing::debug!(
+        peer_pid = peer.pid,
+        peer_uid = peer.uid,
+        "scanner client disconnected"
+    );
     Ok(())
 }
 
@@ -267,6 +336,12 @@ fn start_scan(
             payload: None,
         },
     );
+    tracing::info!(
+        job_id,
+        device_path = %device_path,
+        fs_type = fs_type.as_str(),
+        "scanner job started"
+    );
 
     let worker_jobs = jobs.clone();
     let worker_writer = writer.clone();
@@ -299,6 +374,12 @@ fn run_scan_job(
     cancellation: ScanCancellation,
 ) -> anyhow::Result<()> {
     let device_path = device.display().to_string();
+    tracing::debug!(
+        job_id,
+        device_path = %device_path,
+        fs_type = fs_type.as_str(),
+        "scanner worker running"
+    );
     let mut progress = |done: u64, total: u64| {
         let total = total.max(1);
         let percent = (((done.min(total) * 100) + total / 2) / total).min(100) as u8;
@@ -324,6 +405,7 @@ fn cancel_scan(
     jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>,
 ) -> anyhow::Result<(Value, Vec<u8>)> {
     let params: ScannerCancelScanParams = params_as(frame)?;
+    tracing::info!(job_id = params.job_id, "scanner job cancellation requested");
     let mut jobs = jobs.lock().unwrap();
     let Some(job) = jobs.get_mut(&params.job_id) else {
         return Ok((
@@ -358,6 +440,12 @@ fn take_result(
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("scanner result was already taken"))?;
             let record_count = job.summary.record_count.unwrap_or(0);
+            tracing::debug!(
+                job_id = params.job_id,
+                record_count,
+                payload_bytes = payload.len(),
+                "scanner result taken"
+            );
             Ok((
                 serde_json::to_value(ScannerTakeResultResult { record_count })?,
                 payload,
@@ -398,6 +486,7 @@ fn finish_job_success(
     stream::write_scan_stream(&mut payload, &db)?;
     if let Some(job) = jobs.lock().unwrap().get_mut(&job_id) {
         if job.summary.state == ScanState::Cancelled {
+            tracing::info!(job_id, "scanner job cancelled before success publish");
             let _ = write_locked(
                 writer,
                 &IpcFrame::event(
@@ -412,6 +501,7 @@ fn finish_job_success(
         job.summary.record_count = Some(record_count);
         job.payload = Some(payload);
     }
+    tracing::info!(job_id, record_count, "scanner job finished");
     write_locked(
         writer,
         &IpcFrame::event(
@@ -437,6 +527,7 @@ fn finish_job_failed(
         job.summary.state = state;
         job.summary.error = Some(message.clone());
     }
+    tracing::warn!(job_id, state = ?state, error = %message, "scanner job failed");
     let event = if state == ScanState::Cancelled {
         "scanner.scan_cancelled"
     } else {
@@ -505,12 +596,25 @@ fn peer_credentials(stream: &UnixStream) -> anyhow::Result<PeerCredentials> {
 
 fn authorize_peer(peer: &PeerCredentials) -> anyhow::Result<()> {
     if std::env::var_os("OXIDEX_SCANNERD_SKIP_POLKIT").is_some() {
+        tracing::warn!(
+            "OXIDEX_SCANNERD_SKIP_POLKIT is set; allowing scanner client without Polkit"
+        );
         return Ok(());
     }
     if peer.uid == 0 {
+        tracing::debug!(
+            peer_pid = peer.pid,
+            "allowing root scanner client without Polkit prompt"
+        );
         return Ok(());
     }
 
+    tracing::debug!(
+        action = POLKIT_ACTION,
+        peer_pid = peer.pid,
+        peer_uid = peer.uid,
+        "running pkcheck"
+    );
     let output = Command::new("pkcheck")
         .arg("--action-id")
         .arg(POLKIT_ACTION)
@@ -521,12 +625,24 @@ fn authorize_peer(peer: &PeerCredentials) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("failed to run pkcheck: {err}"))?;
 
     if output.status.success() {
+        tracing::debug!(
+            peer_pid = peer.pid,
+            peer_uid = peer.uid,
+            "pkcheck authorized peer"
+        );
         return Ok(());
     }
 
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let details = format!("{}{}", diagnostics.trim(), stdout.trim());
+    tracing::warn!(
+        peer_pid = peer.pid,
+        peer_uid = peer.uid,
+        status = %output.status,
+        details = %details,
+        "pkcheck denied peer"
+    );
     if details.contains("is not registered") || details.contains("not registered") {
         anyhow::bail!(
             "Polkit action {POLKIT_ACTION} is not registered. Install org.mahouya.oxidex.policy to /usr/share/polkit-1/actions/ and restart polkit, then reconnect. pkcheck said: {details}"

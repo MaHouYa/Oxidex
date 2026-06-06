@@ -27,12 +27,35 @@ use oxidex_core::index::{
 use oxidex_core::model::{DeviceMetadata, FsType, SortDirection, SortKey};
 use oxidex_core::snapshot;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
+use tracing_subscriber::EnvFilter;
 
 mod fonts;
 mod i18n;
 
+#[derive(Clone, Debug, Default)]
+struct GuiArgs {
+    standalone: bool,
+    debug: bool,
+    log_level: Option<String>,
+}
+
 fn main() -> eframe::Result {
-    let standalone = std::env::args().any(|arg| arg == "--standalone");
+    let args = match parse_gui_args() {
+        Ok(Some(args)) => args,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            eprintln!("oxidex: {err:#}");
+            print_gui_usage();
+            return Ok(());
+        }
+    };
+    init_terminal_logging("oxidex", args.debug, args.log_level.as_deref());
+    tracing::info!(
+        standalone = args.standalone,
+        debug = args.debug,
+        "starting Oxidex GUI"
+    );
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("org.mahouya.oxidex")
@@ -46,15 +69,62 @@ fn main() -> eframe::Result {
         "Oxidex",
         native_options,
         Box::new(move |cc| {
-            if standalone {
+            if args.standalone {
+                tracing::debug!("starting standalone GUI mode");
                 return Ok(Box::new(OxidexApp::new(cc)) as Box<dyn eframe::App>);
             }
-            match DaemonGuiApp::new(cc) {
+            match DaemonGuiApp::new(cc, &args) {
                 Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
                 Err(err) => Ok(Box::new(ServiceErrorApp::new(cc, err)) as Box<dyn eframe::App>),
             }
         }),
     )
+}
+
+fn parse_gui_args() -> anyhow::Result<Option<GuiArgs>> {
+    let mut parsed = GuiArgs::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--standalone" => parsed.standalone = true,
+            "--debug" => parsed.debug = true,
+            "--log-level" => {
+                let Some(value) = args.next() else {
+                    anyhow::bail!("--log-level requires a value");
+                };
+                parsed.log_level = Some(value);
+            }
+            "--help" | "-h" => {
+                print_gui_usage();
+                return Ok(None);
+            }
+            other => anyhow::bail!("unknown argument: {other}"),
+        }
+    }
+    Ok(Some(parsed))
+}
+
+fn print_gui_usage() {
+    eprintln!("Usage: oxidex [--standalone] [--debug] [--log-level <level>]");
+    eprintln!("Levels: trace, debug, info, warn, error. RUST_LOG overrides --log-level.");
+}
+
+fn init_terminal_logging(binary: &str, debug: bool, log_level: Option<&str>) {
+    let default_level = log_level.unwrap_or(if debug { "debug" } else { "warn" });
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(default_level))
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    if let Err(err) = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
+        .try_init()
+    {
+        eprintln!("{binary}: failed to initialize terminal logging: {err}");
+    }
 }
 
 struct OxidexApp {
@@ -135,8 +205,9 @@ impl DaemonGuiApp {
         tr(self.language, key)
     }
 
-    fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
-        let mut client = connect_or_start_daemon()?;
+    fn new(cc: &eframe::CreationContext<'_>, args: &GuiArgs) -> anyhow::Result<Self> {
+        tracing::debug!("connecting GUI to oxidexd");
+        let mut client = connect_or_start_daemon(args.debug, args.log_level.as_deref())?;
         let config = client.config_get().ok();
         let theme = config
             .as_ref()
@@ -160,6 +231,13 @@ impl DaemonGuiApp {
         let indexes = client.indexes().unwrap_or_default();
         let jobs = client.jobs().unwrap_or_default();
         let watches = client.watch_status().unwrap_or_default();
+        tracing::debug!(
+            devices = devices.len(),
+            indexes = indexes.len(),
+            jobs = jobs.len(),
+            watches = watches.len(),
+            "loaded initial daemon state"
+        );
         let mut app = Self {
             client: Some(client),
             query: String::new(),
@@ -218,6 +296,12 @@ impl DaemonGuiApp {
             Ok(result) => {
                 let count = result.rows.len();
                 let truncated = result.truncated;
+                tracing::debug!(
+                    query = %self.query,
+                    rows = count,
+                    truncated,
+                    "daemon search completed"
+                );
                 self.rows = result.rows;
                 self.selected_hit =
                     previous.filter(|hit| self.rows.iter().any(|row| row.hit == *hit));
@@ -242,6 +326,13 @@ impl DaemonGuiApp {
             client.watch_status(),
         ) {
             (Ok(devices), Ok(indexes), Ok(jobs), Ok(watches)) => {
+                tracing::debug!(
+                    devices = devices.len(),
+                    indexes = indexes.len(),
+                    jobs = jobs.len(),
+                    watches = watches.len(),
+                    "refreshed daemon lists"
+                );
                 self.devices = devices;
                 self.indexes = indexes;
                 self.jobs = jobs;
@@ -252,6 +343,7 @@ impl DaemonGuiApp {
             | (_, Err(err), _, _)
             | (_, _, Err(err), _)
             | (_, _, _, Err(err)) => {
+                tracing::warn!(error = %format!("{err:#}"), "failed to refresh daemon lists");
                 self.status = format!("{}: {err:#}", self.t(Text::SearchFailed))
             }
         }
@@ -382,13 +474,26 @@ impl DaemonGuiApp {
             return;
         };
         self.status = format!("{indexing_label} {device_id}...");
+        tracing::info!(device_id = %device_id, "requesting daemon scan");
         match client.start_scan(&device_id) {
             Ok(result) => {
+                tracing::info!(
+                    job_id = result.job_id,
+                    device_id = %result.device_id,
+                    "daemon scan queued"
+                );
                 self.status = format!("{queued_label} {}: {}.", result.job_id, result.device_id);
                 self.refresh_lists();
                 self.recompute_rows();
             }
-            Err(err) => self.status = format!("{failed_label} {device_id}: {err:#}"),
+            Err(err) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    error = %format!("{err:#}"),
+                    "failed to start daemon scan"
+                );
+                self.status = format!("{failed_label} {device_id}: {err:#}");
+            }
         }
     }
 
@@ -399,6 +504,7 @@ impl DaemonGuiApp {
         };
         match client.forget_index(&device_id) {
             Ok(indexes) => {
+                tracing::info!(device_id = %device_id, "forgot index through daemon");
                 self.indexes = indexes;
                 self.rows.retain(|row| row.hit.device_id != device_id);
                 if self
@@ -415,6 +521,11 @@ impl DaemonGuiApp {
                 self.status = format!("{} {device_id}.", self.t(Text::Forgot));
             }
             Err(err) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    error = %format!("{err:#}"),
+                    "failed to forget index through daemon"
+                );
                 self.status = format!("{} {device_id}: {err:#}", self.t(Text::FailedToForget))
             }
         }
@@ -1200,11 +1311,17 @@ impl OxidexApp {
     }
 
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        tracing::debug!("initializing standalone GUI state");
         let (tx, rx) = crossbeam_channel::unbounded();
         let config = load_config().unwrap_or_default();
         let (language, cjk_font_status) = apply_gui_preferences(&cc.egui_ctx, &config);
         let devices = list_known_devices().unwrap_or_default();
         let indexes = snapshot::load_all_indexes().unwrap_or_default();
+        tracing::debug!(
+            devices = devices.len(),
+            indexes = indexes.len(),
+            "loaded standalone state"
+        );
         let mut app = Self {
             devices,
             indexes,
@@ -1275,6 +1392,15 @@ impl OxidexApp {
                             } else {
                                 format!("{} {device_id}.", self.t(Text::IndexedDevice))
                             };
+                            let entries = self
+                                .index_by_id(&device_id)
+                                .map(|index| index.records.len())
+                                .unwrap_or(0);
+                            tracing::info!(
+                                device_id = %device_id,
+                                entries,
+                                "standalone scan finished"
+                            );
                         }
                         Err(err) => {
                             let message = format!("{err:#}");
@@ -1282,6 +1408,11 @@ impl OxidexApp {
                                 .insert(device_id.clone(), message.clone());
                             self.status =
                                 format!("{} {device_id}: {message}", self.t(Text::IndexingFailed));
+                            tracing::warn!(
+                                device_id = %device_id,
+                                error = %message,
+                                "standalone scan failed"
+                            );
                         }
                     }
                 }
@@ -1311,6 +1442,11 @@ impl OxidexApp {
             self.sort_direction,
         );
         self.selected_hit = previous_selection.filter(|hit| self.hits.iter().any(|h| h == hit));
+        tracing::debug!(
+            query = %self.query,
+            hits = self.hits.len(),
+            "standalone search recomputed"
+        );
     }
 
     fn search_request(&self) -> Result<SearchRequest, oxidex_core::index::SearchParseError> {
@@ -1442,6 +1578,12 @@ impl OxidexApp {
             "{} {}...",
             self.t(Text::IndexingDevice),
             device.metadata.device_id
+        );
+        tracing::info!(
+            device_id = %device.metadata.device_id,
+            fs_type = device.metadata.fs_type.as_str(),
+            dev_node = %device.metadata.dev_node,
+            "starting standalone helper scan"
         );
         let tx = self.tx.clone();
         thread::spawn(move || run_scan_job(device, cancel, tx));
@@ -2359,13 +2501,21 @@ fn scan_device_with_helper(
     }
 }
 
-fn connect_or_start_daemon() -> anyhow::Result<OxidexClient> {
+fn connect_or_start_daemon(
+    debug_mode: bool,
+    log_level: Option<&str>,
+) -> anyhow::Result<OxidexClient> {
     match OxidexClient::connect_default() {
-        Ok(client) => Ok(client),
+        Ok(client) => {
+            tracing::debug!("connected to existing oxidexd");
+            Ok(client)
+        }
         Err(first_err) => {
-            start_daemon_once()?;
+            tracing::warn!(error = %first_err, "oxidexd socket unavailable; attempting auto-start");
+            start_daemon_once(debug_mode, log_level)?;
             for _ in 0..20 {
                 if let Ok(client) = OxidexClient::connect_default() {
+                    tracing::debug!("connected to auto-started oxidexd");
                     return Ok(client);
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -2375,13 +2525,27 @@ fn connect_or_start_daemon() -> anyhow::Result<OxidexClient> {
     }
 }
 
-fn start_daemon_once() -> anyhow::Result<()> {
-    Command::new(sibling_binary("oxidexd"))
-        .arg("--foreground")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+fn start_daemon_once(debug_mode: bool, log_level: Option<&str>) -> anyhow::Result<()> {
+    let binary = sibling_binary("oxidexd");
+    tracing::debug!(
+        binary = %binary.display(),
+        debug_mode,
+        ?log_level,
+        "auto-starting oxidexd"
+    );
+    let mut command = Command::new(binary);
+    command.arg("--foreground");
+    if debug_mode {
+        command.arg("--debug");
+    }
+    if let Some(level) = log_level {
+        command.arg("--log-level").arg(level);
+    }
+    command.stdin(Stdio::null());
+    if !debug_mode {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    command.spawn()?;
     Ok(())
 }
 

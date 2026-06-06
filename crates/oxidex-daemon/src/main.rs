@@ -38,6 +38,7 @@ use oxidex_core::rules::{compile_rules, filter_index};
 use oxidex_core::scanner::ScanCancellation;
 use oxidex_core::{VERSION, snapshot, stream};
 use serde_json::{Value, json};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SCANNER_SOCKET: &str = "/run/oxidex/scannerd.sock";
 
@@ -52,10 +53,13 @@ fn run() -> anyhow::Result<()> {
     let mut socket_path = default_daemon_socket_path()?;
     let mut config_path = default_config_path()?;
     let mut foreground = false;
+    let mut debug_mode = false;
+    let mut log_level: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--foreground" => foreground = true,
+            "--debug" => debug_mode = true,
             "--socket" => {
                 let Some(value) = args.next() else {
                     anyhow::bail!("--socket requires a path");
@@ -69,7 +73,10 @@ fn run() -> anyhow::Result<()> {
                 config_path = PathBuf::from(value);
             }
             "--log-level" => {
-                let _ = args.next();
+                let Some(value) = args.next() else {
+                    anyhow::bail!("--log-level requires a value");
+                };
+                log_level = Some(value);
             }
             "--help" | "-h" => {
                 print_usage();
@@ -78,10 +85,19 @@ fn run() -> anyhow::Result<()> {
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
+    init_terminal_logging("oxidexd", debug_mode, log_level.as_deref());
+    tracing::info!(
+        foreground,
+        debug_mode,
+        socket = %socket_path.display(),
+        config = %config_path.display(),
+        scanner_socket = DEFAULT_SCANNER_SOCKET,
+        "starting oxidexd"
+    );
 
     if !foreground {
-        eprintln!(
-            "oxidexd: running in foreground; service managers should pass --foreground explicitly"
+        tracing::warn!(
+            "running in foreground; service managers should pass --foreground explicitly"
         );
     }
 
@@ -95,13 +111,32 @@ fn run() -> anyhow::Result<()> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: oxidexd [--foreground] [--socket <path>] [--config <path>] [--log-level <level>]"
+        "Usage: oxidexd [--foreground] [--debug] [--socket <path>] [--config <path>] [--log-level <level>]"
     );
+    eprintln!("Levels: trace, debug, info, warn, error. RUST_LOG overrides --log-level.");
+}
+
+fn init_terminal_logging(binary: &str, debug: bool, log_level: Option<&str>) {
+    let default_level = log_level.unwrap_or(if debug { "debug" } else { "info" });
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(default_level))
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    if let Err(err) = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
+        .try_init()
+    {
+        eprintln!("{binary}: failed to initialize terminal logging: {err}");
+    }
 }
 
 fn serve(socket_path: PathBuf, state: Arc<Mutex<DaemonState>>) -> anyhow::Result<()> {
     let listener = if let Some(listener) = inherited_systemd_listener()? {
-        eprintln!("oxidexd: using inherited systemd socket");
+        tracing::info!("using inherited systemd socket");
         listener
     } else {
         if let Some(parent) = socket_path.parent() {
@@ -111,7 +146,7 @@ fn serve(socket_path: PathBuf, state: Arc<Mutex<DaemonState>>) -> anyhow::Result
             fs::remove_file(&socket_path)?;
         }
         let listener = UnixListener::bind(&socket_path)?;
-        eprintln!("oxidexd: listening on {}", socket_path.display());
+        tracing::info!(socket = %socket_path.display(), "listening");
         listener
     };
 
@@ -119,13 +154,14 @@ fn serve(socket_path: PathBuf, state: Arc<Mutex<DaemonState>>) -> anyhow::Result
         match stream {
             Ok(stream) => {
                 let state = state.clone();
+                tracing::debug!("accepted daemon client connection");
                 thread::spawn(move || {
                     if let Err(err) = handle_client(stream, state) {
-                        eprintln!("oxidexd: client error: {err:#}");
+                        tracing::warn!(error = %format!("{err:#}"), "daemon client error");
                     }
                 });
             }
-            Err(err) => eprintln!("oxidexd: accept failed: {err}"),
+            Err(err) => tracing::warn!(error = %err, "accept failed"),
         }
     }
     Ok(())
@@ -151,6 +187,7 @@ fn inherited_systemd_listener() -> anyhow::Result<Option<UnixListener>> {
 
 fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> anyhow::Result<()> {
     ensure_same_uid_client(&stream)?;
+    tracing::debug!("daemon client passed same-UID check");
     while let Some(frame) = read_frame(&mut stream)? {
         let id = frame.header.id;
         let Some(id) = id else {
@@ -160,12 +197,21 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> anyh
             )?;
             continue;
         };
+        let method = frame.header.method.clone().unwrap_or_default();
+        tracing::debug!(id, method = %method, "daemon request received");
         let response = match handle_request(frame, &state) {
-            Ok((result, payload)) => IpcFrame::ok(id, result, payload),
-            Err(err) => IpcFrame::error(Some(id), "request_failed", format!("{err:#}")),
+            Ok((result, payload)) => {
+                tracing::debug!(id, method = %method, payload_bytes = payload.len(), "daemon request completed");
+                IpcFrame::ok(id, result, payload)
+            }
+            Err(err) => {
+                tracing::warn!(id, method = %method, error = %format!("{err:#}"), "daemon request failed");
+                IpcFrame::error(Some(id), "request_failed", format!("{err:#}"))
+            }
         };
         write_frame(&mut stream, &response)?;
     }
+    tracing::debug!("daemon client disconnected");
     Ok(())
 }
 
@@ -405,11 +451,24 @@ impl DaemonState {
     fn load(config_path: PathBuf, scanner_socket: PathBuf) -> anyhow::Result<Self> {
         let config = load_config_from_path(&config_path)?;
         let indexes = snapshot::load_all_indexes()?;
-        let index_states = snapshot::load_all_index_states()?
-            .into_iter()
-            .map(|state| (state.device_id.clone(), state))
-            .collect();
+        let index_states: HashMap<String, snapshot::IndexStateV1> =
+            snapshot::load_all_index_states()?
+                .into_iter()
+                .map(|mut state| {
+                    if normalize_watch_setup_sidecar(&mut state) {
+                        let _ = snapshot::save_index_state(&state);
+                    }
+                    (state.device_id.clone(), state)
+                })
+                .collect();
         let devices = list_known_devices().unwrap_or_default();
+        tracing::debug!(
+            config = %config_path.display(),
+            indexes = indexes.len(),
+            index_states = index_states.len(),
+            devices = devices.len(),
+            "loaded daemon state"
+        );
         Ok(Self {
             config_path,
             config,
@@ -582,6 +641,13 @@ fn start_scan_job(
                 cancellation: cancellation.clone(),
             },
         );
+        tracing::info!(
+            job_id,
+            device_id = %device_id,
+            dev_node = %device.metadata.dev_node,
+            fs_type = device.metadata.fs_type.as_str(),
+            "queued scan job"
+        );
 
         (job_id, device, cancellation)
     };
@@ -614,6 +680,11 @@ fn run_scan_worker(worker: ScanWorkerState) {
     }
 
     let start = Instant::now();
+    tracing::info!(
+        job_id = worker.job_id,
+        device_id = %worker.device.metadata.device_id,
+        "scan worker started"
+    );
     let (config, scanner_socket) = {
         let state = worker.state.lock().unwrap();
         (state.config.clone(), state.scanner_socket.clone())
@@ -632,7 +703,15 @@ fn run_scan_worker(worker: ScanWorkerState) {
         Ok((index, scanner_label)) => {
             finish_daemon_job_success(worker, index, scanner_label, start)
         }
-        Err(err) => finish_daemon_job_failed(worker, format!("{err:#}"), start),
+        Err(err) => {
+            tracing::warn!(
+                job_id = worker.job_id,
+                device_id = %worker.device.metadata.device_id,
+                error = %format!("{err:#}"),
+                "scan worker failed"
+            );
+            finish_daemon_job_failed(worker, format!("{err:#}"), start)
+        }
     }
 }
 
@@ -659,6 +738,7 @@ fn wait_for_scan_slot(worker: &ScanWorkerState) -> anyhow::Result<()> {
                 job.summary.state = ScanState::Running;
                 job.summary.started_time = Some(now_unix());
                 job.summary.message = "Running".into();
+                tracing::debug!(job_id = worker.job_id, "scan job acquired running slot");
                 return Ok(());
             }
         }
@@ -728,6 +808,15 @@ fn finish_daemon_job_success(
                 job.summary.message = format!("Indexed {entry_count} entries");
                 job.summary.result = result_summary;
             }
+            tracing::info!(
+                job_id = worker.job_id,
+                device_id = %device_id,
+                entries = entry_count,
+                scanner = %scanner_label,
+                snapshot = %path.display(),
+                duration_ms = start.elapsed().as_millis(),
+                "scan job finished"
+            );
         }
         Err(err) => finish_daemon_job_failed(worker, format!("{err:#}"), start),
     }
@@ -763,6 +852,13 @@ fn finish_daemon_job_failed(worker: ScanWorkerState, message: String, start: Ins
         job.summary.message = message.clone();
         job.summary.error = Some(message);
     }
+    tracing::warn!(
+        job_id = worker.job_id,
+        device_id = %device_id,
+        cancelled,
+        duration_ms = start.elapsed().as_millis(),
+        "scan job failed"
+    );
 }
 
 fn cancel_scan_job(
@@ -900,6 +996,14 @@ fn reconcile_watchers(
                     {
                         return None;
                     }
+                    if state
+                        .index_states
+                        .get(&index.metadata.device_id)
+                        .and_then(|state| state.live_watch_state.as_deref())
+                        .is_some_and(|watch_state| watch_state == "unavailable")
+                    {
+                        return None;
+                    }
                     let device = state
                         .devices
                         .iter()
@@ -979,6 +1083,12 @@ fn reconcile_watchers(
             Ok(watcher)
         }) {
             Ok(watcher) => {
+                tracing::debug!(
+                    device_id = %device_id,
+                    mount_point = %mount_point.display(),
+                    watched_directories = dir_count,
+                    "mounted live watcher started"
+                );
                 watchers.insert(
                     device_id.clone(),
                     ActiveWatcher {
@@ -999,7 +1109,7 @@ fn reconcile_watchers(
                     },
                 );
             }
-            Err(err) => mark_watch_error(state, &device_id, format!("{err:#}")),
+            Err(err) => mark_watch_setup_unavailable(state, &device_id, format!("{err:#}")),
         }
     }
 }
@@ -1260,6 +1370,11 @@ fn set_watch_dirty_locked(state: &mut DaemonState, device_id: &str, dirty: bool)
 }
 
 fn mark_watch_error(state: &Arc<Mutex<DaemonState>>, device_id: &str, message: String) {
+    tracing::warn!(
+        device_id,
+        error = %message,
+        "mounted live watcher desynchronized"
+    );
     let mut state = state.lock().unwrap();
     let sidecar = state
         .index_states
@@ -1285,6 +1400,67 @@ fn mark_watch_error(state: &Arc<Mutex<DaemonState>>, device_id: &str, message: S
             dirty: false,
             last_error: Some(message),
         });
+}
+
+fn mark_watch_setup_unavailable(state: &Arc<Mutex<DaemonState>>, device_id: &str, message: String) {
+    tracing::warn!(
+        device_id,
+        error = %message,
+        "mounted live watcher unavailable"
+    );
+    let mut state = state.lock().unwrap();
+    let sidecar = state
+        .index_states
+        .entry(device_id.to_owned())
+        .or_insert_with(|| snapshot::IndexStateV1::new(device_id.to_owned()));
+    if sidecar.stale_reason.as_deref() == Some("watch_desync")
+        && sidecar
+            .last_error
+            .as_deref()
+            .is_some_and(is_permission_denied_message)
+    {
+        sidecar.stale_reason = None;
+        sidecar.last_error = None;
+    }
+    sidecar.live_watch_state = Some("unavailable".into());
+    let _ = snapshot::save_index_state(sidecar);
+    state
+        .watch_summaries
+        .entry(device_id.to_owned())
+        .and_modify(|summary| {
+            summary.state = "unavailable".into();
+            summary.last_error = Some(message.clone());
+        })
+        .or_insert(WatchSummary {
+            device_id: device_id.to_owned(),
+            mounted: true,
+            enabled: true,
+            state: "unavailable".into(),
+            watched_directories: 0,
+            dirty: false,
+            last_error: Some(message),
+        });
+}
+
+fn normalize_watch_setup_sidecar(state: &mut snapshot::IndexStateV1) -> bool {
+    if state.stale_reason.as_deref() == Some("watch_desync")
+        && state.live_watch_state.as_deref() == Some("error")
+        && state
+            .last_error
+            .as_deref()
+            .is_some_and(is_permission_denied_message)
+    {
+        state.stale_reason = None;
+        state.last_error = None;
+        state.live_watch_state = Some("unavailable".into());
+        true
+    } else {
+        false
+    }
+}
+
+fn is_permission_denied_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("permission denied")
 }
 
 fn device_label(index: &SearchIndex) -> String {
@@ -1314,20 +1490,24 @@ fn scan_and_index_device(
         anyhow::ensure!(device_config.enabled, "device is disabled in config");
     }
 
-    let (scan, scanner_label) = match scan_with_scannerd(
-        scanner_socket,
-        device,
-        cancellation,
-        progress,
-    ) {
-        Ok(scan) => (scan, "scannerd".to_owned()),
-        Err(scanner_err) => {
-            eprintln!(
-                "oxidexd: scanner daemon unavailable or failed ({scanner_err:#}); falling back to scanner helper"
-            );
-            (scan_with_helper(device, cancellation)?, "helper".to_owned())
-        }
-    };
+    let (scan, scanner_label) =
+        match scan_with_scannerd(scanner_socket, device, cancellation, progress) {
+            Ok(scan) => {
+                tracing::debug!(
+                    device_id = %device.metadata.device_id,
+                    "scan completed through scanner daemon"
+                );
+                (scan, "scannerd".to_owned())
+            }
+            Err(scanner_err) => {
+                tracing::warn!(
+                    device_id = %device.metadata.device_id,
+                    error = %format!("{scanner_err:#}"),
+                    "scanner daemon unavailable or failed; falling back to scanner helper"
+                );
+                (scan_with_helper(device, cancellation)?, "helper".to_owned())
+            }
+        };
 
     let mut index = SearchIndex::from_scan(device.metadata.clone(), scan, now_unix())?;
     if let Some(device_config) = config
@@ -1347,6 +1527,11 @@ fn scan_with_scannerd(
     cancellation: &ScanCancellation,
     progress: &mut dyn FnMut(u8),
 ) -> anyhow::Result<ScanDatabase> {
+    tracing::debug!(
+        socket = %socket_path.display(),
+        device_id = %device.metadata.device_id,
+        "connecting to scanner daemon"
+    );
     let mut stream = UnixStream::connect(socket_path).map_err(|err| {
         if err.kind() == ErrorKind::PermissionDenied {
             anyhow::anyhow!(
@@ -1364,6 +1549,7 @@ fn scan_with_scannerd(
     };
     let auth: ScannerAuthorizeResult = result_as(&frame)?;
     anyhow::ensure!(auth.authorized, "scanner daemon authorization failed");
+    tracing::debug!(device_id = %device.metadata.device_id, "scanner daemon session authorized");
 
     let params = ScannerStartScanParams {
         device_path: device.metadata.dev_node.clone(),
@@ -1375,6 +1561,11 @@ fn scan_with_scannerd(
     )?;
     let frame = read_until_response(&mut stream, 2, progress)?;
     let started: ScannerStartScanResult = result_as(&frame)?;
+    tracing::info!(
+        device_id = %device.metadata.device_id,
+        scanner_job_id = started.job_id,
+        "scanner daemon job started"
+    );
     let mut next_id = 3u64;
 
     loop {
@@ -1409,6 +1600,12 @@ fn scan_with_scannerd(
         let frame = read_until_response(&mut stream, take_id, progress)?;
         if frame.header.ok == Some(true) {
             let _result: oxidex_core::daemon_model::ScannerTakeResultResult = result_as(&frame)?;
+            tracing::debug!(
+                device_id = %device.metadata.device_id,
+                scanner_job_id = started.job_id,
+                payload_bytes = frame.payload.len(),
+                "scanner daemon result received"
+            );
             return stream::read_scan_stream(&frame.payload[..]);
         }
         let message = frame
@@ -1451,6 +1648,13 @@ fn scan_with_helper(
     cancellation: &ScanCancellation,
 ) -> anyhow::Result<ScanDatabase> {
     let helper = helper_path();
+    tracing::info!(
+        helper = %helper.display(),
+        device_id = %device.metadata.device_id,
+        dev_node = %device.metadata.dev_node,
+        fs_type = device.metadata.fs_type.as_str(),
+        "starting scanner helper fallback"
+    );
     let mut child = Command::new("pkexec")
         .arg(helper)
         .arg(&device.metadata.dev_node)
@@ -1685,4 +1889,37 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_denied_watch_setup_sidecar_becomes_unavailable_not_stale() {
+        let mut state = snapshot::IndexStateV1::new("partuuid:test");
+        state.stale_reason = Some("watch_desync".into());
+        state.live_watch_state = Some("error".into());
+        state.last_error = Some("Permission denied (os error 13)".into());
+
+        assert!(normalize_watch_setup_sidecar(&mut state));
+        assert_eq!(state.stale_reason, None);
+        assert_eq!(state.last_error, None);
+        assert_eq!(state.live_watch_state.as_deref(), Some("unavailable"));
+    }
+
+    #[test]
+    fn non_watch_sidecar_error_is_not_normalized() {
+        let mut state = snapshot::IndexStateV1::new("partuuid:test");
+        state.stale_reason = Some("scan_failed".into());
+        state.live_watch_state = Some("error".into());
+        state.last_error = Some("Permission denied (os error 13)".into());
+
+        assert!(!normalize_watch_setup_sidecar(&mut state));
+        assert_eq!(state.stale_reason.as_deref(), Some("scan_failed"));
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("Permission denied (os error 13)")
+        );
+    }
 }
