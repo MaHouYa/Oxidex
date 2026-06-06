@@ -11,9 +11,11 @@ anyhow.workspace = true
 crossbeam-channel.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
+fontdb.workspace = true
 oxidex-client = { path = "../oxidex-client" }
 oxidex-core = { path = "../oxidex-core" }
 open.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sys-locale.workspace = true
 time.workspace = true

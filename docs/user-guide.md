@@ -52,6 +52,128 @@ oxidex --standalone
 
 Standalone mode is useful if the daemon socket or service setup is broken, but normal use should go through `oxidexd`.
 
+## Chinese, Japanese, Korean, And IME Setup
+
+Oxidex stores file names and search text as UTF-8, so CJK file names work in the index format already. The GUI also loads installed system CJK fonts at startup and uses egui/winit's native Linux IME path for composition input.
+
+Oxidex does not bundle large CJK fonts. Install at least one system CJK font package:
+
+Arch Linux:
+
+```sh
+sudo pacman -S noto-fonts-cjk
+# or:
+sudo pacman -S wqy-microhei
+```
+
+Debian/Ubuntu:
+
+```sh
+sudo apt install fonts-noto-cjk
+# or:
+sudo apt install fonts-wqy-microhei
+```
+
+Open **Settings** -> **Appearance** in the GUI. The CJK font status should report that fallback fonts were loaded. If it says no CJK fallback font was found, install one of the packages above and restart Oxidex. You can also set a preferred family name, for example `Noto Sans CJK SC`, then click **Apply**.
+
+### Language Selection
+
+The default language is `system`. Oxidex uses Simplified Chinese automatically when your system locale starts with `zh`, such as `zh_CN.UTF-8` or `zh_Hans_CN`. Otherwise it uses English.
+
+You can override this in **Settings** -> **Appearance**:
+
+- **System**: follow the current locale.
+- **English**: force English.
+- **Simplified Chinese**: force zh-CN.
+
+The same values can be configured manually:
+
+```toml
+[ui]
+language = "system" # system, en_us, or zh_cn
+cjk_font_fallback = true
+cjk_preferred_font = ""
+```
+
+### Fcitx5
+
+Install Fcitx5 and a Chinese engine:
+
+Arch Linux:
+
+```sh
+sudo pacman -S fcitx5 fcitx5-configtool fcitx5-chinese-addons
+```
+
+Debian/Ubuntu package names vary by release, but usually start with:
+
+```sh
+sudo apt install fcitx5 fcitx5-chinese-addons
+```
+
+Many Wayland desktop sessions configure input methods automatically. If your IME does not open in Oxidex, log out and back in after setting these environment variables in your desktop session:
+
+```sh
+GTK_IM_MODULE=fcitx
+QT_IM_MODULE=fcitx
+XMODIFIERS=@im=fcitx
+SDL_IM_MODULE=fcitx
+```
+
+Start or restart Fcitx5, then test in Oxidex by composing `测试` in the search box, extension/path filter fields, and Settings text fields. During active composition, Enter/Escape should not open a selected result or clear your selection; after commit, search updates normally.
+
+### IBus
+
+Install IBus and a CJK engine:
+
+Arch Linux:
+
+```sh
+sudo pacman -S ibus ibus-libpinyin
+# or:
+sudo pacman -S ibus ibus-rime
+```
+
+Debian/Ubuntu:
+
+```sh
+sudo apt install ibus ibus-libpinyin
+# or:
+sudo apt install ibus-rime
+```
+
+Run:
+
+```sh
+ibus-setup
+```
+
+If your desktop session does not configure IBus automatically, set:
+
+```sh
+GTK_IM_MODULE=ibus
+QT_IM_MODULE=ibus
+XMODIFIERS=@im=ibus
+```
+
+Log out and back in, then test by typing `测试.txt`, `日本語.md`, and `한글.log` in Oxidex search fields. Copy Name and Copy Path should preserve CJK text.
+
+### CJK Troubleshooting
+
+Missing glyph boxes usually mean Oxidex did not find a CJK fallback font. Install `noto-fonts-cjk`, `fonts-noto-cjk`, `wqy-microhei`, or `fonts-wqy-microhei`, then restart the GUI. If you use an unusual font family, set it as the preferred CJK font in Settings.
+
+If the IME candidate window never appears, first test the same IME in another GTK or Wayland application. Then confirm the relevant environment variables are present in the shell that launches Oxidex:
+
+```sh
+env | grep -E 'IM_MODULE|XMODIFIERS'
+```
+
+On systemd-based desktops, environment changes often require a full logout/login. For user services, you may also need:
+
+```sh
+systemctl --user import-environment GTK_IM_MODULE QT_IM_MODULE XMODIFIERS SDL_IM_MODULE
+```
+
 ## Optional Systemd Socket Activation
 
 Packages install systemd socket units. Socket activation lets systemd start daemons only when something connects.
@@ -275,6 +397,8 @@ Set simple values:
 oxidex-cli config set ui.theme dark
 oxidex-cli config set ui.theme light
 oxidex-cli config set ui.theme system
+oxidex-cli config set ui.language zh_cn
+oxidex-cli config set ui.language system
 oxidex-cli config set search.default_sort relevance
 oxidex-cli config set indexing.watch_mounted true
 oxidex-cli config set rofi.max_results 200

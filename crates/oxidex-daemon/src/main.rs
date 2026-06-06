@@ -14,7 +14,7 @@ use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use oxidex_core::config::{
-    AppConfig, ThemeMode, config_path as default_config_path, load_config_from_path,
+    AppConfig, LanguageMode, ThemeMode, config_path as default_config_path, load_config_from_path,
     save_config_to_path, validate_config,
 };
 use oxidex_core::daemon_model::{
@@ -1537,6 +1537,18 @@ fn apply_config_set(config: &mut AppConfig, params: &ConfigSetParams) -> anyhow:
                 other => anyhow::bail!("unsupported theme '{other}'"),
             };
         }
+        "ui.language" => {
+            let value = params
+                .value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("ui.language must be a string"))?;
+            config.ui.language = match value {
+                "system" => LanguageMode::System,
+                "en_us" | "en-US" | "en" => LanguageMode::EnUs,
+                "zh_cn" | "zh-CN" | "zh" => LanguageMode::ZhCn,
+                other => anyhow::bail!("unsupported language '{other}'"),
+            };
+        }
         "ui.show_filter_panel" => {
             config.ui.show_filter_panel = params
                 .value
@@ -1548,6 +1560,20 @@ fn apply_config_set(config: &mut AppConfig, params: &ConfigSetParams) -> anyhow:
                 .value
                 .as_bool()
                 .ok_or_else(|| anyhow::anyhow!("ui.remember_window_size must be a boolean"))?;
+        }
+        "ui.cjk_font_fallback" => {
+            config.ui.cjk_font_fallback = params
+                .value
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("ui.cjk_font_fallback must be a boolean"))?;
+        }
+        "ui.cjk_preferred_font" => {
+            config.ui.cjk_preferred_font = params
+                .value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("ui.cjk_preferred_font must be a string"))?
+                .trim()
+                .to_owned();
         }
         "search.default_sort" => {
             let value = params

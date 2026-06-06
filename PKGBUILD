@@ -12,6 +12,13 @@ url="https://github.com/MaHouYa/Oxidex"
 license=('GPL-3.0-or-later')
 depends=('gcc-libs' 'glibc' 'polkit' 'libx11' 'libxcb' 'libxkbcommon' 'wayland' 'libglvnd' 'fontconfig' 'xdg-utils' 'hicolor-icon-theme')
 makedepends=('cargo' 'clang')
+optdepends=('noto-fonts-cjk: CJK glyph fallback'
+            'wqy-microhei: alternative Chinese glyph fallback'
+            'fcitx5: input method support'
+            'fcitx5-chinese-addons: Chinese input engines for Fcitx5'
+            'ibus: input method support'
+            'ibus-libpinyin: Chinese input engine for IBus'
+            'ibus-rime: Rime input engine for IBus')
 install=oxidex.install
 
 # Disable the creation of the -debug package.

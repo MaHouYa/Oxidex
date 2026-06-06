@@ -12,8 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use fonts::CjkFontStatus;
+use i18n::{LanguageMode, ResolvedLanguage, Text, language_mode_value, system_language, tr};
 use oxidex_client::OxidexClient;
-use oxidex_core::config::{ThemeMode, load_config};
+use oxidex_core::config::{AppConfig, ThemeMode, load_config, save_config};
 use oxidex_core::daemon_model::{
     DeviceSummary, IndexSummary, ScanJobSummary, SearchQueryParams, SearchResultRow, WatchSummary,
 };
@@ -25,6 +27,9 @@ use oxidex_core::index::{
 use oxidex_core::model::{DeviceMetadata, FsType, SortDirection, SortKey};
 use oxidex_core::snapshot;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
+
+mod fonts;
+mod i18n;
 
 fn main() -> eframe::Result {
     let standalone = std::env::args().any(|arg| arg == "--standalone");
@@ -46,7 +51,7 @@ fn main() -> eframe::Result {
             }
             match DaemonGuiApp::new(cc) {
                 Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
-                Err(err) => Ok(Box::new(ServiceErrorApp::new(err)) as Box<dyn eframe::App>),
+                Err(err) => Ok(Box::new(ServiceErrorApp::new(cc, err)) as Box<dyn eframe::App>),
             }
         }),
     )
@@ -67,11 +72,17 @@ struct OxidexApp {
     status: String,
     show_filters: bool,
     show_index_manager: bool,
+    show_settings: bool,
     properties_hit: Option<SearchHit>,
     last_scan_errors: HashMap<String, String>,
     scan_job: Option<ScanJob>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
+    language_mode: LanguageMode,
+    language: ResolvedLanguage,
+    cjk_font_fallback: bool,
+    cjk_preferred_font: String,
+    cjk_font_status: CjkFontStatus,
 }
 
 struct ScanJob {
@@ -112,9 +123,18 @@ struct DaemonGuiApp {
     show_settings: bool,
     properties_row: Option<SearchResultRow>,
     theme: ThemeMode,
+    language_mode: LanguageMode,
+    language: ResolvedLanguage,
+    cjk_font_fallback: bool,
+    cjk_preferred_font: String,
+    cjk_font_status: CjkFontStatus,
 }
 
 impl DaemonGuiApp {
+    fn t(&self, key: Text) -> &'static str {
+        tr(self.language, key)
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
         let mut client = connect_or_start_daemon()?;
         let config = client.config_get().ok();
@@ -122,7 +142,11 @@ impl DaemonGuiApp {
             .as_ref()
             .map(|config| config.config.ui.theme)
             .unwrap_or(ThemeMode::System);
-        apply_theme(&cc.egui_ctx, theme);
+        let ui_config = config
+            .as_ref()
+            .map(|config| config.config.clone())
+            .unwrap_or_default();
+        let (language, cjk_font_status) = apply_gui_preferences(&cc.egui_ctx, &ui_config);
 
         let sort_key = config
             .as_ref()
@@ -151,7 +175,7 @@ impl DaemonGuiApp {
             selected_hit: None,
             sort_key,
             sort_direction,
-            status: "Connected to oxidexd.".into(),
+            status: tr(language, Text::ConnectedToDaemon).into(),
             show_filters: config
                 .as_ref()
                 .map(|config| config.config.ui.show_filter_panel)
@@ -160,6 +184,11 @@ impl DaemonGuiApp {
             show_settings: false,
             properties_row: None,
             theme,
+            language_mode: ui_config.ui.language,
+            language,
+            cjk_font_fallback: ui_config.ui.cjk_font_fallback,
+            cjk_preferred_font: ui_config.ui.cjk_preferred_font.clone(),
+            cjk_font_status,
         };
         app.recompute_rows();
         Ok(app)
@@ -169,7 +198,7 @@ impl DaemonGuiApp {
         let request = match self.search_request() {
             Ok(request) => request,
             Err(err) => {
-                self.status = format!("Search error: {err}");
+                self.status = format!("{}: {err}", self.t(Text::SearchError));
                 return;
             }
         };
@@ -193,12 +222,12 @@ impl DaemonGuiApp {
                 self.selected_hit =
                     previous.filter(|hit| self.rows.iter().any(|row| row.hit == *hit));
                 self.status = if truncated {
-                    format!("Showing first {count} results.")
+                    format!("{}: {count}.", self.t(Text::ShowingFirstResults))
                 } else {
-                    format!("{count} result{}.", plural(count))
+                    format!("{} {}.", count, result_word(self.language, count))
                 };
             }
-            Err(err) => self.status = format!("Search failed: {err:#}"),
+            Err(err) => self.status = format!("{}: {err:#}", self.t(Text::SearchFailed)),
         }
     }
 
@@ -217,12 +246,14 @@ impl DaemonGuiApp {
                 self.indexes = indexes;
                 self.jobs = jobs;
                 self.watches = watches;
-                self.status = "Refreshed devices and indexes.".into();
+                self.status = self.t(Text::Refreshed).into();
             }
             (Err(err), _, _, _)
             | (_, Err(err), _, _)
             | (_, _, Err(err), _)
-            | (_, _, _, Err(err)) => self.status = format!("Refresh failed: {err:#}"),
+            | (_, _, _, Err(err)) => {
+                self.status = format!("{}: {err:#}", self.t(Text::SearchFailed))
+            }
         }
     }
 
@@ -256,7 +287,11 @@ impl DaemonGuiApp {
         for path in filters.path_contains {
             parts.push(format!("path:{path}"));
         }
-        Some(format!("Active filters: {}", parts.join("  ")))
+        Some(format!(
+            "{}: {}",
+            self.t(Text::ActiveFilters),
+            parts.join("  ")
+        ))
     }
 
     fn selected_row(&self) -> Option<&SearchResultRow> {
@@ -266,30 +301,32 @@ impl DaemonGuiApp {
 
     fn open_selected(&mut self) {
         let Some(row) = self.selected_row().cloned() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         let Some(client) = self.client.as_mut() else {
-            self.status = "Daemon client is unavailable.".into();
+            self.status = self.t(Text::DaemonClientUnavailable).into();
             return;
         };
         match client.resolve_path(&row.hit.device_id, row.hit.record_idx) {
             Ok(path) if path.mounted => match open::that(&path.path) {
-                Ok(()) => self.status = format!("Opened {}", path.path),
-                Err(err) => self.status = format!("Failed to open {}: {err}", path.path),
+                Ok(()) => self.status = format!("{} {}", self.t(Text::Opened), path.path),
+                Err(err) => {
+                    self.status = format!("{} {}: {err}", self.t(Text::FailedToOpen), path.path)
+                }
             },
-            Ok(_) => self.status = "This item is indexed, but its device is not mounted.".into(),
-            Err(err) => self.status = format!("Failed to resolve path: {err:#}"),
+            Ok(_) => self.status = self.t(Text::IndexedDeviceUnmounted).into(),
+            Err(err) => self.status = format!("{}: {err:#}", self.t(Text::FailedToResolvePath)),
         }
     }
 
     fn open_selected_location(&mut self) {
         let Some(row) = self.selected_row().cloned() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         let Some(client) = self.client.as_mut() else {
-            self.status = "Daemon client is unavailable.".into();
+            self.status = self.t(Text::DaemonClientUnavailable).into();
             return;
         };
         match client.resolve_path(&row.hit.device_id, row.hit.record_idx) {
@@ -303,55 +340,61 @@ impl DaemonGuiApp {
                         .unwrap_or_else(|| PathBuf::from(&path.path))
                 };
                 match open::that(&target) {
-                    Ok(()) => self.status = format!("Opened {}", target.display()),
-                    Err(err) => self.status = format!("Failed to open {}: {err}", target.display()),
+                    Ok(()) => {
+                        self.status = format!("{} {}", self.t(Text::Opened), target.display())
+                    }
+                    Err(err) => {
+                        self.status =
+                            format!("{} {}: {err}", self.t(Text::FailedToOpen), target.display())
+                    }
                 }
             }
-            Ok(_) => self.status = "This item is indexed, but its device is not mounted.".into(),
-            Err(err) => self.status = format!("Failed to resolve path: {err:#}"),
+            Ok(_) => self.status = self.t(Text::IndexedDeviceUnmounted).into(),
+            Err(err) => self.status = format!("{}: {err:#}", self.t(Text::FailedToResolvePath)),
         }
     }
 
     fn copy_selected_name(&mut self, ctx: &egui::Context) {
         let Some(row) = self.selected_row() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         ctx.copy_text(row.name.clone());
-        self.status = "Copied file name.".into();
+        self.status = self.t(Text::CopiedFileName).into();
     }
 
     fn copy_selected_path(&mut self, ctx: &egui::Context) {
         let Some(row) = self.selected_row() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         ctx.copy_text(row.display_path.clone());
-        self.status = "Copied full path.".into();
+        self.status = self.t(Text::CopiedFullPath).into();
     }
 
     fn scan_device(&mut self, device_id: String) {
+        let indexing_label = self.t(Text::IndexingDevice);
+        let queued_label = self.t(Text::QueuedScanJob);
+        let failed_label = self.t(Text::IndexingFailed);
+        let unavailable_label = self.t(Text::DaemonClientUnavailable);
         let Some(client) = self.client.as_mut() else {
-            self.status = "Daemon client is unavailable.".into();
+            self.status = unavailable_label.into();
             return;
         };
-        self.status = format!("Indexing {device_id}...");
+        self.status = format!("{indexing_label} {device_id}...");
         match client.start_scan(&device_id) {
             Ok(result) => {
-                self.status = format!(
-                    "Queued scan job {} for {}.",
-                    result.job_id, result.device_id
-                );
+                self.status = format!("{queued_label} {}: {}.", result.job_id, result.device_id);
                 self.refresh_lists();
                 self.recompute_rows();
             }
-            Err(err) => self.status = format!("Indexing failed for {device_id}: {err:#}"),
+            Err(err) => self.status = format!("{failed_label} {device_id}: {err:#}"),
         }
     }
 
     fn forget_index(&mut self, device_id: String) {
         let Some(client) = self.client.as_mut() else {
-            self.status = "Daemon client is unavailable.".into();
+            self.status = self.t(Text::DaemonClientUnavailable).into();
             return;
         };
         match client.forget_index(&device_id) {
@@ -369,15 +412,17 @@ impl DaemonGuiApp {
                 if self.selected_scope == device_id {
                     self.selected_scope.clear();
                 }
-                self.status = format!("Forgot {device_id}.");
+                self.status = format!("{} {device_id}.", self.t(Text::Forgot));
             }
-            Err(err) => self.status = format!("Failed to forget {device_id}: {err:#}"),
+            Err(err) => {
+                self.status = format!("{} {device_id}: {err:#}", self.t(Text::FailedToForget))
+            }
         }
     }
 
     fn apply_theme_setting(&mut self, ctx: &egui::Context, theme: ThemeMode) {
         let Some(client) = self.client.as_mut() else {
-            self.status = "Daemon client is unavailable.".into();
+            self.status = self.t(Text::DaemonClientUnavailable).into();
             return;
         };
         let value = match theme {
@@ -389,9 +434,60 @@ impl DaemonGuiApp {
             Ok(_) => {
                 self.theme = theme;
                 apply_theme(ctx, theme);
-                self.status = format!("Theme set to {value}.");
+                self.status = format!("{}: {}.", self.t(Text::ThemeSet), value);
             }
-            Err(err) => self.status = format!("Failed to update theme: {err:#}"),
+            Err(err) => self.status = format!("{}: {err:#}", self.t(Text::FailedToUpdateTheme)),
+        }
+    }
+
+    fn apply_language_setting(&mut self, language_mode: LanguageMode) {
+        let Some(client) = self.client.as_mut() else {
+            self.status = self.t(Text::DaemonClientUnavailable).into();
+            return;
+        };
+        match client.config_set(
+            "ui.language",
+            serde_json::Value::String(language_mode_value(language_mode).into()),
+        ) {
+            Ok(_) => {
+                self.language_mode = language_mode;
+                self.language = system_language(language_mode);
+                self.status = format!(
+                    "{}: {}",
+                    self.t(Text::Language),
+                    language_label(self.language, language_mode)
+                );
+            }
+            Err(err) => self.status = format!("{}: {err:#}", self.t(Text::FailedToUpdateLanguage)),
+        }
+    }
+
+    fn apply_cjk_font_settings(&mut self, ctx: &egui::Context) {
+        let Some(client) = self.client.as_mut() else {
+            self.status = self.t(Text::DaemonClientUnavailable).into();
+            return;
+        };
+        let fallback = self.cjk_font_fallback;
+        let preferred = self.cjk_preferred_font.trim().to_owned();
+        let result = client
+            .config_set("ui.cjk_font_fallback", serde_json::Value::Bool(fallback))
+            .and_then(|_| {
+                client.config_set(
+                    "ui.cjk_preferred_font",
+                    serde_json::Value::String(preferred.clone()),
+                )
+            });
+        match result {
+            Ok(_) => {
+                self.cjk_preferred_font = preferred;
+                self.cjk_font_status =
+                    fonts::configure_fonts(ctx, self.cjk_font_fallback, &self.cjk_preferred_font);
+                apply_theme(ctx, self.theme);
+                self.status = self.t(Text::CjkFontsLoaded).into();
+            }
+            Err(err) => {
+                self.status = format!("{}: {err:#}", self.t(Text::FailedToUpdateCjkFontSettings))
+            }
         }
     }
 }
@@ -425,27 +521,32 @@ impl eframe::App for DaemonGuiApp {
 
         egui::Panel::top("daemon-top").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Refresh").clicked() {
+                if ui.button(self.t(Text::Refresh)).clicked() {
                     self.refresh_lists();
                     self.recompute_rows();
                 }
-                if ui.button("Indexes").clicked() {
+                if ui.button(self.t(Text::Indexes)).clicked() {
                     self.show_index_manager = true;
                     self.refresh_lists();
                 }
-                if ui.button("Settings").clicked() {
+                if ui.button(self.t(Text::Settings)).clicked() {
                     self.show_settings = true;
                 }
                 egui::ComboBox::from_id_salt("daemon-device-scope")
-                    .selected_text(daemon_scope_label(&self.selected_scope, &self.indexes))
+                    .selected_text(daemon_scope_label(
+                        self.language,
+                        &self.selected_scope,
+                        &self.indexes,
+                    ))
                     .width(190.0)
                     .show_ui(ui, |ui| {
+                        let all_devices_label = self.t(Text::AllDevices);
                         let mut scope_changed = false;
                         if ui
                             .selectable_value(
                                 &mut self.selected_scope,
                                 String::new(),
-                                "All devices",
+                                all_devices_label,
                             )
                             .clicked()
                         {
@@ -468,14 +569,17 @@ impl eframe::App for DaemonGuiApp {
                             self.recompute_rows();
                         }
                     });
-                if ui.selectable_label(self.show_filters, "Filters").clicked() {
+                let filters_label = self.t(Text::Filters);
+                if ui
+                    .selectable_label(self.show_filters, filters_label)
+                    .clicked()
+                {
                     self.show_filters = !self.show_filters;
                 }
+                let search_hint = self.t(Text::SearchHintDaemon);
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text(
-                            "Search files, e.g. *.rs ext:txt path:src type:dir !cache size:<10mb",
-                        )
+                        .hint_text(search_hint)
                         .desired_width(f32::INFINITY),
                 );
                 if response.changed() {
@@ -493,9 +597,9 @@ impl eframe::App for DaemonGuiApp {
         egui::Panel::bottom("daemon-status").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
-                    "{} object{} found",
+                    "{} {}",
                     self.rows.len(),
-                    plural(self.rows.len())
+                    self.t(Text::ObjectsFound)
                 ));
                 ui.separator();
                 ui.label(&self.status);
@@ -522,7 +626,15 @@ impl DaemonGuiApp {
     fn daemon_filter_panel(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         ui.horizontal(|ui| {
-            ui.label("Ext");
+            let ext_label = self.t(Text::Ext);
+            let type_label = self.t(Text::Type);
+            let all_label = self.t(Text::All);
+            let files_label = self.t(Text::Files);
+            let folders_label = self.t(Text::Folders);
+            let symlinks_label = self.t(Text::Symlinks);
+            let path_label = self.t(Text::Path);
+            let clear_label = self.t(Text::Clear);
+            ui.label(ext_label);
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut self.filter_extensions)
@@ -530,26 +642,30 @@ impl DaemonGuiApp {
                         .desired_width(140.0),
                 )
                 .changed();
-            ui.label("Type");
+            ui.label(type_label);
             let before_type = self.filter_type;
             egui::ComboBox::from_id_salt("daemon-type-filter")
-                .selected_text(file_type_label(self.filter_type))
+                .selected_text(file_type_label(self.language, self.filter_type))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.filter_type, None, "All");
-                    ui.selectable_value(&mut self.filter_type, Some(SearchFileType::File), "Files");
+                    ui.selectable_value(&mut self.filter_type, None, all_label);
+                    ui.selectable_value(
+                        &mut self.filter_type,
+                        Some(SearchFileType::File),
+                        files_label,
+                    );
                     ui.selectable_value(
                         &mut self.filter_type,
                         Some(SearchFileType::Dir),
-                        "Folders",
+                        folders_label,
                     );
                     ui.selectable_value(
                         &mut self.filter_type,
                         Some(SearchFileType::Symlink),
-                        "Symlinks",
+                        symlinks_label,
                     );
                 });
             changed |= before_type != self.filter_type;
-            ui.label("Path");
+            ui.label(path_label);
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut self.filter_path)
@@ -557,7 +673,7 @@ impl DaemonGuiApp {
                         .desired_width(180.0),
                 )
                 .changed();
-            if ui.button("Clear").clicked() {
+            if ui.button(clear_label).clicked() {
                 self.filter_extensions.clear();
                 self.filter_path.clear();
                 self.filter_type = None;
@@ -573,71 +689,76 @@ impl DaemonGuiApp {
         let has_selection = self.selected_row().is_some();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(has_selection, egui::Button::new("Open"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::Open)))
                 .clicked()
             {
                 self.open_selected();
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Open Folder"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::OpenFolder)))
                 .clicked()
             {
                 self.open_selected_location();
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Copy Name"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::CopyName)))
                 .clicked()
             {
                 self.copy_selected_name(ctx);
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Copy Path"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::CopyPath)))
                 .clicked()
             {
                 self.copy_selected_path(ctx);
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Properties"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::Properties)))
                 .clicked()
             {
                 self.properties_row = self.selected_row().cloned();
             }
             ui.separator();
+            let relevance_label = self.t(Text::Relevance);
+            let name_label = self.t(Text::Name);
+            let path_label = self.t(Text::Path);
+            let size_label = self.t(Text::Size);
+            let date_label = self.t(Text::Date);
             let mut sort_changed = false;
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Relevance,
-                "Relevance",
+                relevance_label,
             );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Name,
-                "Name",
+                name_label,
             );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Path,
-                "Path",
+                path_label,
             );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Size,
-                "Size",
+                size_label,
             );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Mtime,
-                "Date",
+                date_label,
             );
             if sort_changed {
                 self.recompute_rows();
@@ -649,16 +770,16 @@ impl DaemonGuiApp {
         if self.indexes.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
-                ui.heading("No indexes yet");
-                ui.label("Open Indexes to index an NTFS, EXT4, or Btrfs device.");
+                ui.heading(self.t(Text::NoIndexesYet));
+                ui.label(self.t(Text::OpenIndexesHint));
             });
             return;
         }
         if self.rows.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
-                ui.heading("No results");
-                ui.label("Try a different name, wildcard, extension, path, or type filter.");
+                ui.heading(self.t(Text::NoResults));
+                ui.label(self.t(Text::TryDifferentSearchHint));
             });
             return;
         }
@@ -676,16 +797,16 @@ impl DaemonGuiApp {
             .column(Column::initial(150.0).at_least(120.0).clip(true))
             .header(row_height, |mut row| {
                 row.col(|ui| {
-                    ui.strong("Name");
+                    ui.strong(self.t(Text::Name));
                 });
                 row.col(|ui| {
-                    ui.strong("Path");
+                    ui.strong(self.t(Text::Path));
                 });
                 row.col(|ui| {
-                    ui.strong("Size");
+                    ui.strong(self.t(Text::Size));
                 });
                 row.col(|ui| {
-                    ui.strong("Modified");
+                    ui.strong(self.t(Text::Modified));
                 });
             })
             .body(|body| {
@@ -715,32 +836,32 @@ impl DaemonGuiApp {
                     }
                     response.clone().context_menu(|ui| {
                         self.selected_hit = Some(result.hit.clone());
-                        if ui.button("Open").clicked() {
+                        if ui.button(self.t(Text::Open)).clicked() {
                             self.open_selected();
                             ui.close();
                         }
-                        if ui.button("Open Folder").clicked() {
+                        if ui.button(self.t(Text::OpenFolder)).clicked() {
                             self.open_selected_location();
                             ui.close();
                         }
-                        if ui.button("Copy Name").clicked() {
+                        if ui.button(self.t(Text::CopyName)).clicked() {
                             self.copy_selected_name(ctx);
                             ui.close();
                         }
-                        if ui.button("Copy Path").clicked() {
+                        if ui.button(self.t(Text::CopyPath)).clicked() {
                             self.copy_selected_path(ctx);
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Rescan This Device").clicked() {
+                        if ui.button(self.t(Text::RescanThisDevice)).clicked() {
                             self.scan_device(result.hit.device_id.clone());
                             ui.close();
                         }
-                        if ui.button("Forget This Index").clicked() {
+                        if ui.button(self.t(Text::ForgetThisIndex)).clicked() {
                             self.forget_index(result.hit.device_id.clone());
                             ui.close();
                         }
-                        if ui.button("Properties").clicked() {
+                        if ui.button(self.t(Text::Properties)).clicked() {
                             self.properties_row = Some(result.clone());
                             ui.close();
                         }
@@ -757,35 +878,42 @@ impl DaemonGuiApp {
 
     fn daemon_index_manager(&mut self, ctx: &egui::Context) {
         let mut open = self.show_index_manager;
-        egui::Window::new("Indexes")
+        egui::Window::new(self.t(Text::Indexes))
             .open(&mut open)
             .default_width(980.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Refresh Devices").clicked() {
+                    if ui.button(self.t(Text::RefreshDevices)).clicked() {
                         self.refresh_lists();
                     }
-                    if ui.button("Refresh Jobs").clicked() {
+                    if ui.button(self.t(Text::RefreshJobs)).clicked() {
                         self.refresh_lists();
                     }
                 });
                 for job in self.jobs.clone() {
                     ui.horizontal(|ui| {
                         ui.label(format!(
-                            "Job {} {} {:?} {}%",
-                            job.job_id, job.device_id, job.state, job.progress
+                            "{} {} {} {:?} {}%",
+                            self.t(Text::Indexing),
+                            job.job_id,
+                            job.device_id,
+                            job.state,
+                            job.progress
                         ));
                         ui.label(fit(&job.message, 42));
                         if matches!(
                             job.state,
                             oxidex_core::daemon_model::ScanState::Queued
                                 | oxidex_core::daemon_model::ScanState::Running
-                        ) && ui.button("Cancel").clicked()
+                        ) && ui.button(self.t(Text::Cancel)).clicked()
                             && let Some(client) = self.client.as_mut()
                         {
                             match client.cancel_scan(Some(job.job_id), None) {
                                 Ok(result) => self.status = result.message,
-                                Err(err) => self.status = format!("Failed to cancel scan: {err:#}"),
+                                Err(err) => {
+                                    self.status =
+                                        format!("{}: {err:#}", self.t(Text::FailedToCancelScan));
+                                }
                             }
                         }
                     });
@@ -804,15 +932,17 @@ impl DaemonGuiApp {
                                 ui.label(fit(&device_summary_label(&device), 30));
                                 ui.label(fit(device.fs_type.as_str(), 7));
                                 ui.label(if device.mounted {
-                                    "mounted"
+                                    self.t(Text::Mounted)
                                 } else {
-                                    "not mounted"
+                                    self.t(Text::NotMounted)
                                 });
                                 ui.label(fit(&device.dev_node, 22));
                                 ui.label(
                                     indexed_count
-                                        .map(|count| format!("{count} entries"))
-                                        .unwrap_or_else(|| "not indexed".into()),
+                                        .map(|count| {
+                                            format!("{count} {}", self.t(Text::EntryPlural))
+                                        })
+                                        .unwrap_or_else(|| self.t(Text::NotIndexed).into()),
                                 );
                                 if let Some(index) = self
                                     .indexes
@@ -831,14 +961,16 @@ impl DaemonGuiApp {
                                     }
                                 }
                                 let label = if indexed_count.is_some() {
-                                    "Rescan"
+                                    self.t(Text::Rescan)
                                 } else {
-                                    "Index"
+                                    self.t(Text::Index)
                                 };
                                 if ui.button(label).clicked() {
                                     self.scan_device(device.device_id.clone());
                                 }
-                                if indexed_count.is_some() && ui.button("Forget").clicked() {
+                                if indexed_count.is_some()
+                                    && ui.button(self.t(Text::ForgetThisIndex)).clicked()
+                                {
                                     self.forget_index(device.device_id.clone());
                                 }
                             });
@@ -851,51 +983,122 @@ impl DaemonGuiApp {
 
     fn daemon_settings(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
-        egui::Window::new("Settings")
+        egui::Window::new(self.t(Text::Settings))
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
-                ui.heading("Appearance");
+                ui.heading(self.t(Text::Appearance));
                 ui.horizontal(|ui| {
-                    ui.label("Theme");
+                    ui.label(self.t(Text::Theme));
                     let mut next_theme = self.theme;
                     egui::ComboBox::from_id_salt("daemon-theme")
-                        .selected_text(theme_label(self.theme))
+                        .selected_text(theme_label(self.language, self.theme))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut next_theme, ThemeMode::System, "System");
-                            ui.selectable_value(&mut next_theme, ThemeMode::Light, "Light");
-                            ui.selectable_value(&mut next_theme, ThemeMode::Dark, "Dark");
+                            ui.selectable_value(
+                                &mut next_theme,
+                                ThemeMode::System,
+                                self.t(Text::System),
+                            );
+                            ui.selectable_value(
+                                &mut next_theme,
+                                ThemeMode::Light,
+                                self.t(Text::Light),
+                            );
+                            ui.selectable_value(
+                                &mut next_theme,
+                                ThemeMode::Dark,
+                                self.t(Text::Dark),
+                            );
                         });
                     if next_theme != self.theme {
                         self.apply_theme_setting(ctx, next_theme);
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label(self.t(Text::Language));
+                    let mut next_language = self.language_mode;
+                    egui::ComboBox::from_id_salt("daemon-language")
+                        .selected_text(language_label(self.language, self.language_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut next_language,
+                                LanguageMode::System,
+                                self.t(Text::System),
+                            );
+                            ui.selectable_value(
+                                &mut next_language,
+                                LanguageMode::EnUs,
+                                self.t(Text::English),
+                            );
+                            ui.selectable_value(
+                                &mut next_language,
+                                LanguageMode::ZhCn,
+                                self.t(Text::SimplifiedChinese),
+                            );
+                        });
+                    if next_language != self.language_mode {
+                        self.apply_language_setting(next_language);
+                    }
+                });
+                ui.label(self.t(Text::CjkFonts));
+                ui.horizontal(|ui| {
+                    let cjk_fallback_label = self.t(Text::CjkFontFallback);
+                    let cjk_preferred_label = self.t(Text::CjkPreferredFont);
+                    let apply_label = self.t(Text::Apply);
+                    ui.checkbox(&mut self.cjk_font_fallback, cjk_fallback_label);
+                    ui.label(cjk_preferred_label);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cjk_preferred_font)
+                            .desired_width(180.0),
+                    );
+                    if ui.button(apply_label).clicked() {
+                        self.apply_cjk_font_settings(ctx);
+                    }
+                });
+                ui.label(if self.cjk_font_status.unavailable() {
+                    self.t(Text::CjkFontsMissing)
+                } else if self.cjk_font_status.loaded_fonts.is_empty() {
+                    self.t(Text::CjkFontFallback)
+                } else {
+                    self.t(Text::CjkFontsLoaded)
+                });
+                if !self.cjk_font_status.loaded_fonts.is_empty() {
+                    ui.small(self.cjk_font_status.loaded_fonts.join(", "));
+                }
                 ui.separator();
-                ui.heading("Indexing");
+                ui.heading(self.t(Text::Indexing));
                 if let Some(client) = self.client.as_mut()
                     && let Ok(config) = client.config_get()
                 {
                     ui.label(format!(
-                        "Mounted live updates: {}",
-                        yes_no(config.config.indexing.watch_mounted)
+                        "{}: {}",
+                        self.t(Text::MountedLiveUpdates),
+                        yes_no(self.language, config.config.indexing.watch_mounted)
                     ));
                     ui.label(format!(
-                        "Max parallel scans: {}",
+                        "{}: {}",
+                        self.t(Text::MaxParallelScans),
                         config.config.indexing.max_parallel_scans
                     ));
                     ui.label(format!(
-                        "Rofi max results: {}",
+                        "{}: {}",
+                        self.t(Text::RofiMaxResults),
                         config.config.rofi.max_results
                     ));
                 }
                 ui.separator();
-                ui.heading("Advanced");
-                if let Some(client) = self.client.as_mut()
-                    && ui.button("Show Config Path").clicked()
-                {
-                    match client.config_get() {
-                        Ok(config) => self.status = config.path,
-                        Err(err) => self.status = format!("Failed to read config: {err:#}"),
+                ui.heading(self.t(Text::Advanced));
+                let show_config_label = self.t(Text::ShowConfigPath);
+                let failed_read_label = self.t(Text::FailedToReadConfig);
+                let unavailable_label = self.t(Text::DaemonClientUnavailable);
+                let show_config_clicked = ui.button(show_config_label).clicked();
+                if show_config_clicked {
+                    match self.client.as_mut().map(|client| client.config_get()) {
+                        Some(Ok(config)) => self.status = config.path,
+                        Some(Err(err)) => {
+                            self.status = format!("{failed_read_label}: {err:#}");
+                        }
+                        None => self.status = unavailable_label.into(),
                     }
                 }
             });
@@ -907,23 +1110,39 @@ impl DaemonGuiApp {
             return;
         };
         let mut open = true;
-        egui::Window::new("Properties")
+        egui::Window::new(self.t(Text::Properties))
             .open(&mut open)
             .default_width(540.0)
             .show(ctx, |ui| {
-                property_row(ui, "Name", &row.name);
-                property_row(ui, "Path", &row.display_path);
-                property_row(ui, "Internal Path", &row.internal_path);
-                property_row(ui, "Device", &row.device_label);
-                property_row(ui, "Device ID", &row.hit.device_id);
-                property_row(ui, "Record", &row.hit.record_idx.to_string());
-                property_row(ui, "Filesystem", row.fs_type.as_str());
-                property_row(ui, "Size", &format_size(row.size));
-                property_row(ui, "Modified", &format_time(row.mtime));
-                property_row(ui, "Directory", yes_no(row.is_dir));
-                property_row(ui, "Symlink", yes_no(row.is_symlink));
-                property_row(ui, "Mounted", yes_no(row.mounted));
-                property_row(ui, "Last Indexed", &format_time(row.last_indexed_time));
+                property_row(ui, self.t(Text::Name), &row.name);
+                property_row(ui, self.t(Text::Path), &row.display_path);
+                property_row(ui, self.t(Text::InternalPath), &row.internal_path);
+                property_row(ui, self.t(Text::Device), &row.device_label);
+                property_row(ui, self.t(Text::DeviceId), &row.hit.device_id);
+                property_row(ui, self.t(Text::Record), &row.hit.record_idx.to_string());
+                property_row(ui, self.t(Text::Filesystem), row.fs_type.as_str());
+                property_row(ui, self.t(Text::Size), &format_size(row.size));
+                property_row(ui, self.t(Text::Modified), &format_time(row.mtime));
+                property_row(
+                    ui,
+                    self.t(Text::Directory),
+                    yes_no(self.language, row.is_dir),
+                );
+                property_row(
+                    ui,
+                    self.t(Text::Symlink),
+                    yes_no(self.language, row.is_symlink),
+                );
+                property_row(
+                    ui,
+                    self.t(Text::Mounted),
+                    yes_no(self.language, row.mounted),
+                );
+                property_row(
+                    ui,
+                    self.t(Text::LastIndexed),
+                    &format_time(row.last_indexed_time),
+                );
                 if let Some(index) = self
                     .indexes
                     .iter()
@@ -931,13 +1150,13 @@ impl DaemonGuiApp {
                     && let Some(state) = &index.state
                 {
                     if let Some(scanner) = &state.last_scanner {
-                        property_row(ui, "Scanner", scanner);
+                        property_row(ui, self.t(Text::Scanner), scanner);
                     }
                     if let Some(error) = &state.last_error {
-                        property_row(ui, "Last Error", error);
+                        property_row(ui, self.t(Text::LastError), error);
                     }
                     if let Some(stale) = &state.stale_reason {
-                        property_row(ui, "Stale", stale);
+                        property_row(ui, self.t(Text::Stale), stale);
                     }
                 }
             });
@@ -949,14 +1168,16 @@ impl DaemonGuiApp {
 
 struct ServiceErrorApp {
     message: String,
+    language: ResolvedLanguage,
 }
 
 impl ServiceErrorApp {
-    fn new(err: anyhow::Error) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, err: anyhow::Error) -> Self {
+        let config = load_config().unwrap_or_default();
+        let (language, _) = apply_gui_preferences(&cc.egui_ctx, &config);
         Self {
-            message: format!(
-                "Could not connect to oxidexd: {err:#}\n\nRun oxidex --standalone for the in-process fallback, or start oxidexd --foreground."
-            ),
+            message: format!("{err:#}\n\n{}", tr(language, Text::ServiceFallbackHint)),
+            language,
         }
     }
 }
@@ -966,7 +1187,7 @@ impl eframe::App for ServiceErrorApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(72.0);
-                ui.heading("Oxidex service is unavailable");
+                ui.heading(tr(self.language, Text::ServiceUnavailable));
                 ui.label(&self.message);
             });
         });
@@ -974,10 +1195,14 @@ impl eframe::App for ServiceErrorApp {
 }
 
 impl OxidexApp {
+    fn t(&self, key: Text) -> &'static str {
+        tr(self.language, key)
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let config = load_config().unwrap_or_default();
-        apply_theme(&cc.egui_ctx, config.ui.theme);
+        let (language, cjk_font_status) = apply_gui_preferences(&cc.egui_ctx, &config);
         let devices = list_known_devices().unwrap_or_default();
         let indexes = snapshot::load_all_indexes().unwrap_or_default();
         let mut app = Self {
@@ -995,16 +1220,22 @@ impl OxidexApp {
             status: String::new(),
             show_filters: config.ui.show_filter_panel,
             show_index_manager: false,
+            show_settings: false,
             properties_hit: None,
             last_scan_errors: HashMap::new(),
             scan_job: None,
             tx,
             rx,
+            language_mode: config.ui.language,
+            language,
+            cjk_font_fallback: config.ui.cjk_font_fallback,
+            cjk_preferred_font: config.ui.cjk_preferred_font.clone(),
+            cjk_font_status,
         };
         app.status = format!(
-            "Loaded {} persisted index{}.",
+            "{}: {}.",
+            app.t(Text::LoadedPersistedIndexes),
             app.indexes.len(),
-            plural(app.indexes.len())
         );
         app.recompute_hits();
         app
@@ -1014,11 +1245,12 @@ impl OxidexApp {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 AppEvent::ScanProgress { device_id, percent } => {
+                    let indexing_label = self.t(Text::IndexingDevice);
                     if let Some(job) = &mut self.scan_job
                         && job.device_id == device_id
                     {
                         job.progress = percent;
-                        self.status = format!("Indexing {device_id}: {percent}%");
+                        self.status = format!("{indexing_label} {device_id}: {percent}%");
                     }
                 }
                 AppEvent::ScanFinished { device_id, result } => {
@@ -1036,17 +1268,20 @@ impl OxidexApp {
                             self.recompute_hits();
                             self.status = if indexed_fs_type == FsType::Btrfs {
                                 format!(
-                                    "Indexed {device_id}. Btrfs V2 indexes the default root only."
+                                    "{} {device_id}. {}",
+                                    self.t(Text::IndexedDevice),
+                                    self.t(Text::BtrfsDefaultRootNotice)
                                 )
                             } else {
-                                format!("Indexed {device_id}.")
+                                format!("{} {device_id}.", self.t(Text::IndexedDevice))
                             };
                         }
                         Err(err) => {
                             let message = format!("{err:#}");
                             self.last_scan_errors
                                 .insert(device_id.clone(), message.clone());
-                            self.status = format!("Indexing failed for {device_id}: {message}");
+                            self.status =
+                                format!("{} {device_id}: {message}", self.t(Text::IndexingFailed));
                         }
                     }
                 }
@@ -1064,7 +1299,7 @@ impl OxidexApp {
         let request = match self.search_request() {
             Ok(request) => request,
             Err(err) => {
-                self.status = format!("Search error: {err}");
+                self.status = format!("{}: {err}", self.t(Text::SearchError));
                 return;
             }
         };
@@ -1122,35 +1357,37 @@ impl OxidexApp {
 
     fn open_selected(&mut self) {
         let Some((idx, rec_idx)) = self.selected_index_record() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         let Some(device) = self.device_by_id(&idx.metadata.device_id) else {
-            self.status = "Device is not currently attached.".into();
+            self.status = self.t(Text::DeviceNotAttached).into();
             return;
         };
         if !device.mounted || device.primary_mount_point.is_empty() {
-            self.status = "This item is indexed, but its device is not mounted.".into();
+            self.status = self.t(Text::IndexedDeviceUnmounted).into();
             return;
         }
         let path = mounted_path(idx, rec_idx, device);
         match open::that(&path) {
-            Ok(()) => self.status = format!("Opened {}", path.display()),
-            Err(err) => self.status = format!("Failed to open {}: {err}", path.display()),
+            Ok(()) => self.status = format!("{} {}", self.t(Text::Opened), path.display()),
+            Err(err) => {
+                self.status = format!("{} {}: {err}", self.t(Text::FailedToOpen), path.display())
+            }
         }
     }
 
     fn open_selected_location(&mut self) {
         let Some((idx, rec_idx)) = self.selected_index_record() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         let Some(device) = self.device_by_id(&idx.metadata.device_id) else {
-            self.status = "Device is not currently attached.".into();
+            self.status = self.t(Text::DeviceNotAttached).into();
             return;
         };
         if !device.mounted || device.primary_mount_point.is_empty() {
-            self.status = "This item is indexed, but its device is not mounted.".into();
+            self.status = self.t(Text::IndexedDeviceUnmounted).into();
             return;
         }
         let mut path = PathBuf::from(&device.primary_mount_point);
@@ -1159,24 +1396,26 @@ impl OxidexApp {
             path.push(internal_dir);
         }
         match open::that(&path) {
-            Ok(()) => self.status = format!("Opened {}", path.display()),
-            Err(err) => self.status = format!("Failed to open {}: {err}", path.display()),
+            Ok(()) => self.status = format!("{} {}", self.t(Text::Opened), path.display()),
+            Err(err) => {
+                self.status = format!("{} {}: {err}", self.t(Text::FailedToOpen), path.display())
+            }
         }
     }
 
     fn copy_selected_names(&mut self, ctx: &egui::Context) {
         let Some((idx, rec_idx)) = self.selected_index_record() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         let name = idx.name(rec_idx).to_owned();
         ctx.copy_text(name);
-        self.status = "Copied file name.".into();
+        self.status = self.t(Text::CopiedFileName).into();
     }
 
     fn copy_selected_paths(&mut self, ctx: &egui::Context) {
         let Some((idx, rec_idx)) = self.selected_index_record() else {
-            self.status = "No result selected.".into();
+            self.status = self.t(Text::NoResultSelected).into();
             return;
         };
         let (mounted, mp) = self
@@ -1184,12 +1423,12 @@ impl OxidexApp {
             .map(|dev| (dev.mounted, dev.primary_mount_point.as_str()))
             .unwrap_or((false, ""));
         ctx.copy_text(idx.display_path(rec_idx, mounted, mp));
-        self.status = "Copied full path.".into();
+        self.status = self.t(Text::CopiedFullPath).into();
     }
 
     fn start_scan(&mut self, device: DeviceInfo) {
         if self.scan_job.is_some() {
-            self.status = "Another indexing job is already running.".into();
+            self.status = self.t(Text::AnotherIndexingJobRunning).into();
             return;
         }
 
@@ -1199,7 +1438,11 @@ impl OxidexApp {
             cancel: cancel.clone(),
             progress: 0,
         });
-        self.status = format!("Indexing {}...", device.metadata.device_id);
+        self.status = format!(
+            "{} {}...",
+            self.t(Text::IndexingDevice),
+            device.metadata.device_id
+        );
         let tx = self.tx.clone();
         thread::spawn(move || run_scan_job(device, cancel, tx));
     }
@@ -1207,7 +1450,7 @@ impl OxidexApp {
     fn cancel_scan(&mut self) {
         if let Some(job) = &self.scan_job {
             job.cancel.store(true, Ordering::Relaxed);
-            self.status = format!("Cancelling {}...", job.device_id);
+            self.status = format!("{} {}...", self.t(Text::Cancelling), job.device_id);
         }
     }
 
@@ -1215,10 +1458,12 @@ impl OxidexApp {
         self.indexes
             .retain(|idx| idx.metadata.device_id != device_id);
         if let Err(err) = snapshot::delete_index(device_id) {
-            self.status =
-                format!("Removed in-memory index, but failed to delete snapshot: {err:#}");
+            self.status = format!(
+                "{}: {err:#}",
+                self.t(Text::RemovedInMemoryButSnapshotDeleteFailed)
+            );
         } else {
-            self.status = format!("Forgot {device_id}.");
+            self.status = format!("{} {device_id}.", self.t(Text::Forgot));
         }
         if self.selected_scope == device_id {
             self.selected_scope.clear();
@@ -1238,21 +1483,26 @@ impl eframe::App for OxidexApp {
 
         egui::Panel::top("top").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Scope");
+                ui.label(self.t(Text::Scope));
                 let scopes: Vec<(String, String)> = self
                     .indexes
                     .iter()
                     .map(|idx| (idx.metadata.device_id.clone(), device_label(&idx.metadata)))
                     .collect();
                 let mut scope_changed = false;
+                let all_indexed_label = self.t(Text::AllIndexedDevices);
                 egui::ComboBox::from_id_salt("scope")
-                    .selected_text(scope_label(&self.selected_scope, &self.indexes))
+                    .selected_text(scope_label(
+                        self.language,
+                        &self.selected_scope,
+                        &self.indexes,
+                    ))
                     .show_ui(ui, |ui| {
                         if ui
                             .selectable_value(
                                 &mut self.selected_scope,
                                 String::new(),
-                                "All indexed devices",
+                                all_indexed_label,
                             )
                             .changed()
                         {
@@ -1271,18 +1521,26 @@ impl eframe::App for OxidexApp {
                     self.recompute_hits();
                 }
 
-                if ui.button("Index Manager").clicked() {
+                if ui.button(self.t(Text::IndexManager)).clicked() {
                     self.show_index_manager = true;
                     self.refresh_devices();
                 }
 
-                if ui.selectable_label(self.show_filters, "Filters").clicked() {
+                if ui.button(self.t(Text::Settings)).clicked() {
+                    self.show_settings = true;
+                }
+
+                if ui
+                    .selectable_label(self.show_filters, self.t(Text::Filters))
+                    .clicked()
+                {
                     self.show_filters = !self.show_filters;
                 }
 
+                let search_hint = self.t(Text::SearchHint);
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search files, e.g. *.rs ext:txt path:src type:dir")
+                        .hint_text(search_hint)
                         .desired_width(f32::INFINITY),
                 );
                 if response.changed() {
@@ -1303,9 +1561,9 @@ impl eframe::App for OxidexApp {
         egui::Panel::bottom("status").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
-                    "{} object{} found",
+                    "{} {}",
                     self.hits.len(),
-                    plural(self.hits.len())
+                    self.t(Text::ObjectsFound)
                 ));
                 ui.separator();
                 ui.label(&self.status);
@@ -1314,7 +1572,7 @@ impl eframe::App for OxidexApp {
                     ui.add(
                         egui::ProgressBar::new(job.progress as f32 / 100.0).desired_width(120.0),
                     );
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(self.t(Text::Cancel)).clicked() {
                         self.cancel_scan();
                     }
                 }
@@ -1330,6 +1588,9 @@ impl eframe::App for OxidexApp {
         if self.show_index_manager {
             self.index_manager(&ctx);
         }
+        if self.show_settings {
+            self.settings_window(&ctx);
+        }
         self.properties_window(&ctx);
     }
 }
@@ -1337,9 +1598,6 @@ impl eframe::App for OxidexApp {
 impl OxidexApp {
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.properties_hit = None;
-            }
             return;
         }
 
@@ -1349,6 +1607,8 @@ impl OxidexApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.properties_hit.is_some() {
                 self.properties_hit = None;
+            } else if self.show_settings {
+                self.show_settings = false;
             } else if self.show_filters {
                 self.show_filters = false;
             } else {
@@ -1367,7 +1627,15 @@ impl OxidexApp {
     fn filter_panel(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Extension");
+            let extension_label = self.t(Text::Extension);
+            let type_label = self.t(Text::Type);
+            let all_label = self.t(Text::All);
+            let files_label = self.t(Text::Files);
+            let folders_label = self.t(Text::Folders);
+            let symlinks_label = self.t(Text::Symlinks);
+            let path_label = self.t(Text::Path);
+            let clear_filters_label = self.t(Text::ClearFilters);
+            ui.label(extension_label);
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut self.filter_extensions)
@@ -1376,37 +1644,37 @@ impl OxidexApp {
                 )
                 .changed();
 
-            ui.label("Type");
+            ui.label(type_label);
             egui::ComboBox::from_id_salt("type-filter")
-                .selected_text(file_type_label(self.filter_type))
+                .selected_text(file_type_label(self.language, self.filter_type))
                 .show_ui(ui, |ui| {
                     changed |= ui
-                        .selectable_value(&mut self.filter_type, None, "All")
+                        .selectable_value(&mut self.filter_type, None, all_label)
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.filter_type,
                             Some(SearchFileType::File),
-                            "Files",
+                            files_label,
                         )
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.filter_type,
                             Some(SearchFileType::Dir),
-                            "Folders",
+                            folders_label,
                         )
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.filter_type,
                             Some(SearchFileType::Symlink),
-                            "Symlinks",
+                            symlinks_label,
                         )
                         .changed();
                 });
 
-            ui.label("Path");
+            ui.label(path_label);
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut self.filter_path)
@@ -1415,7 +1683,7 @@ impl OxidexApp {
                 )
                 .changed();
 
-            if ui.button("Clear Filters").clicked() {
+            if ui.button(clear_filters_label).clicked() {
                 self.filter_extensions.clear();
                 self.filter_path.clear();
                 self.filter_type = None;
@@ -1444,71 +1712,79 @@ impl OxidexApp {
         for path in filters.path_contains {
             parts.push(format!("path:{path}"));
         }
-        Some(format!("Active filters: {}", parts.join("  ")))
+        Some(format!(
+            "{}: {}",
+            self.t(Text::ActiveFilters),
+            parts.join("  ")
+        ))
     }
 
     fn results_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let has_selection = self.selected_index_record().is_some();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(has_selection, egui::Button::new("Open"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::Open)))
                 .clicked()
             {
                 self.open_selected();
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Open Folder"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::OpenFolder)))
                 .clicked()
             {
                 self.open_selected_location();
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Copy Name"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::CopyName)))
                 .clicked()
             {
                 self.copy_selected_names(ctx);
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Copy Path"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::CopyPath)))
                 .clicked()
             {
                 self.copy_selected_paths(ctx);
             }
             if ui
-                .add_enabled(has_selection, egui::Button::new("Properties"))
+                .add_enabled(has_selection, egui::Button::new(self.t(Text::Properties)))
                 .clicked()
             {
                 self.properties_hit = self.selected_hit.clone();
             }
             ui.separator();
+            let name_label = self.t(Text::Name);
+            let path_label = self.t(Text::Path);
+            let size_label = self.t(Text::Size);
+            let date_label = self.t(Text::Date);
             let mut sort_changed = false;
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Name,
-                "Name",
+                name_label,
             );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Path,
-                "Path",
+                path_label,
             );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Size,
-                "Size",
+                size_label,
             );
             sort_changed |= sort_button(
                 ui,
                 &mut self.sort_key,
                 &mut self.sort_direction,
                 SortKey::Mtime,
-                "Date",
+                date_label,
             );
             if sort_changed {
                 self.recompute_hits();
@@ -1521,16 +1797,16 @@ impl OxidexApp {
         if self.indexes.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
-                ui.heading("No indexes yet");
-                ui.label("Open Index Manager to index an NTFS, EXT4, or Btrfs device.");
+                ui.heading(self.t(Text::NoIndexesYet));
+                ui.label(self.t(Text::OpenIndexManagerHint));
             });
             return;
         }
         if self.hits.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
-                ui.heading("No results");
-                ui.label("Try a different name, wildcard, extension, path, or type filter.");
+                ui.heading(self.t(Text::NoResults));
+                ui.label(self.t(Text::TryDifferentSearchHint));
             });
             return;
         }
@@ -1548,16 +1824,16 @@ impl OxidexApp {
             .column(Column::initial(150.0).at_least(120.0).clip(true))
             .header(row_height, |mut row| {
                 row.col(|ui| {
-                    ui.strong("Name");
+                    ui.strong(self.t(Text::Name));
                 });
                 row.col(|ui| {
-                    ui.strong("Path");
+                    ui.strong(self.t(Text::Path));
                 });
                 row.col(|ui| {
-                    ui.strong("Size");
+                    ui.strong(self.t(Text::Size));
                 });
                 row.col(|ui| {
-                    ui.strong("Modified");
+                    ui.strong(self.t(Text::Modified));
                 });
             })
             .body(|body| {
@@ -1624,28 +1900,28 @@ impl OxidexApp {
             .map(|device| device.metadata.fs_type.is_supported_for_scan())
             .unwrap_or(false);
         if ui
-            .add_enabled(has_selection, egui::Button::new("Open"))
+            .add_enabled(has_selection, egui::Button::new(self.t(Text::Open)))
             .clicked()
         {
             self.open_selected();
             ui.close();
         }
         if ui
-            .add_enabled(has_selection, egui::Button::new("Open Folder"))
+            .add_enabled(has_selection, egui::Button::new(self.t(Text::OpenFolder)))
             .clicked()
         {
             self.open_selected_location();
             ui.close();
         }
         if ui
-            .add_enabled(has_selection, egui::Button::new("Copy Name"))
+            .add_enabled(has_selection, egui::Button::new(self.t(Text::CopyName)))
             .clicked()
         {
             self.copy_selected_names(ctx);
             ui.close();
         }
         if ui
-            .add_enabled(has_selection, egui::Button::new("Copy Path"))
+            .add_enabled(has_selection, egui::Button::new(self.t(Text::CopyPath)))
             .clicked()
         {
             self.copy_selected_paths(ctx);
@@ -1655,7 +1931,7 @@ impl OxidexApp {
         if ui
             .add_enabled(
                 has_selection && can_rescan && self.scan_job.is_none(),
-                egui::Button::new("Rescan Device"),
+                egui::Button::new(self.t(Text::RescanThisDevice)),
             )
             .clicked()
         {
@@ -1667,7 +1943,7 @@ impl OxidexApp {
         if ui
             .add_enabled(
                 has_selection && self.scan_job.is_none(),
-                egui::Button::new("Forget Index"),
+                egui::Button::new(self.t(Text::ForgetThisIndex)),
             )
             .clicked()
         {
@@ -1677,7 +1953,7 @@ impl OxidexApp {
             ui.close();
         }
         if ui
-            .add_enabled(has_selection, egui::Button::new("Properties"))
+            .add_enabled(has_selection, egui::Button::new(self.t(Text::Properties)))
             .clicked()
         {
             self.properties_hit = self.selected_hit.clone();
@@ -1687,16 +1963,21 @@ impl OxidexApp {
 
     fn index_manager(&mut self, ctx: &egui::Context) {
         let mut open = self.show_index_manager;
-        egui::Window::new("Indexes")
+        egui::Window::new(self.t(Text::Indexes))
             .open(&mut open)
             .default_width(980.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Refresh Devices").clicked() {
+                    if ui.button(self.t(Text::RefreshDevices)).clicked() {
                         self.refresh_devices();
                     }
                     if let Some(job) = &self.scan_job {
-                        ui.label(format!("Indexing {}: {}%", job.device_id, job.progress));
+                        ui.label(format!(
+                            "{} {}: {}%",
+                            self.t(Text::IndexingDevice),
+                            job.device_id,
+                            job.progress
+                        ));
                     }
                 });
                 ui.separator();
@@ -1718,31 +1999,36 @@ impl OxidexApp {
                                 ui.label(fit(&device_label(meta), 28));
                                 ui.label(fit(meta.fs_type.as_str(), 7));
                                 ui.label(if device.mounted {
-                                    "mounted"
+                                    self.t(Text::Mounted)
                                 } else {
-                                    "not mounted"
+                                    self.t(Text::NotMounted)
                                 });
                                 ui.label(fit(&meta.dev_node, 22));
                                 ui.label(match count {
-                                    Some(n) => format!("{n} entries"),
-                                    None => "not indexed".to_owned(),
+                                    Some(n) => format!("{n} {}", self.t(Text::EntryPlural)),
+                                    None => self.t(Text::NotIndexed).to_owned(),
                                 });
                                 ui.label(
                                     index
                                         .map(|idx| {
                                             format!(
-                                                "indexed {}",
+                                                "{} {}",
+                                                self.t(Text::IndexedDevice),
                                                 format_time(idx.last_indexed_time)
                                             )
                                         })
-                                        .unwrap_or_else(|| "never indexed".to_owned()),
+                                        .unwrap_or_else(|| self.t(Text::NeverIndexed).to_owned()),
                                 );
                                 if let Some(err) = self.last_scan_errors.get(&meta.device_id) {
                                     ui.label(fit(err, 36));
                                 }
 
                                 let busy = self.scan_job.is_some();
-                                let scan_label = if count.is_some() { "Rescan" } else { "Index" };
+                                let scan_label = if count.is_some() {
+                                    self.t(Text::Rescan)
+                                } else {
+                                    self.t(Text::Index)
+                                };
                                 if ui
                                     .add_enabled(
                                         !busy && meta.fs_type.is_supported_for_scan(),
@@ -1753,7 +2039,12 @@ impl OxidexApp {
                                     self.start_scan(device.clone());
                                 }
                                 if count.is_some()
-                                    && ui.add_enabled(!busy, egui::Button::new("Forget")).clicked()
+                                    && ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(self.t(Text::ForgetThisIndex)),
+                                        )
+                                        .clicked()
                                 {
                                     self.forget_index(&meta.device_id);
                                 }
@@ -1763,6 +2054,162 @@ impl OxidexApp {
                     });
             });
         self.show_index_manager = open;
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new(self.t(Text::Settings))
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.heading(self.t(Text::Appearance));
+                ui.horizontal(|ui| {
+                    ui.label(self.t(Text::Theme));
+                    let mut next_theme = load_config()
+                        .map(|config| config.ui.theme)
+                        .unwrap_or(ThemeMode::System);
+                    egui::ComboBox::from_id_salt("standalone-theme")
+                        .selected_text(theme_label(self.language, next_theme))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut next_theme,
+                                ThemeMode::System,
+                                self.t(Text::System),
+                            );
+                            ui.selectable_value(
+                                &mut next_theme,
+                                ThemeMode::Light,
+                                self.t(Text::Light),
+                            );
+                            ui.selectable_value(
+                                &mut next_theme,
+                                ThemeMode::Dark,
+                                self.t(Text::Dark),
+                            );
+                        });
+                    if ui.button(self.t(Text::Apply)).clicked() {
+                        self.apply_standalone_theme(ctx, next_theme);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(self.t(Text::Language));
+                    let mut next_language = self.language_mode;
+                    egui::ComboBox::from_id_salt("standalone-language")
+                        .selected_text(language_label(self.language, self.language_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut next_language,
+                                LanguageMode::System,
+                                self.t(Text::System),
+                            );
+                            ui.selectable_value(
+                                &mut next_language,
+                                LanguageMode::EnUs,
+                                self.t(Text::English),
+                            );
+                            ui.selectable_value(
+                                &mut next_language,
+                                LanguageMode::ZhCn,
+                                self.t(Text::SimplifiedChinese),
+                            );
+                        });
+                    if next_language != self.language_mode {
+                        self.apply_standalone_language(next_language);
+                    }
+                });
+                ui.label(self.t(Text::CjkFonts));
+                ui.horizontal(|ui| {
+                    let cjk_fallback_label = self.t(Text::CjkFontFallback);
+                    let cjk_preferred_label = self.t(Text::CjkPreferredFont);
+                    let apply_label = self.t(Text::Apply);
+                    ui.checkbox(&mut self.cjk_font_fallback, cjk_fallback_label);
+                    ui.label(cjk_preferred_label);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cjk_preferred_font)
+                            .desired_width(180.0),
+                    );
+                    if ui.button(apply_label).clicked() {
+                        self.apply_standalone_cjk_fonts(ctx);
+                    }
+                });
+                ui.label(if self.cjk_font_status.unavailable() {
+                    self.t(Text::CjkFontsMissing)
+                } else if self.cjk_font_status.loaded_fonts.is_empty() {
+                    self.t(Text::CjkFontFallback)
+                } else {
+                    self.t(Text::CjkFontsLoaded)
+                });
+                if !self.cjk_font_status.loaded_fonts.is_empty() {
+                    ui.small(self.cjk_font_status.loaded_fonts.join(", "));
+                }
+            });
+        self.show_settings = open;
+    }
+
+    fn save_ui_config(&mut self, update: impl FnOnce(&mut AppConfig)) -> bool {
+        match load_config() {
+            Ok(mut config) => {
+                update(&mut config);
+                match save_config(&config) {
+                    Ok(()) => {
+                        self.status = self.t(Text::SettingsSaved).into();
+                        true
+                    }
+                    Err(err) => {
+                        self.status = format!("{}: {err:#}", self.t(Text::FailedToSaveSettings));
+                        false
+                    }
+                }
+            }
+            Err(err) => {
+                self.status = format!("{}: {err:#}", self.t(Text::FailedToReadConfig));
+                false
+            }
+        }
+    }
+
+    fn apply_standalone_theme(&mut self, ctx: &egui::Context, theme: ThemeMode) {
+        if !self.save_ui_config(|config| {
+            config.ui.theme = theme;
+        }) {
+            return;
+        }
+        apply_theme(ctx, theme);
+        self.status = format!(
+            "{}: {}.",
+            self.t(Text::ThemeSet),
+            theme_label(self.language, theme)
+        );
+    }
+
+    fn apply_standalone_language(&mut self, language_mode: LanguageMode) {
+        if !self.save_ui_config(|config| {
+            config.ui.language = language_mode;
+        }) {
+            return;
+        }
+        self.language_mode = language_mode;
+        self.language = system_language(language_mode);
+        self.status = format!(
+            "{}: {}",
+            self.t(Text::Language),
+            language_label(self.language, language_mode)
+        );
+    }
+
+    fn apply_standalone_cjk_fonts(&mut self, ctx: &egui::Context) {
+        let preferred = self.cjk_preferred_font.trim().to_owned();
+        let fallback = self.cjk_font_fallback;
+        if !self.save_ui_config(|config| {
+            config.ui.cjk_font_fallback = fallback;
+            config.ui.cjk_preferred_font = preferred.clone();
+        }) {
+            return;
+        }
+        self.cjk_preferred_font = preferred;
+        self.cjk_font_status =
+            fonts::configure_fonts(ctx, self.cjk_font_fallback, &self.cjk_preferred_font);
+        self.status = self.t(Text::CjkFontsLoaded).into();
     }
 
     fn properties_window(&mut self, ctx: &egui::Context) {
@@ -1784,22 +2231,38 @@ impl OxidexApp {
             .unwrap_or((false, ""));
         let mut open = true;
 
-        egui::Window::new("Properties")
+        egui::Window::new(self.t(Text::Properties))
             .open(&mut open)
             .default_width(520.0)
             .show(ctx, |ui| {
-                property_row(ui, "Name", idx.name(rec_idx));
-                property_row(ui, "Path", &idx.display_path(rec_idx, mounted, mp));
-                property_row(ui, "Internal Path", idx.internal_path(rec_idx));
-                property_row(ui, "Device", &device_label(&idx.metadata));
-                property_row(ui, "Device ID", &idx.metadata.device_id);
-                property_row(ui, "Filesystem", idx.metadata.fs_type.as_str());
-                property_row(ui, "Size", &format_size(rec.size));
-                property_row(ui, "Modified", &format_time(rec.mtime));
-                property_row(ui, "Directory", yes_no(rec.is_dir()));
-                property_row(ui, "Symlink", yes_no(rec.is_symlink()));
-                property_row(ui, "Mounted", yes_no(mounted));
-                property_row(ui, "Last Indexed", &format_time(idx.last_indexed_time));
+                property_row(ui, self.t(Text::Name), idx.name(rec_idx));
+                property_row(
+                    ui,
+                    self.t(Text::Path),
+                    &idx.display_path(rec_idx, mounted, mp),
+                );
+                property_row(ui, self.t(Text::InternalPath), idx.internal_path(rec_idx));
+                property_row(ui, self.t(Text::Device), &device_label(&idx.metadata));
+                property_row(ui, self.t(Text::DeviceId), &idx.metadata.device_id);
+                property_row(ui, self.t(Text::Filesystem), idx.metadata.fs_type.as_str());
+                property_row(ui, self.t(Text::Size), &format_size(rec.size));
+                property_row(ui, self.t(Text::Modified), &format_time(rec.mtime));
+                property_row(
+                    ui,
+                    self.t(Text::Directory),
+                    yes_no(self.language, rec.is_dir()),
+                );
+                property_row(
+                    ui,
+                    self.t(Text::Symlink),
+                    yes_no(self.language, rec.is_symlink()),
+                );
+                property_row(ui, self.t(Text::Mounted), yes_no(self.language, mounted));
+                property_row(
+                    ui,
+                    self.t(Text::LastIndexed),
+                    &format_time(idx.last_indexed_time),
+                );
             });
 
         if !open {
@@ -1957,6 +2420,19 @@ fn mounted_path(index: &SearchIndex, rec_idx: u32, device: &DeviceInfo) -> PathB
     path
 }
 
+fn apply_gui_preferences(
+    ctx: &egui::Context,
+    config: &AppConfig,
+) -> (ResolvedLanguage, CjkFontStatus) {
+    let status = fonts::configure_fonts(
+        ctx,
+        config.ui.cjk_font_fallback,
+        &config.ui.cjk_preferred_font,
+    );
+    apply_theme(ctx, config.ui.theme);
+    (system_language(config.ui.language), status)
+}
+
 fn apply_theme(ctx: &egui::Context, theme: ThemeMode) {
     match theme {
         ThemeMode::System => {}
@@ -1965,9 +2441,9 @@ fn apply_theme(ctx: &egui::Context, theme: ThemeMode) {
     }
 }
 
-fn scope_label(scope: &str, indexes: &[SearchIndex]) -> String {
+fn scope_label(language: ResolvedLanguage, scope: &str, indexes: &[SearchIndex]) -> String {
     if scope.is_empty() {
-        return "All indexed devices".into();
+        return tr(language, Text::AllIndexedDevices).into();
     }
     indexes
         .iter()
@@ -1976,9 +2452,9 @@ fn scope_label(scope: &str, indexes: &[SearchIndex]) -> String {
         .unwrap_or_else(|| scope.to_owned())
 }
 
-fn daemon_scope_label(scope: &str, indexes: &[IndexSummary]) -> String {
+fn daemon_scope_label(language: ResolvedLanguage, scope: &str, indexes: &[IndexSummary]) -> String {
     if scope.is_empty() {
-        return "All devices".into();
+        return tr(language, Text::AllDevices).into();
     }
     indexes
         .iter()
@@ -2011,20 +2487,28 @@ fn device_summary_label(device: &DeviceSummary) -> String {
     }
 }
 
-fn theme_label(theme: ThemeMode) -> &'static str {
+fn theme_label(language: ResolvedLanguage, theme: ThemeMode) -> &'static str {
     match theme {
-        ThemeMode::System => "System",
-        ThemeMode::Light => "Light",
-        ThemeMode::Dark => "Dark",
+        ThemeMode::System => tr(language, Text::System),
+        ThemeMode::Light => tr(language, Text::Light),
+        ThemeMode::Dark => tr(language, Text::Dark),
     }
 }
 
-fn file_type_label(file_type: Option<SearchFileType>) -> &'static str {
+fn language_label(language: ResolvedLanguage, mode: LanguageMode) -> &'static str {
+    match mode {
+        LanguageMode::System => tr(language, Text::System),
+        LanguageMode::EnUs => tr(language, Text::English),
+        LanguageMode::ZhCn => tr(language, Text::SimplifiedChinese),
+    }
+}
+
+fn file_type_label(language: ResolvedLanguage, file_type: Option<SearchFileType>) -> &'static str {
     match file_type {
-        None => "All",
-        Some(SearchFileType::File) => "Files",
-        Some(SearchFileType::Dir) => "Folders",
-        Some(SearchFileType::Symlink) => "Symlinks",
+        None => tr(language, Text::All),
+        Some(SearchFileType::File) => tr(language, Text::Files),
+        Some(SearchFileType::Dir) => tr(language, Text::Folders),
+        Some(SearchFileType::Symlink) => tr(language, Text::Symlinks),
     }
 }
 
@@ -2043,8 +2527,21 @@ fn property_row(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+fn yes_no(language: ResolvedLanguage, value: bool) -> &'static str {
+    match (language, value) {
+        (ResolvedLanguage::ZhCn, true) => "是",
+        (ResolvedLanguage::ZhCn, false) => "否",
+        (_, true) => "yes",
+        (_, false) => "no",
+    }
+}
+
+fn result_word(language: ResolvedLanguage, count: usize) -> &'static str {
+    match language {
+        ResolvedLanguage::ZhCn => tr(language, Text::ResultPlural),
+        ResolvedLanguage::EnUs if count == 1 => tr(language, Text::ResultSingular),
+        ResolvedLanguage::EnUs => tr(language, Text::ResultPlural),
+    }
 }
 
 fn sort_button(
@@ -2126,8 +2623,4 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
 }

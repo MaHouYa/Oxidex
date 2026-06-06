@@ -24,10 +24,16 @@ pub struct AppConfig {
 pub struct UiConfig {
     #[serde(default)]
     pub theme: ThemeMode,
+    #[serde(default)]
+    pub language: LanguageMode,
     #[serde(default = "default_true")]
     pub show_filter_panel: bool,
     #[serde(default = "default_true")]
     pub remember_window_size: bool,
+    #[serde(default = "default_true")]
+    pub cjk_font_fallback: bool,
+    #[serde(default)]
+    pub cjk_preferred_font: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -37,6 +43,15 @@ pub enum ThemeMode {
     System,
     Light,
     Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageMode {
+    #[default]
+    System,
+    EnUs,
+    ZhCn,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -114,8 +129,11 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: ThemeMode::System,
+            language: LanguageMode::System,
             show_filter_panel: true,
             remember_window_size: true,
+            cjk_font_fallback: true,
+            cjk_preferred_font: String::new(),
         }
     }
 }
@@ -275,6 +293,9 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.version, 1);
         assert_eq!(config.ui.theme, ThemeMode::System);
+        assert_eq!(config.ui.language, LanguageMode::System);
+        assert!(config.ui.cjk_font_fallback);
+        assert!(config.ui.cjk_preferred_font.is_empty());
         assert_eq!(config.search.default_sort, SortKey::Relevance);
         assert_eq!(config.search.default_direction, SortDirection::Asc);
         assert_eq!(config.search.max_results, 20_000);
@@ -309,5 +330,31 @@ mod tests {
         let mut config = AppConfig::default();
         config.version = 2;
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn old_ui_config_loads_with_cjk_defaults() {
+        let text = r#"
+version = 1
+
+[ui]
+theme = "dark"
+show_filter_panel = false
+remember_window_size = true
+
+[search]
+default_sort = "name"
+default_direction = "asc"
+max_results = 100
+
+[indexing]
+max_parallel_scans = 1
+"#;
+        let config: AppConfig = toml::from_str(text).unwrap();
+        assert_eq!(config.ui.theme, ThemeMode::Dark);
+        assert_eq!(config.ui.language, LanguageMode::System);
+        assert!(config.ui.cjk_font_fallback);
+        assert!(config.ui.cjk_preferred_font.is_empty());
+        validate_config(&config).unwrap();
     }
 }
