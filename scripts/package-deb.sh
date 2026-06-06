@@ -77,7 +77,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: $ARCH
-Maintainer: Oxidex Maintainers <oxidex@example.invalid>
+Maintainer: Honghao <Rasphino@users.noreply.github.com>
 Installed-Size: $installed_size
 Depends: libc6 (>= 2.31), libgcc-s1, policykit-1, adduser, xdg-utils, hicolor-icon-theme, libgl1, libx11-6, libxcb1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libfontconfig1
 Homepage: https://github.com/MaHouYa/Oxidex

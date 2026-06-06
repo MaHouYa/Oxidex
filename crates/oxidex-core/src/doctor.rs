@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -200,20 +201,33 @@ fn check_indexes(report: &mut DoctorReport) {
 }
 
 fn check_daemon_socket(report: &mut DoctorReport, path: &Path) {
-    if path.exists() {
-        report.add(
-            DoctorCategory::Daemon,
-            DoctorSeverity::Ok,
-            "daemon_socket",
-            format!("Daemon socket exists at {}", path.display()),
-        );
-    } else {
+    if !path.exists() {
         report.add(
             DoctorCategory::Daemon,
             DoctorSeverity::Warn,
             "daemon_socket",
             format!("Daemon socket is not present at {}", path.display()),
         );
+        return;
+    }
+
+    match UnixStream::connect(path) {
+        Ok(_) => report.add(
+            DoctorCategory::Daemon,
+            DoctorSeverity::Ok,
+            "daemon_socket",
+            format!("Daemon socket is reachable at {}", path.display()),
+        ),
+        Err(err) => report.add_detail(
+            DoctorCategory::Daemon,
+            DoctorSeverity::Fail,
+            "daemon_socket",
+            format!(
+                "Daemon socket exists but is not reachable at {}",
+                path.display()
+            ),
+            err.to_string(),
+        ),
     }
 }
 
@@ -229,7 +243,7 @@ fn check_scanner_socket(report: &mut DoctorReport, path: &Path) {
     };
 
     let mode = meta.permissions().mode() & 0o777;
-    let severity = if mode & 0o007 == 0 {
+    let severity = if mode & !0o660 == 0 {
         DoctorSeverity::Ok
     } else {
         DoctorSeverity::Fail

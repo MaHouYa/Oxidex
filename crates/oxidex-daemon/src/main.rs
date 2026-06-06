@@ -336,9 +336,11 @@ fn handle_request(
         "config.set" => {
             let params: ConfigSetParams = params_as(&frame)?;
             let mut state = state.lock().unwrap();
-            apply_config_set(&mut state.config, &params)?;
-            validate_config(&state.config)?;
-            save_config_to_path(&state.config_path, &state.config)?;
+            let mut next_config = state.config.clone();
+            apply_config_set(&mut next_config, &params)?;
+            validate_config(&next_config)?;
+            save_config_to_path(&state.config_path, &next_config)?;
+            state.config = next_config;
             let path = state.config_path.display().to_string();
             Ok((
                 serde_json::to_value(ConfigGetResult {
@@ -889,6 +891,15 @@ fn reconcile_watchers(
                 .indexes
                 .iter()
                 .filter_map(|index| {
+                    if state
+                        .index_states
+                        .get(&index.metadata.device_id)
+                        .and_then(|state| state.stale_reason.as_deref())
+                        .map(|reason| reason.starts_with("watch_"))
+                        .unwrap_or(false)
+                    {
+                        return None;
+                    }
                     let device = state
                         .devices
                         .iter()
@@ -920,6 +931,13 @@ fn reconcile_watchers(
             .map(|watcher| watcher.mount_point == mount_point)
             .unwrap_or(false)
         {
+            let dirty = state
+                .lock()
+                .unwrap()
+                .watch_summaries
+                .get(&device_id)
+                .map(|summary| summary.dirty)
+                .unwrap_or(false);
             update_watch_summary(
                 state,
                 WatchSummary {
@@ -928,7 +946,7 @@ fn reconcile_watchers(
                     enabled: true,
                     state: "watching".into(),
                     watched_directories: dir_count,
-                    dirty: false,
+                    dirty,
                     last_error: None,
                 },
             );
@@ -1641,12 +1659,4 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
-}
-
-#[allow(dead_code)]
-fn indexed_device_ids(indexes: &[SearchIndex]) -> HashSet<String> {
-    indexes
-        .iter()
-        .map(|index| index.metadata.device_id.clone())
-        .collect()
 }

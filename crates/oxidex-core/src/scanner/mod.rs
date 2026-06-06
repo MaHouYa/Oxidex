@@ -52,14 +52,6 @@ pub fn scan_device(
     }
 }
 
-pub fn scan_device_uncancelled(
-    path: &Path,
-    fs_type: FsType,
-    progress: &mut ProgressCallback<'_>,
-) -> anyhow::Result<ScanDatabase> {
-    scan_device(path, fs_type, progress, &ScanCancellation::new())
-}
-
 pub fn validate_device_path(input: &str) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(!input.is_empty(), "empty device path");
     let path = Path::new(input);
