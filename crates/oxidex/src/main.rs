@@ -929,16 +929,16 @@ impl DaemonGuiApp {
                     let selected = self.selected_hit.as_ref() == Some(&result.hit);
                     row.set_selected(selected);
                     row.col(|ui| {
-                        ui.label(&result.name);
+                        result_cell_label(ui, &result.name);
                     });
                     row.col(|ui| {
-                        ui.label(&result.display_path);
+                        result_cell_label(ui, &result.display_path);
                     });
                     row.col(|ui| {
-                        ui.label(format_size(result.size));
+                        result_cell_label(ui, format_size(result.size));
                     });
                     row.col(|ui| {
-                        ui.label(format_time(result.mtime));
+                        result_cell_label(ui, format_time(result.mtime));
                     });
 
                     let response = row.response();
@@ -2000,16 +2000,16 @@ impl OxidexApp {
                     row.set_selected(selected);
 
                     row.col(|ui| {
-                        ui.label(name);
+                        result_cell_label(ui, name);
                     });
                     row.col(|ui| {
-                        ui.label(path);
+                        result_cell_label(ui, path);
                     });
                     row.col(|ui| {
-                        ui.label(size);
+                        result_cell_label(ui, size);
                     });
                     row.col(|ui| {
-                        ui.label(modified);
+                        result_cell_label(ui, modified);
                     });
 
                     let response = row.response();
@@ -2689,6 +2689,10 @@ fn property_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.label(format!("{label}:"));
         ui.monospace(value);
     });
+}
+
+fn result_cell_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.add(egui::Label::new(text).selectable(false));
 }
 
 fn yes_no(language: ResolvedLanguage, value: bool) -> &'static str {
