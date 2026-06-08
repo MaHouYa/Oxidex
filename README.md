@@ -12,7 +12,7 @@ Credit: Oxidex builds on the original project foundation created by Reikooters. 
 
 For installation, first indexing, search examples, rofi usage, troubleshooting, and exporting debug logs, see the [Oxidex User Guide](docs/user-guide.md).
 
-Rename note: version 2.0.0 completes the public rename to Oxidex. Commands, crates, config paths, index paths, systemd units, and the scanner socket group now use the `oxidex` name.
+Rename note: version 2.1.0 continues the public Oxidex line. Commands, crates, config paths, index paths, systemd units, and the scanner socket group use the `oxidex` name.
 
 ## Features
 
@@ -199,7 +199,7 @@ Build a local `.deb` after a release build:
 scripts/package-deb.sh
 ```
 
-The package is written to `dist/oxidex_2.0.0_amd64.deb`. The GitHub Actions workflow in `.github/workflows/deb.yml` builds the same package inside an `ubuntu:20.04` job container and uploads it as a workflow artifact.
+The package is written to `dist/oxidex_2.1.0_amd64.deb`. The GitHub Actions workflow in `.github/workflows/deb.yml` builds the same package inside an `ubuntu:20.04` job container and uploads it as a workflow artifact.
 
 The Debian package installs the GUI, CLI, user daemon, scanner daemon, desktop file, systemd units, hicolor icons, and license into standard system paths.
 
