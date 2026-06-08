@@ -127,6 +127,67 @@ fn init_terminal_logging(binary: &str, debug: bool, log_level: Option<&str>) {
     }
 }
 
+fn update_ime_tracking(ctx: &egui::Context, composing: &mut bool) {
+    let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+    ctx.input(|input| {
+        for event in &input.events {
+            let egui::Event::Ime(ime_event) = event else {
+                continue;
+            };
+            match ime_event {
+                egui::ImeEvent::Enabled => {
+                    *composing = true;
+                    if debug_enabled {
+                        tracing::debug!("IME enabled");
+                    }
+                }
+                egui::ImeEvent::Preedit(text) => {
+                    *composing = !text.is_empty();
+                    if debug_enabled {
+                        tracing::debug!(
+                            chars = text.chars().count(),
+                            bytes = text.len(),
+                            "IME preedit"
+                        );
+                    }
+                }
+                egui::ImeEvent::Commit(text) => {
+                    *composing = false;
+                    if debug_enabled {
+                        tracing::debug!(
+                            chars = text.chars().count(),
+                            bytes = text.len(),
+                            "IME commit"
+                        );
+                    }
+                }
+                egui::ImeEvent::Disabled => {
+                    *composing = false;
+                    if debug_enabled {
+                        tracing::debug!("IME disabled");
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn keep_ime_enabled(response: &egui::Response) {
+    if response.has_focus() {
+        response
+            .ctx
+            .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+        response
+            .ctx
+            .send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+                egui::viewport::IMEPurpose::Normal,
+            ));
+        response
+            .ctx
+            .send_viewport_cmd(egui::ViewportCommand::IMERect(response.rect));
+    }
+}
+
 struct OxidexApp {
     devices: Vec<DeviceInfo>,
     indexes: Vec<SearchIndex>,
@@ -153,6 +214,7 @@ struct OxidexApp {
     cjk_font_fallback: bool,
     cjk_preferred_font: String,
     cjk_font_status: CjkFontStatus,
+    ime_composing: bool,
 }
 
 struct ScanJob {
@@ -198,6 +260,7 @@ struct DaemonGuiApp {
     cjk_font_fallback: bool,
     cjk_preferred_font: String,
     cjk_font_status: CjkFontStatus,
+    ime_composing: bool,
 }
 
 impl DaemonGuiApp {
@@ -267,6 +330,7 @@ impl DaemonGuiApp {
             cjk_font_fallback: ui_config.ui.cjk_font_fallback,
             cjk_preferred_font: ui_config.ui.cjk_preferred_font.clone(),
             cjk_font_status,
+            ime_composing: false,
         };
         app.recompute_rows();
         Ok(app)
@@ -606,6 +670,7 @@ impl DaemonGuiApp {
 impl eframe::App for DaemonGuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        update_ime_tracking(&ctx, &mut self.ime_composing);
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
             self.open_selected();
         }
@@ -690,10 +755,12 @@ impl eframe::App for DaemonGuiApp {
                 let search_hint = self.t(Text::SearchHintDaemon);
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
+                        .id_salt("daemon-search-query")
                         .hint_text(search_hint)
                         .desired_width(f32::INFINITY),
                 );
-                if response.changed() {
+                keep_ime_enabled(&response);
+                if response.changed() && !self.ime_composing {
                     self.recompute_rows();
                 }
             });
@@ -746,13 +813,14 @@ impl DaemonGuiApp {
             let path_label = self.t(Text::Path);
             let clear_label = self.t(Text::Clear);
             ui.label(ext_label);
-            changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.filter_extensions)
-                        .hint_text("rs,txt")
-                        .desired_width(140.0),
-                )
-                .changed();
+            let extensions_response = ui.add(
+                egui::TextEdit::singleline(&mut self.filter_extensions)
+                    .id_salt("daemon-filter-extensions")
+                    .hint_text("rs,txt")
+                    .desired_width(140.0),
+            );
+            keep_ime_enabled(&extensions_response);
+            changed |= extensions_response.changed();
             ui.label(type_label);
             let before_type = self.filter_type;
             egui::ComboBox::from_id_salt("daemon-type-filter")
@@ -777,13 +845,14 @@ impl DaemonGuiApp {
                 });
             changed |= before_type != self.filter_type;
             ui.label(path_label);
-            changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.filter_path)
-                        .hint_text("src")
-                        .desired_width(180.0),
-                )
-                .changed();
+            let path_response = ui.add(
+                egui::TextEdit::singleline(&mut self.filter_path)
+                    .id_salt("daemon-filter-path")
+                    .hint_text("src")
+                    .desired_width(180.0),
+            );
+            keep_ime_enabled(&path_response);
+            changed |= path_response.changed();
             if ui.button(clear_label).clicked() {
                 self.filter_extensions.clear();
                 self.filter_path.clear();
@@ -791,7 +860,7 @@ impl DaemonGuiApp {
                 changed = true;
             }
         });
-        if changed {
+        if changed && !self.ime_composing {
             self.recompute_rows();
         }
     }
@@ -1158,10 +1227,12 @@ impl DaemonGuiApp {
                     let apply_label = self.t(Text::Apply);
                     ui.checkbox(&mut self.cjk_font_fallback, cjk_fallback_label);
                     ui.label(cjk_preferred_label);
-                    ui.add(
+                    let preferred_font_response = ui.add(
                         egui::TextEdit::singleline(&mut self.cjk_preferred_font)
+                            .id_salt("daemon-cjk-preferred-font")
                             .desired_width(180.0),
                     );
+                    keep_ime_enabled(&preferred_font_response);
                     if ui.button(apply_label).clicked() {
                         self.apply_cjk_font_settings(ctx);
                     }
@@ -1348,6 +1419,7 @@ impl OxidexApp {
             cjk_font_fallback: config.ui.cjk_font_fallback,
             cjk_preferred_font: config.ui.cjk_preferred_font.clone(),
             cjk_font_status,
+            ime_composing: false,
         };
         app.status = format!(
             "{}: {}.",
@@ -1618,6 +1690,7 @@ impl eframe::App for OxidexApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
         let ctx = ui.ctx().clone();
+        update_ime_tracking(&ctx, &mut self.ime_composing);
         self.handle_keyboard(&ctx);
         if self.scan_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1682,10 +1755,12 @@ impl eframe::App for OxidexApp {
                 let search_hint = self.t(Text::SearchHint);
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
+                        .id_salt("standalone-search-query")
                         .hint_text(search_hint)
                         .desired_width(f32::INFINITY),
                 );
-                if response.changed() {
+                keep_ime_enabled(&response);
+                if response.changed() && !self.ime_composing {
                     self.recompute_hits();
                 }
             });
@@ -1778,13 +1853,14 @@ impl OxidexApp {
             let path_label = self.t(Text::Path);
             let clear_filters_label = self.t(Text::ClearFilters);
             ui.label(extension_label);
-            changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.filter_extensions)
-                        .hint_text("rs,txt")
-                        .desired_width(120.0),
-                )
-                .changed();
+            let extensions_response = ui.add(
+                egui::TextEdit::singleline(&mut self.filter_extensions)
+                    .id_salt("standalone-filter-extensions")
+                    .hint_text("rs,txt")
+                    .desired_width(120.0),
+            );
+            keep_ime_enabled(&extensions_response);
+            changed |= extensions_response.changed();
 
             ui.label(type_label);
             egui::ComboBox::from_id_salt("type-filter")
@@ -1817,13 +1893,14 @@ impl OxidexApp {
                 });
 
             ui.label(path_label);
-            changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.filter_path)
-                        .hint_text("src")
-                        .desired_width(180.0),
-                )
-                .changed();
+            let path_response = ui.add(
+                egui::TextEdit::singleline(&mut self.filter_path)
+                    .id_salt("standalone-filter-path")
+                    .hint_text("src")
+                    .desired_width(180.0),
+            );
+            keep_ime_enabled(&path_response);
+            changed |= path_response.changed();
 
             if ui.button(clear_filters_label).clicked() {
                 self.filter_extensions.clear();
@@ -1833,7 +1910,7 @@ impl OxidexApp {
             }
         });
 
-        if changed {
+        if changed && !self.ime_composing {
             self.recompute_hits();
         }
     }
@@ -2266,10 +2343,12 @@ impl OxidexApp {
                     let apply_label = self.t(Text::Apply);
                     ui.checkbox(&mut self.cjk_font_fallback, cjk_fallback_label);
                     ui.label(cjk_preferred_label);
-                    ui.add(
+                    let preferred_font_response = ui.add(
                         egui::TextEdit::singleline(&mut self.cjk_preferred_font)
+                            .id_salt("standalone-cjk-preferred-font")
                             .desired_width(180.0),
                     );
+                    keep_ime_enabled(&preferred_font_response);
                     if ui.button(apply_label).clicked() {
                         self.apply_standalone_cjk_fonts(ctx);
                     }
