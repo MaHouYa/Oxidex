@@ -326,6 +326,48 @@ Available actions:
 
 If a device is not mounted, text copy actions still work. Open actions require a current mount point.
 
+## Ulauncher Workflow
+
+Oxidex includes a Ulauncher v5 extension in `extensions/ulauncher-oxidex/`.
+The extension connects directly to `oxidexd`, so it does not shell out through
+`oxidex-cli` for every search.
+
+Install it from the Oxidex repository root:
+
+```sh
+mkdir -p ~/.local/share/ulauncher/extensions
+ln -s "$PWD/extensions/ulauncher-oxidex" \
+  ~/.local/share/ulauncher/extensions/ulauncher-oxidex
+```
+
+Restart Ulauncher after installing or changing the extension. For debugging,
+start Ulauncher from a terminal:
+
+```sh
+ulauncher -v
+```
+
+The default keyword is `ox`:
+
+```text
+ox main
+ox ext:rs path:src
+ox :scan
+ox :rescan
+ox :status
+ox :help
+```
+
+Search results open an action menu. From there you can open the file, open the
+containing folder, copy the resolved path, copy the file name, or queue a
+rescan for the result's device.
+
+The inline `:scan` and `:rescan` commands list known and indexed devices, then
+queue an Oxidex scan for the selected device. Rescans still use the normal
+privileged scanner path: `oxidexd` must be able to connect to
+`/run/oxidex/scannerd.sock`, usually by having your user in the `oxidex` group.
+Run `oxidex-cli doctor` if scans fail.
+
 ## Rofi And CLI Workflows
 
 Basic search:

@@ -1,0 +1,50 @@
+{
+  "required_api_version": "^2.0.0",
+  "name": "Oxidex",
+  "description": "Search Oxidex indexes from Ulauncher",
+  "developer_name": "Oxidex contributors",
+  "icon": "images/icon.png",
+  "options": {
+    "query_debounce": 0.12
+  },
+  "preferences": [
+    {
+      "id": "keyword",
+      "type": "keyword",
+      "name": "Oxidex",
+      "description": "Search indexed file names",
+      "default_value": "ox"
+    },
+    {
+      "id": "max_results",
+      "type": "input",
+      "name": "Result limit",
+      "description": "Maximum results to show, clamped between 1 and 100",
+      "default_value": "25"
+    },
+    {
+      "id": "socket_path",
+      "type": "input",
+      "name": "Daemon socket",
+      "description": "Optional oxidexd Unix socket path override",
+      "default_value": ""
+    },
+    {
+      "id": "display_mode",
+      "type": "select",
+      "name": "Result details",
+      "description": "Choose how search result descriptions are shown",
+      "default_value": "device_label",
+      "options": [
+        {
+          "value": "device_label",
+          "text": "Device label"
+        },
+        {
+          "value": "full_path",
+          "text": "Full path"
+        }
+      ]
+    }
+  ]
+}

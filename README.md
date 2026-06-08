@@ -111,6 +111,15 @@ Rofi script mode can call the CLI:
 rofi -dmenu -i -p Oxidex < <(oxidex-cli rofi "$query")
 ```
 
+A Ulauncher v5 extension is available in `extensions/ulauncher-oxidex/`.
+For local development, symlink it into Ulauncher's extension directory and use
+the default `ox` keyword:
+
+```shell
+mkdir -p ~/.local/share/ulauncher/extensions
+ln -s "$PWD/extensions/ulauncher-oxidex" ~/.local/share/ulauncher/extensions/ulauncher-oxidex
+```
+
 ## Building
 
 Install Rust and the native libraries needed by `eframe`/`winit` for Linux desktop rendering. On Arch Linux:
