@@ -5,7 +5,6 @@ members = [
     "crates/oxidex-client",
     "crates/oxidex-core",
     "crates/oxidex-daemon",
-    "crates/oxidex-scanner-helper",
     "crates/oxidex-scannerd",
 ]
 resolver = "3"

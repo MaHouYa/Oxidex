@@ -7,9 +7,11 @@ post_install() {
 Oxidex installed.
 
 To let your user daemon connect to the privileged scanner daemon, add your user
-to the oxidex group, then log out and back in or run newgrp:
+to the oxidex group, enable the scanner socket, then log out and back in or run
+newgrp:
 
   sudo usermod -aG oxidex "$USER"
+  sudo systemctl enable --now oxidex-scannerd.socket
   newgrp oxidex
 
 Check the setup with:

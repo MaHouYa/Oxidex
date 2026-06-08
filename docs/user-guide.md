@@ -6,9 +6,9 @@ Oxidex has three main pieces:
 
 - `oxidex`: the graphical search app.
 - `oxidexd`: your unprivileged per-user search daemon.
-- `oxidex-scannerd`: the privileged scanner daemon used only when Oxidex needs to read raw filesystem metadata from `/dev/...`.
+- `oxidex-scannerd`: the privileged scanner daemon used when Oxidex reads raw filesystem metadata from `/dev/...` or watches mounted indexed filesystems.
 
-The GUI and user daemon do not run as root. When a raw disk scan is needed, Polkit authorizes the scanner daemon.
+The GUI and user daemon do not run as root. Access to the scanner daemon is controlled by the `/run/oxidex/scannerd.sock` Unix socket, normally owned by `root:oxidex` with mode `0660`.
 
 The app has been rebranded to Oxidex, but the current compatibility release keeps the existing `oxidex` command names, config paths, index paths, and scanner group name.
 
@@ -18,6 +18,7 @@ After installing Oxidex from a package, make sure your user can connect to the s
 
 ```sh
 sudo usermod -aG oxidex "$USER"
+sudo systemctl enable --now oxidex-scannerd.socket
 ```
 
 Then log out and log back in. For a temporary current-terminal session, you can run:
@@ -32,7 +33,7 @@ Check the setup:
 oxidex-cli doctor
 ```
 
-You want the scanner socket, Polkit action, config, and index checks to be `OK`. A warning about the daemon not running is usually harmless before the first GUI launch.
+You want the scanner socket, group membership, config, and index checks to be `OK`. A warning about the daemon not running is usually harmless before the first GUI launch.
 
 ## Starting Oxidex
 
@@ -197,7 +198,7 @@ systemctl --user status oxidexd.socket
 systemctl status oxidex-scannerd.socket
 ```
 
-The GUI and CLI can also start `oxidexd` themselves if the user socket is not active. The scanner daemon should normally be reached through `/run/oxidex/scannerd.sock`; if it is unavailable, Oxidex may fall back to the compatibility helper.
+The GUI and CLI can also start `oxidexd` themselves if the user socket is not active. The scanner daemon should normally be reached through `/run/oxidex/scannerd.sock`; if it is unavailable, scans fail with setup instructions instead of opening a password prompt.
 
 ## Indexing A Disk
 
@@ -208,9 +209,8 @@ The Indexes window shows known NTFS, EXT4, and Btrfs devices. For each device, i
 To index a device:
 
 1. Click **Index** beside the device.
-2. Approve the Polkit prompt if asked.
-3. Wait for the job progress to finish.
-4. Search results become available immediately after the snapshot is saved.
+2. Wait for the job progress to finish.
+3. Search results become available immediately after the snapshot is saved.
 
 To refresh an existing index:
 
@@ -458,6 +458,7 @@ Fix:
 
 ```sh
 sudo usermod -aG oxidex "$USER"
+sudo systemctl enable --now oxidex-scannerd.socket
 ```
 
 Then log out and log back in, or run:
@@ -466,50 +467,19 @@ Then log out and log back in, or run:
 newgrp oxidex
 ```
 
-### Polkit Action Is Not Registered
+### Scanner Socket Is Missing
 
 Symptoms:
 
 ```text
-Action org.mahouya.oxidex.connect-scanner is not registered
+Scanner socket is not present at /run/oxidex/scannerd.sock
 ```
 
-Check:
+Fix:
 
 ```sh
-pkaction | grep oxidex
-```
-
-You should see:
-
-```text
-org.mahouya.oxidex.connect-scanner
-org.mahouya.oxidex.run-scanner
-```
-
-If you are running from the source tree for development, install the local Polkit policy:
-
-```sh
-scripts/dev-install-polkit.sh
-```
-
-If you installed a package, reinstall the package or verify that this file exists:
-
-```text
-/usr/share/polkit-1/actions/org.mahouya.oxidex.policy
-```
-
-### Polkit Prompt Does Not Appear
-
-Make sure your desktop session has a Polkit authentication agent running. Many desktop environments start one automatically.
-
-You can test Polkit manually:
-
-```sh
-pkcheck \
-  --action-id org.mahouya.oxidex.connect-scanner \
-  --process $$ \
-  --allow-user-interaction
+sudo systemctl enable --now oxidex-scannerd.socket
+oxidex-cli doctor --scanner
 ```
 
 ### Search Results Are Missing Or Stale
@@ -564,7 +534,6 @@ journalctl --user -u oxidexd.service --since "2 hours ago" > "$bundle/oxidexd-us
 journalctl -u oxidex-scannerd.service --since "2 hours ago" > "$bundle/oxidex-scannerd-journal.log" 2>&1 || true
 journalctl --since "2 hours ago" | grep -i oxidex > "$bundle/oxidex-system-grep.log" 2>&1 || true
 
-pkaction | grep oxidex > "$bundle/polkit-actions.txt" 2>&1 || true
 id > "$bundle/id.txt" 2>&1 || true
 ls -l /run/oxidex /run/oxidex/scannerd.sock > "$bundle/scanner-socket.txt" 2>&1 || true
 ls -l "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/oxidex" > "$bundle/user-runtime-socket.txt" 2>&1 || true
@@ -636,18 +605,6 @@ tar -czf /tmp/oxidex-foreground-logs.tar.gz \
   /tmp/oxidex-scannerd.log \
   /tmp/oxidex-gui.log
 ```
-
-### Scanner Helper Logs
-
-The compatibility helper writes binary scan data to stdout, so do not paste stdout into bug reports. If you need helper diagnostics, redirect stdout to a file and attach only stderr unless asked:
-
-```sh
-pkexec oxidex-scanner-helper /dev/YOUR_DEVICE ext4 \
-  > /tmp/oxidex-scan.bin \
-  2> /tmp/oxidex-helper.log
-```
-
-Usually `/tmp/oxidex-helper.log` is enough. The `.bin` file can be large and may indirectly reveal filesystem metadata, so do not share it publicly unless a maintainer asks for it.
 
 ## Privacy Notes
 

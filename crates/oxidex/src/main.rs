@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::{BufRead, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -7,9 +6,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use fonts::CjkFontStatus;
@@ -24,7 +22,7 @@ use oxidex_core::index::{
     SearchFileType, SearchFilters, SearchHit, SearchIndex, SearchRequest, merge_search_request,
     parse_search_query,
 };
-use oxidex_core::model::{DeviceMetadata, FsType, SortDirection, SortKey};
+use oxidex_core::model::{DeviceMetadata, SortDirection, SortKey};
 use oxidex_core::snapshot;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use tracing_subscriber::EnvFilter;
@@ -207,8 +205,6 @@ struct OxidexApp {
     properties_hit: Option<SearchHit>,
     last_scan_errors: HashMap<String, String>,
     scan_job: Option<ScanJob>,
-    tx: Sender<AppEvent>,
-    rx: Receiver<AppEvent>,
     language_mode: LanguageMode,
     language: ResolvedLanguage,
     cjk_font_fallback: bool,
@@ -221,17 +217,6 @@ struct ScanJob {
     device_id: String,
     cancel: Arc<AtomicBool>,
     progress: u8,
-}
-
-enum AppEvent {
-    ScanProgress {
-        device_id: String,
-        percent: u8,
-    },
-    ScanFinished {
-        device_id: String,
-        result: Box<anyhow::Result<SearchIndex>>,
-    },
 }
 
 struct DaemonGuiApp {
@@ -1383,7 +1368,6 @@ impl OxidexApp {
 
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         tracing::debug!("initializing standalone GUI state");
-        let (tx, rx) = crossbeam_channel::unbounded();
         let config = load_config().unwrap_or_default();
         let (language, cjk_font_status) = apply_gui_preferences(&cc.egui_ctx, &config);
         let devices = list_known_devices().unwrap_or_default();
@@ -1412,8 +1396,6 @@ impl OxidexApp {
             properties_hit: None,
             last_scan_errors: HashMap::new(),
             scan_job: None,
-            tx,
-            rx,
             language_mode: config.ui.language,
             language,
             cjk_font_fallback: config.ui.cjk_font_fallback,
@@ -1428,68 +1410,6 @@ impl OxidexApp {
         );
         app.recompute_hits();
         app
-    }
-
-    fn poll_events(&mut self) {
-        while let Ok(event) = self.rx.try_recv() {
-            match event {
-                AppEvent::ScanProgress { device_id, percent } => {
-                    let indexing_label = self.t(Text::IndexingDevice);
-                    if let Some(job) = &mut self.scan_job
-                        && job.device_id == device_id
-                    {
-                        job.progress = percent;
-                        self.status = format!("{indexing_label} {device_id}: {percent}%");
-                    }
-                }
-                AppEvent::ScanFinished { device_id, result } => {
-                    self.scan_job = None;
-                    match *result {
-                        Ok(index) => {
-                            let indexed_fs_type = index.metadata.fs_type;
-                            self.last_scan_errors.remove(&device_id);
-                            self.indexes
-                                .retain(|idx| idx.metadata.device_id != device_id);
-                            self.indexes.push(index);
-                            self.indexes
-                                .sort_by(|a, b| a.metadata.device_id.cmp(&b.metadata.device_id));
-                            self.refresh_devices();
-                            self.recompute_hits();
-                            self.status = if indexed_fs_type == FsType::Btrfs {
-                                format!(
-                                    "{} {device_id}. {}",
-                                    self.t(Text::IndexedDevice),
-                                    self.t(Text::BtrfsDefaultRootNotice)
-                                )
-                            } else {
-                                format!("{} {device_id}.", self.t(Text::IndexedDevice))
-                            };
-                            let entries = self
-                                .index_by_id(&device_id)
-                                .map(|index| index.records.len())
-                                .unwrap_or(0);
-                            tracing::info!(
-                                device_id = %device_id,
-                                entries,
-                                "standalone scan finished"
-                            );
-                        }
-                        Err(err) => {
-                            let message = format!("{err:#}");
-                            self.last_scan_errors
-                                .insert(device_id.clone(), message.clone());
-                            self.status =
-                                format!("{} {device_id}: {message}", self.t(Text::IndexingFailed));
-                            tracing::warn!(
-                                device_id = %device_id,
-                                error = %message,
-                                "standalone scan failed"
-                            );
-                        }
-                    }
-                }
-            }
-        }
     }
 
     fn refresh_devices(&mut self) {
@@ -1639,26 +1559,13 @@ impl OxidexApp {
             self.status = self.t(Text::AnotherIndexingJobRunning).into();
             return;
         }
-
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.scan_job = Some(ScanJob {
-            device_id: device.metadata.device_id.clone(),
-            cancel: cancel.clone(),
-            progress: 0,
-        });
-        self.status = format!(
-            "{} {}...",
-            self.t(Text::IndexingDevice),
-            device.metadata.device_id
-        );
+        self.status = "Scanning requires oxidexd and oxidex-scannerd. Start Oxidex normally or use oxidex-cli scan.".into();
         tracing::info!(
             device_id = %device.metadata.device_id,
             fs_type = device.metadata.fs_type.as_str(),
             dev_node = %device.metadata.dev_node,
-            "starting standalone helper scan"
+            "standalone scan blocked; daemon scanner is required"
         );
-        let tx = self.tx.clone();
-        thread::spawn(move || run_scan_job(device, cancel, tx));
     }
 
     fn cancel_scan(&mut self) {
@@ -1688,7 +1595,6 @@ impl OxidexApp {
 
 impl eframe::App for OxidexApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_events();
         let ctx = ui.ctx().clone();
         update_ime_tracking(&ctx, &mut self.ime_composing);
         self.handle_keyboard(&ctx);
@@ -2114,10 +2020,7 @@ impl OxidexApp {
             .as_ref()
             .and_then(|hit| self.device_by_id(&hit.device_id))
             .cloned();
-        let can_rescan = selected_device
-            .as_ref()
-            .map(|device| device.metadata.fs_type.is_supported_for_scan())
-            .unwrap_or(false);
+        let can_rescan = false;
         if ui
             .add_enabled(has_selection, egui::Button::new(self.t(Text::Open)))
             .clicked()
@@ -2152,6 +2055,7 @@ impl OxidexApp {
                 has_selection && can_rescan && self.scan_job.is_none(),
                 egui::Button::new(self.t(Text::RescanThisDevice)),
             )
+            .on_disabled_hover_text("Scanning requires oxidexd and oxidex-scannerd.")
             .clicked()
         {
             if let Some(device) = selected_device {
@@ -2249,9 +2153,9 @@ impl OxidexApp {
                                     self.t(Text::Index)
                                 };
                                 if ui
-                                    .add_enabled(
-                                        !busy && meta.fs_type.is_supported_for_scan(),
-                                        egui::Button::new(scan_label),
+                                    .add_enabled(false, egui::Button::new(scan_label))
+                                    .on_disabled_hover_text(
+                                        "Scanning requires oxidexd and oxidex-scannerd.",
                                     )
                                     .clicked()
                                 {
@@ -2492,94 +2396,6 @@ impl OxidexApp {
     }
 }
 
-fn run_scan_job(device: DeviceInfo, cancel: Arc<AtomicBool>, tx: Sender<AppEvent>) {
-    let result = scan_device_with_helper(&device, cancel.clone(), tx.clone()).and_then(|scan| {
-        let index = SearchIndex::from_scan(device.metadata.clone(), scan, now_unix())?;
-        snapshot::save_index(&index)?;
-        Ok(index)
-    });
-    let _ = tx.send(AppEvent::ScanFinished {
-        device_id: device.metadata.device_id,
-        result: Box::new(result),
-    });
-}
-
-fn scan_device_with_helper(
-    device: &DeviceInfo,
-    cancel: Arc<AtomicBool>,
-    tx: Sender<AppEvent>,
-) -> anyhow::Result<oxidex_core::model::ScanDatabase> {
-    let helper = helper_path();
-    let mut child = Command::new("pkexec")
-        .arg(helper)
-        .arg(&device.metadata.dev_node)
-        .arg(device.metadata.fs_type.as_str())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("helper stdout unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("helper stderr unavailable"))?;
-
-    let stdout_handle = thread::spawn(move || {
-        let mut data = Vec::new();
-        stdout.read_to_end(&mut data).map(|_| data)
-    });
-
-    let device_id = device.metadata.device_id.clone();
-    let stderr_handle = thread::spawn(move || -> std::io::Result<String> {
-        let reader = std::io::BufReader::new(stderr);
-        let mut diagnostics = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if let Some(rest) = line.trim().strip_prefix("OXIDEX_PROGRESS ")
-                && let Ok(percent) = rest.trim().parse::<u8>()
-            {
-                let _ = tx.send(AppEvent::ScanProgress {
-                    device_id: device_id.clone(),
-                    percent: percent.min(100),
-                });
-            } else if !line.trim().is_empty() {
-                diagnostics.push(line);
-            }
-        }
-        Ok(diagnostics.join("\n"))
-    });
-
-    let mut cancellation_requested = false;
-    loop {
-        if cancel.load(Ordering::Relaxed) && !cancellation_requested {
-            cancellation_requested = true;
-            let _ = child.kill();
-        }
-        if let Some(status) = child.try_wait()? {
-            let output = stdout_handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("helper stdout reader panicked"))??;
-            let diagnostics = stderr_handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("helper stderr reader panicked"))??;
-            if cancellation_requested {
-                anyhow::bail!("scan cancelled");
-            }
-            if !status.success() {
-                if diagnostics.trim().is_empty() {
-                    anyhow::bail!("scanner helper failed with status {status}");
-                }
-                anyhow::bail!("scanner helper failed with status {status}: {diagnostics}");
-            }
-            return oxidex_core::stream::read_scan_stream(&output[..]);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn connect_or_start_daemon(
     debug_mode: bool,
     log_level: Option<&str>,
@@ -2639,19 +2455,6 @@ fn sibling_binary(name: &str) -> PathBuf {
         }
     }
     PathBuf::from(name)
-}
-
-fn helper_path() -> PathBuf {
-    let Ok(exe) = std::env::current_exe() else {
-        return PathBuf::from("oxidex-scanner-helper");
-    };
-    if let Some(dir) = exe.parent() {
-        let sibling = dir.join("oxidex-scanner-helper");
-        if sibling.exists() {
-            return sibling;
-        }
-    }
-    PathBuf::from("oxidex-scanner-helper")
 }
 
 fn mounted_path(index: &SearchIndex, rec_idx: u32, device: &DeviceInfo) -> PathBuf {
@@ -2863,11 +2666,4 @@ fn format_time(ts: i64) -> String {
     time.to_offset(offset)
         .format(format_description!("[year]-[month]-[day] [hour]:[minute]"))
         .unwrap_or_else(|_| ts.to_string())
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

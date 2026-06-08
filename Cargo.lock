@@ -2818,7 +2818,6 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "libc",
- "notify",
  "oxidex-core",
  "serde",
  "serde_json",
@@ -2828,19 +2827,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxidex-scanner-helper"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "oxidex-core",
-]
-
-[[package]]
 name = "oxidex-scannerd"
 version = "2.0.0"
 dependencies = [
  "anyhow",
  "libc",
+ "notify",
  "oxidex-core",
  "serde_json",
  "tracing",

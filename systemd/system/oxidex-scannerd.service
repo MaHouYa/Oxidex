@@ -1,6 +1,5 @@
 [Unit]
 Description=Oxidex privileged scanner daemon
-After=polkit.service
 
 [Service]
 Type=simple

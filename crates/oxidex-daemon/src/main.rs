@@ -1,18 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, ErrorKind, Read};
+use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use notify::event::{ModifyKind, RenameMode};
-use notify::{
-    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-};
 use oxidex_core::config::{
     AppConfig, LanguageMode, ThemeMode, config_path as default_config_path, load_config_from_path,
     save_config_to_path, validate_config,
@@ -21,9 +16,11 @@ use oxidex_core::daemon_model::{
     ConfigGetResult, ConfigSetParams, ConfigValidateParams, DaemonDoctorResult, DaemonStatus,
     DeviceSummary, IndexCancelScanParams, IndexCancelScanResult, IndexForgetParams,
     IndexJobStatusParams, IndexStartScanParams, IndexStartScanResult, IndexSummary,
-    ResolvePathParams, ResolvedPath, ScanJobSummary, ScanState, ScannerAuthorizeResult,
-    ScannerCancelScanParams, ScannerStartScanParams, ScannerStartScanResult, ScannerStatusDetail,
-    ScannerTakeResultParams, SearchExplainParams, SearchQueryParams, SearchQueryResult,
+    ResolvePathParams, ResolvedPath, ScanJobSummary, ScanState, ScannerCancelScanParams,
+    ScannerLiveMetadata, ScannerStartScanParams, ScannerStartScanResult, ScannerStartWatchParams,
+    ScannerStartWatchResult, ScannerStatusDetail, ScannerStopWatchParams, ScannerTakeResultParams,
+    ScannerWatchErrorEvent, ScannerWatchEvent, ScannerWatchEventKind, ScannerWatchId,
+    ScannerWatchStoppedEvent, SearchExplainParams, SearchQueryParams, SearchQueryResult,
     SearchResultRow, WatchSummary,
 };
 use oxidex_core::device::{DeviceInfo, list_known_devices};
@@ -279,7 +276,6 @@ fn handle_request(
             let state = state.lock().unwrap();
             let mut report = run_local_doctor(&DoctorOptions {
                 scanner_socket: Some(state.scanner_socket.clone()),
-                helper_path: Some(helper_path()),
                 ..DoctorOptions::default()
             });
             report.add(
@@ -478,8 +474,9 @@ impl DaemonState {
             scanner_status: ScannerStatusDetail {
                 socket: scanner_socket.display().to_string(),
                 reachable: false,
-                authorized: false,
-                using_helper_fallback: false,
+                access_model: "unix_group_socket".into(),
+                peer_uid: None,
+                peer_gid: None,
                 last_error: None,
             },
             scanner_socket,
@@ -791,8 +788,7 @@ fn finish_daemon_job_success(
                 .index_states
                 .insert(device_id.clone(), state_sidecar.clone());
             state.scanner_status.reachable = scanner_label == "scannerd";
-            state.scanner_status.authorized = scanner_label == "scannerd";
-            state.scanner_status.using_helper_fallback = scanner_label == "helper";
+            state.scanner_status.access_model = "unix_group_socket".into();
             state.scanner_status.last_error = None;
             let result_summary = state
                 .indexes
@@ -906,65 +902,52 @@ fn start_watch_manager(state: Arc<Mutex<DaemonState>>) {
     thread::spawn(move || watch_manager_loop(state));
 }
 
-struct ActiveWatcher {
-    _watcher: RecommendedWatcher,
-    mount_point: PathBuf,
-}
-
 struct DirtyState {
     first_dirty: Instant,
     last_dirty: Instant,
 }
 
-enum WatchMessage {
-    Event {
-        device_id: String,
-        mount_point: PathBuf,
-        event: Event,
-    },
-    Error {
-        device_id: String,
-        message: String,
-    },
+struct ScannerWatchConnection {
+    stream: UnixStream,
+    next_id: u64,
+    active: HashMap<String, ScannerWatchId>,
 }
 
 fn watch_manager_loop(state: Arc<Mutex<DaemonState>>) {
-    let (tx, rx) = std::sync::mpsc::channel::<WatchMessage>();
-    let mut watchers: HashMap<String, ActiveWatcher> = HashMap::new();
+    let mut connection: Option<ScannerWatchConnection> = None;
     let mut dirty: HashMap<String, DirtyState> = HashMap::new();
     let mut last_reconcile = Instant::now() - Duration::from_secs(60);
 
     loop {
-        while let Ok(message) = rx.try_recv() {
-            match message {
-                WatchMessage::Event {
-                    device_id,
-                    mount_point,
-                    event,
-                } => match apply_watch_event(&state, &device_id, &mount_point, event) {
-                    Ok(true) => {
-                        let now = Instant::now();
-                        dirty
-                            .entry(device_id.clone())
-                            .and_modify(|entry| entry.last_dirty = now)
-                            .or_insert(DirtyState {
-                                first_dirty: now,
-                                last_dirty: now,
-                            });
-                        set_watch_dirty(&state, &device_id, true);
-                    }
-                    Ok(false) => {}
-                    Err(err) => mark_watch_error(&state, &device_id, format!("{err:#}")),
-                },
-                WatchMessage::Error { device_id, message } => {
-                    mark_watch_error(&state, &device_id, message);
+        if connection.is_none() {
+            match connect_scanner_watch_session(&state) {
+                Ok(conn) => connection = Some(conn),
+                Err(err) => {
+                    mark_scanner_connection_error(&state, format!("{err:#}"));
+                    flush_dirty_indexes(&state, &mut dirty);
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
                 }
             }
         }
 
-        if last_reconcile.elapsed() >= Duration::from_secs(5) {
-            reconcile_watchers(&state, &tx, &mut watchers);
-            last_reconcile = Instant::now();
+        let mut drop_connection = false;
+        if let Some(conn) = connection.as_mut() {
+            if let Err(err) = drain_scanner_watch_frames(conn, &state, &mut dirty) {
+                let active = conn.active.clone();
+                mark_active_watches_desynced(&state, &active, format!("{err:#}"));
+                drop_connection = true;
+            } else if last_reconcile.elapsed() >= Duration::from_secs(5) {
+                if let Err(err) = reconcile_scanner_watches(&state, conn, &mut dirty) {
+                    let active = conn.active.clone();
+                    mark_active_watches_desynced(&state, &active, format!("{err:#}"));
+                    drop_connection = true;
+                }
+                last_reconcile = Instant::now();
+            }
+        }
+        if drop_connection {
+            connection = None;
         }
 
         flush_dirty_indexes(&state, &mut dirty);
@@ -972,202 +955,312 @@ fn watch_manager_loop(state: Arc<Mutex<DaemonState>>) {
     }
 }
 
-fn reconcile_watchers(
+#[derive(Clone)]
+struct DesiredWatch {
+    device_id: String,
+    device_path: String,
+    fs_type: oxidex_core::model::FsType,
+    mount_point: String,
+    watched_directories: usize,
+}
+
+fn connect_scanner_watch_session(
     state: &Arc<Mutex<DaemonState>>,
-    tx: &std::sync::mpsc::Sender<WatchMessage>,
-    watchers: &mut HashMap<String, ActiveWatcher>,
-) {
-    let desired = {
-        let mut state = state.lock().unwrap();
-        state.refresh_devices();
-        if !state.config.indexing.watch_mounted {
-            Vec::new()
+) -> anyhow::Result<ScannerWatchConnection> {
+    let socket_path = state.lock().unwrap().scanner_socket.clone();
+    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+        if err.kind() == ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "permission denied connecting to scanner daemon socket {}; ensure it is root:oxidex mode 0660 and this user is in the oxidex group",
+                socket_path.display()
+            )
         } else {
-            state
-                .indexes
-                .iter()
-                .filter_map(|index| {
-                    if state
-                        .index_states
-                        .get(&index.metadata.device_id)
-                        .and_then(|state| state.stale_reason.as_deref())
-                        .map(|reason| reason.starts_with("watch_"))
-                        .unwrap_or(false)
-                    {
-                        return None;
-                    }
-                    if state
-                        .index_states
-                        .get(&index.metadata.device_id)
-                        .and_then(|state| state.live_watch_state.as_deref())
-                        .is_some_and(|watch_state| watch_state == "unavailable")
-                    {
-                        return None;
-                    }
-                    let device = state
-                        .devices
-                        .iter()
-                        .find(|device| device.metadata.device_id == index.metadata.device_id)?;
-                    if !device.mounted || device.primary_mount_point.trim().is_empty() {
-                        return None;
-                    }
-                    let dir_count = index
-                        .records
-                        .iter()
-                        .filter(|record| record.is_dir())
-                        .count();
-                    Some((
-                        index.metadata.device_id.clone(),
-                        PathBuf::from(&device.primary_mount_point),
-                        dir_count,
-                    ))
-                })
-                .collect::<Vec<_>>()
+            anyhow::Error::from(err)
         }
-    };
+    })?;
+    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    {
+        let mut state = state.lock().unwrap();
+        state.scanner_status.reachable = true;
+        state.scanner_status.access_model = "unix_group_socket".into();
+        state.scanner_status.last_error = None;
+    }
+    tracing::debug!(socket = %socket_path.display(), "scanner watch session connected");
+    Ok(ScannerWatchConnection {
+        stream,
+        next_id: 1,
+        active: HashMap::new(),
+    })
+}
 
-    let desired_ids: HashSet<_> = desired.iter().map(|(id, _, _)| id.clone()).collect();
-    watchers.retain(|device_id, _| desired_ids.contains(device_id));
+fn reconcile_scanner_watches(
+    state: &Arc<Mutex<DaemonState>>,
+    conn: &mut ScannerWatchConnection,
+    dirty: &mut HashMap<String, DirtyState>,
+) -> anyhow::Result<()> {
+    let desired = desired_watches(state);
+    let desired_ids: HashSet<_> = desired
+        .iter()
+        .map(|watch| watch.device_id.clone())
+        .collect();
+    let current_ids: Vec<_> = conn.active.keys().cloned().collect();
+    for device_id in current_ids {
+        if !desired_ids.contains(&device_id) {
+            if let Some(watch_id) = conn.active.remove(&device_id) {
+                let params = ScannerStopWatchParams { watch_id };
+                let _ = scanner_watch_request(
+                    conn,
+                    "scanner.stop_watch",
+                    serde_json::to_value(params)?,
+                    state,
+                    dirty,
+                );
+            }
+            state.lock().unwrap().watch_summaries.remove(&device_id);
+        }
+    }
 
-    for (device_id, mount_point, dir_count) in desired {
-        if watchers
-            .get(&device_id)
-            .map(|watcher| watcher.mount_point == mount_point)
-            .unwrap_or(false)
-        {
+    for desired in desired {
+        if conn.active.contains_key(&desired.device_id) {
             let dirty = state
                 .lock()
                 .unwrap()
                 .watch_summaries
-                .get(&device_id)
+                .get(&desired.device_id)
                 .map(|summary| summary.dirty)
                 .unwrap_or(false);
             update_watch_summary(
                 state,
                 WatchSummary {
-                    device_id,
+                    device_id: desired.device_id,
                     mounted: true,
                     enabled: true,
                     state: "watching".into(),
-                    watched_directories: dir_count,
+                    watched_directories: desired.watched_directories,
                     dirty,
                     last_error: None,
                 },
             );
             continue;
         }
-
-        let tx = tx.clone();
-        let callback_device_id = device_id.clone();
-        let callback_mount = mount_point.clone();
-        match RecommendedWatcher::new(
-            move |result: notify::Result<Event>| match result {
-                Ok(event) => {
-                    let _ = tx.send(WatchMessage::Event {
-                        device_id: callback_device_id.clone(),
-                        mount_point: callback_mount.clone(),
-                        event,
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(WatchMessage::Error {
-                        device_id: callback_device_id.clone(),
-                        message: err.to_string(),
-                    });
-                }
-            },
-            NotifyConfig::default(),
+        let params = ScannerStartWatchParams {
+            device_id: desired.device_id.clone(),
+            device_path: desired.device_path.clone(),
+            fs_type: desired.fs_type,
+            mount_point: desired.mount_point.clone(),
+        };
+        match scanner_watch_request(
+            conn,
+            "scanner.start_watch",
+            serde_json::to_value(params)?,
+            state,
+            dirty,
         )
-        .and_then(|mut watcher| {
-            watcher.watch(&mount_point, RecursiveMode::Recursive)?;
-            Ok(watcher)
-        }) {
-            Ok(watcher) => {
-                tracing::debug!(
-                    device_id = %device_id,
-                    mount_point = %mount_point.display(),
-                    watched_directories = dir_count,
-                    "mounted live watcher started"
-                );
-                watchers.insert(
-                    device_id.clone(),
-                    ActiveWatcher {
-                        _watcher: watcher,
-                        mount_point: mount_point.clone(),
-                    },
-                );
+        .and_then(|frame| result_as::<ScannerStartWatchResult>(&frame))
+        {
+            Ok(result) => {
+                conn.active
+                    .insert(desired.device_id.clone(), result.watch_id);
                 update_watch_summary(
                     state,
                     WatchSummary {
-                        device_id,
+                        device_id: desired.device_id,
                         mounted: true,
                         enabled: true,
                         state: "watching".into(),
-                        watched_directories: dir_count,
+                        watched_directories: desired.watched_directories,
                         dirty: false,
                         last_error: None,
                     },
                 );
             }
-            Err(err) => mark_watch_setup_unavailable(state, &device_id, format!("{err:#}")),
+            Err(err) => mark_watch_setup_unavailable(state, &desired.device_id, format!("{err:#}")),
         }
+    }
+    Ok(())
+}
+
+fn desired_watches(state: &Arc<Mutex<DaemonState>>) -> Vec<DesiredWatch> {
+    let mut state = state.lock().unwrap();
+    state.refresh_devices();
+    if !state.config.indexing.watch_mounted {
+        return Vec::new();
+    }
+    state
+        .indexes
+        .iter()
+        .filter_map(|index| {
+            if state
+                .index_states
+                .get(&index.metadata.device_id)
+                .and_then(|state| state.stale_reason.as_deref())
+                .map(|reason| reason.starts_with("watch_"))
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            if state
+                .index_states
+                .get(&index.metadata.device_id)
+                .and_then(|state| state.live_watch_state.as_deref())
+                .is_some_and(|watch_state| watch_state == "unavailable")
+            {
+                return None;
+            }
+            let device = state
+                .devices
+                .iter()
+                .find(|device| device.metadata.device_id == index.metadata.device_id)?;
+            if !device.mounted || device.primary_mount_point.trim().is_empty() {
+                return None;
+            }
+            Some(DesiredWatch {
+                device_id: index.metadata.device_id.clone(),
+                device_path: device.metadata.dev_node.clone(),
+                fs_type: device.metadata.fs_type,
+                mount_point: device.primary_mount_point.clone(),
+                watched_directories: index
+                    .records
+                    .iter()
+                    .filter(|record| record.is_dir())
+                    .count(),
+            })
+        })
+        .collect()
+}
+
+fn scanner_watch_request(
+    conn: &mut ScannerWatchConnection,
+    method: &str,
+    params: Value,
+    state: &Arc<Mutex<DaemonState>>,
+    dirty: &mut HashMap<String, DirtyState>,
+) -> anyhow::Result<IpcFrame> {
+    let id = conn.next_id;
+    conn.next_id = conn.next_id.saturating_add(1);
+    write_frame(&mut conn.stream, &IpcFrame::request(id, method, params))?;
+    loop {
+        let Some(frame) = read_scanner_watch_frame(&mut conn.stream)? else {
+            continue;
+        };
+        if frame.header.id == Some(id) {
+            return Ok(frame);
+        }
+        handle_scanner_watch_frame(state, dirty, frame)?;
     }
 }
 
-fn apply_watch_event(
+fn drain_scanner_watch_frames(
+    conn: &mut ScannerWatchConnection,
     state: &Arc<Mutex<DaemonState>>,
-    device_id: &str,
-    mount_point: &Path,
-    event: Event,
-) -> anyhow::Result<bool> {
-    if event.paths.is_empty() {
-        return Ok(false);
+    dirty: &mut HashMap<String, DirtyState>,
+) -> anyhow::Result<()> {
+    while let Some(frame) = read_scanner_watch_frame(&mut conn.stream)? {
+        handle_scanner_watch_frame(state, dirty, frame)?;
     }
+    Ok(())
+}
 
-    match &event.kind {
-        EventKind::Create(_) => {
-            let mut changed = false;
-            for path in &event.paths {
-                if let (Some(internal), Some(metadata)) = (
-                    path_to_internal_path(mount_point, path),
-                    metadata_for_live_path(path),
-                ) {
-                    changed |= apply_live_created(state, device_id, internal, metadata)?;
-                }
+fn read_scanner_watch_frame(stream: &mut UnixStream) -> anyhow::Result<Option<IpcFrame>> {
+    match read_frame(&mut *stream) {
+        Ok(frame) => Ok(frame),
+        Err(err) if is_timeout_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_timeout_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .map(|err| matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock))
+        .unwrap_or(false)
+}
+
+fn handle_scanner_watch_frame(
+    state: &Arc<Mutex<DaemonState>>,
+    dirty: &mut HashMap<String, DirtyState>,
+    frame: IpcFrame,
+) -> anyhow::Result<()> {
+    let Some(event) = frame.header.event.as_deref() else {
+        return Ok(());
+    };
+    match event {
+        "scanner.watch_event" => {
+            let event: ScannerWatchEvent =
+                serde_json::from_value(frame.header.params.unwrap_or(Value::Null))?;
+            if apply_scanner_watch_event(state, &event)? {
+                let now = Instant::now();
+                dirty
+                    .entry(event.device_id.clone())
+                    .and_modify(|entry| entry.last_dirty = now)
+                    .or_insert(DirtyState {
+                        first_dirty: now,
+                        last_dirty: now,
+                    });
+                set_watch_dirty(state, &event.device_id, true);
             }
-            Ok(changed)
         }
-        EventKind::Remove(_) => {
-            let mut changed = false;
+        "scanner.watch_error" => {
+            let event: ScannerWatchErrorEvent =
+                serde_json::from_value(frame.header.params.unwrap_or(Value::Null))?;
+            mark_watch_error(state, &event.device_id, event.message);
+        }
+        "scanner.watch_stopped" => {
+            let event: ScannerWatchStoppedEvent =
+                serde_json::from_value(frame.header.params.unwrap_or(Value::Null))?;
+            state
+                .lock()
+                .unwrap()
+                .watch_summaries
+                .entry(event.device_id.clone())
+                .and_modify(|summary| {
+                    summary.state = "stopped".into();
+                    summary.last_error = Some(event.reason.clone());
+                });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_scanner_watch_event(
+    state: &Arc<Mutex<DaemonState>>,
+    event: &ScannerWatchEvent,
+) -> anyhow::Result<bool> {
+    match event.kind {
+        ScannerWatchEventKind::Created => {
+            let Some(metadata) = event.metadata.clone() else {
+                return Ok(false);
+            };
+            apply_live_created(
+                state,
+                &event.device_id,
+                event.internal_path.clone(),
+                live_metadata(metadata),
+            )
+        }
+        ScannerWatchEventKind::Removed => {
             let mut state = state.lock().unwrap();
-            if let Some(index) = state
+            let Some(index) = state
                 .indexes
                 .iter_mut()
-                .find(|index| index.metadata.device_id == device_id)
-            {
-                for path in &event.paths {
-                    if let Some(internal) = path_to_internal_path(mount_point, path) {
-                        changed |= index.apply_live_event(LiveUpdateEvent::Removed {
-                            internal_path: internal,
-                        })?;
-                    }
-                }
-            }
-            Ok(changed)
+                .find(|index| index.metadata.device_id == event.device_id)
+            else {
+                return Ok(false);
+            };
+            index.apply_live_event(LiveUpdateEvent::Removed {
+                internal_path: event.internal_path.clone(),
+            })
         }
-        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() >= 2 => {
-            let Some(old_internal) = path_to_internal_path(mount_point, &event.paths[0]) else {
+        ScannerWatchEventKind::Renamed => {
+            let Some(old_internal) = event.old_internal_path.clone() else {
                 return Ok(false);
             };
-            let Some(new_internal) = path_to_internal_path(mount_point, &event.paths[1]) else {
-                return Ok(false);
-            };
-            let Some(metadata) = metadata_for_live_path(&event.paths[1]) else {
+            let Some(metadata) = event.metadata.clone() else {
                 let mut state = state.lock().unwrap();
                 let Some(index) = state
                     .indexes
                     .iter_mut()
-                    .find(|index| index.metadata.device_id == device_id)
+                    .find(|index| index.metadata.device_id == event.device_id)
                 else {
                     return Ok(false);
                 };
@@ -1175,12 +1268,16 @@ fn apply_watch_event(
                     internal_path: old_internal,
                 });
             };
-            if !rules_allow(&state.lock().unwrap(), device_id, &new_internal)? {
+            if !rules_allow(
+                &state.lock().unwrap(),
+                &event.device_id,
+                &event.internal_path,
+            )? {
                 let mut state = state.lock().unwrap();
                 let Some(index) = state
                     .indexes
                     .iter_mut()
-                    .find(|index| index.metadata.device_id == device_id)
+                    .find(|index| index.metadata.device_id == event.device_id)
                 else {
                     return Ok(false);
                 };
@@ -1192,39 +1289,42 @@ fn apply_watch_event(
             let Some(index) = state
                 .indexes
                 .iter_mut()
-                .find(|index| index.metadata.device_id == device_id)
+                .find(|index| index.metadata.device_id == event.device_id)
             else {
                 return Ok(false);
             };
             index.apply_live_event(LiveUpdateEvent::Renamed {
                 old_internal_path: old_internal,
-                new_internal_path: new_internal,
-                metadata,
+                new_internal_path: event.internal_path.clone(),
+                metadata: live_metadata(metadata),
             })
         }
-        EventKind::Modify(_) => {
-            let mut changed = false;
+        ScannerWatchEventKind::Metadata => {
+            let Some(metadata) = event.metadata.clone() else {
+                return Ok(false);
+            };
             let mut state = state.lock().unwrap();
-            if let Some(index) = state
+            let Some(index) = state
                 .indexes
                 .iter_mut()
-                .find(|index| index.metadata.device_id == device_id)
-            {
-                for path in &event.paths {
-                    if let (Some(internal), Some(metadata)) = (
-                        path_to_internal_path(mount_point, path),
-                        metadata_for_live_path(path),
-                    ) {
-                        changed |= index.apply_live_event(LiveUpdateEvent::Metadata {
-                            internal_path: internal,
-                            metadata,
-                        })?;
-                    }
-                }
-            }
-            Ok(changed)
+                .find(|index| index.metadata.device_id == event.device_id)
+            else {
+                return Ok(false);
+            };
+            index.apply_live_event(LiveUpdateEvent::Metadata {
+                internal_path: event.internal_path.clone(),
+                metadata: live_metadata(metadata),
+            })
         }
-        _ => Ok(false),
+    }
+}
+
+fn live_metadata(metadata: ScannerLiveMetadata) -> LiveRecordMetadata {
+    LiveRecordMetadata {
+        size: metadata.size,
+        mtime: metadata.mtime,
+        is_dir: metadata.is_dir,
+        is_symlink: metadata.is_symlink,
     }
 }
 
@@ -1267,39 +1367,30 @@ fn rules_allow(state: &DaemonState, device_id: &str, internal_path: &str) -> any
     Ok(rules.matches(internal_path, internal_name(internal_path)))
 }
 
-fn metadata_for_live_path(path: &Path) -> Option<LiveRecordMetadata> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    let file_type = metadata.file_type();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    Some(LiveRecordMetadata {
-        size: metadata.len(),
-        mtime,
-        is_dir: file_type.is_dir(),
-        is_symlink: file_type.is_symlink(),
-    })
-}
-
-fn path_to_internal_path(mount_point: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(mount_point).ok()?;
-    let text = relative.to_string_lossy();
-    if text.is_empty() {
-        Some("/".into())
-    } else {
-        Some(format!("/{}", text.trim_start_matches('/')))
-    }
-}
-
 fn internal_name(internal_path: &str) -> &str {
     internal_path
         .trim_end_matches('/')
         .rsplit('/')
         .next()
         .unwrap_or("")
+}
+
+fn mark_scanner_connection_error(state: &Arc<Mutex<DaemonState>>, message: String) {
+    let mut state = state.lock().unwrap();
+    state.scanner_status.reachable = false;
+    state.scanner_status.access_model = "unix_group_socket".into();
+    state.scanner_status.last_error = Some(message);
+}
+
+fn mark_active_watches_desynced(
+    state: &Arc<Mutex<DaemonState>>,
+    active: &HashMap<String, ScannerWatchId>,
+    message: String,
+) {
+    mark_scanner_connection_error(state, message.clone());
+    for device_id in active.keys() {
+        mark_watch_error(state, device_id, message.clone());
+    }
 }
 
 fn flush_dirty_indexes(state: &Arc<Mutex<DaemonState>>, dirty: &mut HashMap<String, DirtyState>) {
@@ -1490,24 +1581,11 @@ fn scan_and_index_device(
         anyhow::ensure!(device_config.enabled, "device is disabled in config");
     }
 
-    let (scan, scanner_label) =
-        match scan_with_scannerd(scanner_socket, device, cancellation, progress) {
-            Ok(scan) => {
-                tracing::debug!(
-                    device_id = %device.metadata.device_id,
-                    "scan completed through scanner daemon"
-                );
-                (scan, "scannerd".to_owned())
-            }
-            Err(scanner_err) => {
-                tracing::warn!(
-                    device_id = %device.metadata.device_id,
-                    error = %format!("{scanner_err:#}"),
-                    "scanner daemon unavailable or failed; falling back to scanner helper"
-                );
-                (scan_with_helper(device, cancellation)?, "helper".to_owned())
-            }
-        };
+    let scan = scan_with_scannerd(scanner_socket, device, cancellation, progress)?;
+    tracing::debug!(
+        device_id = %device.metadata.device_id,
+        "scan completed through scanner daemon"
+    );
 
     let mut index = SearchIndex::from_scan(device.metadata.clone(), scan, now_unix())?;
     if let Some(device_config) = config
@@ -1518,7 +1596,7 @@ fn scan_and_index_device(
         let rules = compile_rules(&device_config.rules)?;
         index = filter_index(index, &rules)?;
     }
-    Ok((index, scanner_label))
+    Ok((index, "scannerd".to_owned()))
 }
 
 fn scan_with_scannerd(
@@ -1542,31 +1620,22 @@ fn scan_with_scannerd(
             anyhow::Error::from(err)
         }
     })?;
-    let authorize = IpcFrame::request(1, "scanner.authorize", json!({}));
-    write_frame(&mut stream, &authorize)?;
-    let Some(frame) = read_frame(&mut stream)? else {
-        anyhow::bail!("scanner daemon closed connection during authorization");
-    };
-    let auth: ScannerAuthorizeResult = result_as(&frame)?;
-    anyhow::ensure!(auth.authorized, "scanner daemon authorization failed");
-    tracing::debug!(device_id = %device.metadata.device_id, "scanner daemon session authorized");
-
     let params = ScannerStartScanParams {
         device_path: device.metadata.dev_node.clone(),
         fs_type: device.metadata.fs_type,
     };
     write_frame(
         &mut stream,
-        &IpcFrame::request(2, "scanner.start_scan", serde_json::to_value(params)?),
+        &IpcFrame::request(1, "scanner.start_scan", serde_json::to_value(params)?),
     )?;
-    let frame = read_until_response(&mut stream, 2, progress)?;
+    let frame = read_until_response(&mut stream, 1, progress)?;
     let started: ScannerStartScanResult = result_as(&frame)?;
     tracing::info!(
         device_id = %device.metadata.device_id,
         scanner_job_id = started.job_id,
         "scanner daemon job started"
     );
-    let mut next_id = 3u64;
+    let mut next_id = 2u64;
 
     loop {
         if cancellation.is_cancelled() {
@@ -1641,90 +1710,6 @@ fn read_until_response(
             return Ok(frame);
         }
     }
-}
-
-fn scan_with_helper(
-    device: &DeviceInfo,
-    cancellation: &ScanCancellation,
-) -> anyhow::Result<ScanDatabase> {
-    let helper = helper_path();
-    tracing::info!(
-        helper = %helper.display(),
-        device_id = %device.metadata.device_id,
-        dev_node = %device.metadata.dev_node,
-        fs_type = device.metadata.fs_type.as_str(),
-        "starting scanner helper fallback"
-    );
-    let mut child = Command::new("pkexec")
-        .arg(helper)
-        .arg(&device.metadata.dev_node)
-        .arg(device.metadata.fs_type.as_str())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("helper stdout unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("helper stderr unavailable"))?;
-
-    let stdout_handle = thread::spawn(move || {
-        let mut data = Vec::new();
-        stdout.read_to_end(&mut data).map(|_| data)
-    });
-
-    let stderr_handle = thread::spawn(move || -> std::io::Result<String> {
-        let reader = std::io::BufReader::new(stderr);
-        let mut diagnostics = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if !line.trim().is_empty() && !line.trim().starts_with("OXIDEX_PROGRESS ") {
-                diagnostics.push(line);
-            }
-        }
-        Ok(diagnostics.join("\n"))
-    });
-
-    loop {
-        if cancellation.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("scan cancelled");
-        }
-        if let Some(status) = child.try_wait()? {
-            let output = stdout_handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("helper stdout reader panicked"))??;
-            let diagnostics = stderr_handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("helper stderr reader panicked"))??;
-            if !status.success() {
-                if diagnostics.trim().is_empty() {
-                    anyhow::bail!("scanner helper failed with status {status}");
-                }
-                anyhow::bail!("scanner helper failed with status {status}: {diagnostics}");
-            }
-            return stream::read_scan_stream(&output[..]);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn helper_path() -> PathBuf {
-    let Ok(exe) = std::env::current_exe() else {
-        return PathBuf::from("oxidex-scanner-helper");
-    };
-    if let Some(dir) = exe.parent() {
-        let sibling = dir.join("oxidex-scanner-helper");
-        if sibling.exists() {
-            return sibling;
-        }
-    }
-    PathBuf::from("oxidex-scanner-helper")
 }
 
 fn apply_config_set(config: &mut AppConfig, params: &ConfigSetParams) -> anyhow::Result<()> {

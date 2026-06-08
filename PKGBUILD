@@ -10,7 +10,7 @@ pkgdesc="Oxidex, a fast Rust/egui filename search app for NTFS, EXT4, and Btrfs 
 arch=('x86_64')
 url="https://github.com/MaHouYa/Oxidex"
 license=('GPL-3.0-or-later')
-depends=('gcc-libs' 'glibc' 'polkit' 'libx11' 'libxcb' 'libxkbcommon' 'wayland' 'libglvnd' 'fontconfig' 'xdg-utils' 'hicolor-icon-theme')
+depends=('gcc-libs' 'glibc' 'libx11' 'libxcb' 'libxkbcommon' 'wayland' 'libglvnd' 'fontconfig' 'xdg-utils' 'hicolor-icon-theme')
 makedepends=('cargo' 'clang')
 optdepends=('noto-fonts-cjk: CJK glyph fallback'
             'wqy-microhei: alternative Chinese glyph fallback'
@@ -42,10 +42,8 @@ package() {
   install -Dm755 "$srcdir/target/release/oxidex-cli" "$pkgdir/usr/bin/oxidex-cli"
   install -Dm755 "$srcdir/target/release/oxidexd" "$pkgdir/usr/bin/oxidexd"
   install -Dm755 "$srcdir/target/release/oxidex-scannerd" "$pkgdir/usr/bin/oxidex-scannerd"
-  install -Dm755 "$srcdir/target/release/oxidex-scanner-helper" "$pkgdir/usr/bin/oxidex-scanner-helper"
 
   install -Dm644 "$startdir/org.mahouya.oxidex.desktop" "$pkgdir/usr/share/applications/org.mahouya.oxidex.desktop"
-  install -Dm644 "$startdir/org.mahouya.oxidex.policy" "$pkgdir/usr/share/polkit-1/actions/org.mahouya.oxidex.policy"
   install -Dm644 "$startdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$startdir/systemd/user/oxidexd.service" "$pkgdir/usr/lib/systemd/user/oxidexd.service"
   install -Dm644 "$startdir/systemd/user/oxidexd.socket" "$pkgdir/usr/lib/systemd/user/oxidexd.socket"

@@ -1,6 +1,6 @@
 # Oxidex
 
-Oxidex is a Linux desktop filename search utility inspired by Voidtools Everything. This branch rewrites the application in Rust with an unprivileged `egui` GUI, an unprivileged per-user daemon, and a small privileged scanner daemon authorized through Polkit.
+Oxidex is a Linux desktop filename search utility inspired by Voidtools Everything. This branch rewrites the application in Rust with an unprivileged `egui` GUI, an unprivileged per-user daemon, and a small privileged scanner daemon protected by a `root:oxidex` Unix socket.
 
 The Rust app indexes NTFS, EXT4, and basic Btrfs devices by reading filesystem metadata instead of crawling mounted directories or reading file contents. Btrfs V2 support is native and read-only through Rust crates; it indexes the default/main root and treats other subvolumes as boundaries for now.
 
@@ -12,26 +12,26 @@ Credit: Oxidex builds on the original project foundation created by Reikooters. 
 
 For installation, first indexing, search examples, rofi usage, troubleshooting, and exporting debug logs, see the [Oxidex User Guide](docs/user-guide.md).
 
-Rename note: version 2.0.0 completes the public rename to Oxidex. Commands, crates, config paths, index paths, systemd units, Polkit policy, and the scanner socket group now use the `oxidex` name.
+Rename note: version 2.0.0 completes the public rename to Oxidex. Commands, crates, config paths, index paths, systemd units, and the scanner socket group now use the `oxidex` name.
 
 ## Features
 
 - Rust-native desktop GUI built with `eframe`/`egui`, using the `glow` backend by default.
-- Unprivileged GUI and user daemon; only `oxidex-scannerd` or the compatibility `oxidex-scanner-helper` performs privileged raw metadata scans.
+- Unprivileged GUI and user daemon; only `oxidex-scannerd` performs privileged raw metadata scans and mounted live update watching.
 - Persistent multi-device indexes under `$XDG_DATA_HOME/oxidex/indexes/`.
 - Stable device IDs using `partuuid:<id>`, then `uuid:<filesystem-uuid>`, then `dev:<canonical-dev-node>`.
 - NTFS V1 scanner reads MFT metadata, preserves hard-link names as separate entries, filters duplicate DOS 8.3 aliases, and hides early `$` system files.
 - EXT4 V1 scanner reads filesystem metadata, inode metadata, and directory entries through a Rust-native crate.
 - Btrfs V2 scanner reads the default/main root through Rust-native Btrfs metadata APIs and rejects unsupported multi-device layouts clearly.
 - Search uses Unicode lowercase folding plus byte trigrams for positive name tokens of length three or more, with substring refinement, short-token fallback, relevance sorting, wildcards, quoted phrases, negation, and `ext:`/`type:`/`path:`/`size:`/`mtime:` filters.
-- V4 daemon scans are queued, asynchronous, cancellable, and tracked through job status. Mounted indexed filesystems can be kept fresh with unprivileged `notify`/inotify updates.
-- `oxidex-cli doctor` diagnoses daemon, scanner socket, Polkit, config, index, systemd, and security setup problems even when `oxidexd` is not running.
+- V4 daemon scans are queued, asynchronous, cancellable, and tracked through job status. Mounted indexed filesystems can be kept fresh through privileged scanner-daemon `notify`/inotify events.
+- `oxidex-cli doctor` diagnoses daemon, scanner socket, config, index, systemd, and security setup problems even when `oxidexd` is not running.
 - Multi-device search, device-scope filtering, result sorting, mounted/unmounted path display, and persisted snapshot reload on restart.
 - Guaranteed actions: open file, open containing folder, copy file name/path, right-click context actions, and properties.
 
 ## What Was Removed
 
-The Rust build does not use Qt6, KDE Frameworks, KIO, Solid, a D-Bus indexing daemon, libblkid, e2fsprogs/libext2fs, Intel OneTBB, or `wgpu` by default. Polkit remains because raw block-device scanning is privileged.
+The Rust build does not use Qt6, KDE Frameworks, KIO, Solid, a D-Bus indexing daemon, libblkid, e2fsprogs/libext2fs, Intel OneTBB, or `wgpu` by default.
 
 The old C++ daemon snapshot format is intentionally not imported. Users rescan once into the new Rust snapshot format.
 
@@ -41,15 +41,14 @@ The Cargo workspace contains these primary crates:
 
 - `crates/oxidex`: the `eframe`/`egui` GUI.
 - `crates/oxidex-daemon`: `oxidexd`, the unprivileged per-user daemon that owns config, loaded indexes, search, scan requests, and snapshot persistence.
-- `crates/oxidex-scannerd`: `oxidex-scannerd`, the privileged scanner daemon that validates raw `/dev/...` scan requests and streams `ScanStreamV1` data.
+- `crates/oxidex-scannerd`: `oxidex-scannerd`, the privileged scanner daemon that validates raw `/dev/...` scan requests, streams `ScanStreamV1` data, and emits mounted live update events.
 - `crates/oxidex-client`: shared Unix-socket client library for GUI and CLI frontends.
 - `crates/oxidex-cli`: CLI and rofi/script integration client.
-- `crates/oxidex-scanner-helper`: the compatibility privileged scanner CLI kept for one release.
 - `crates/oxidex-core`: shared device discovery, scan stream, indexing, search, snapshots, path resolution, and scanner backends.
 
-`oxidexd` discovers known devices from `/dev/disk/by-*`, `/run/udev/data`, and `/proc/self/mountinfo`. It stores snapshots in the user data directory, keeps index health sidecars beside snapshots, owns the scan job queue, and connects to `oxidex-scannerd` only when a raw rescan is requested. If the scanner daemon is not reachable, it can still fall back to the compatibility helper.
+`oxidexd` discovers known devices from `/dev/disk/by-*`, `/run/udev/data`, and `/proc/self/mountinfo`. It stores snapshots in the user data directory, keeps index health sidecars beside snapshots, owns the scan job queue, applies include/exclude rules, and connects to `oxidex-scannerd` for raw rescans and privileged mounted live update events.
 
-`oxidex-scannerd` validates the device path, resolves symlinks, rejects unsafe inputs, starts cancellable scanner jobs, reports progress as structured IPC events, and returns the existing binary scan stream through `scanner.take_result`.
+`oxidex-scannerd` validates the device path, resolves symlinks, rejects unsafe inputs, starts cancellable scanner jobs, reports progress as structured IPC events, returns the existing binary scan stream through `scanner.take_result`, and watches mounted indexed devices as root when requested by `oxidexd`.
 
 The GUI defaults to daemon mode. Use the standalone fallback when developing or recovering from daemon setup problems:
 
@@ -64,46 +63,28 @@ $XDG_RUNTIME_DIR/oxidex/oxidexd.sock
 /run/oxidex/scannerd.sock
 ```
 
-## Helper CLI
-
-The helper remains available for compatibility and manual diagnostics:
-
-```shell
-oxidex-scanner-helper --version
-oxidex-scanner-helper <absolute-/dev-device> <ntfs|ext4|btrfs>
-```
-
-Progress is emitted on stderr in this format:
-
-```text
-OXIDEX_PROGRESS <0-100>
-```
-
-Stdout is reserved for the binary `ScanStreamV1` payload.
-
 ## Daemon And CLI
 
 Foreground development mode:
 
 ```shell
-scripts/dev-install-polkit.sh
+sudo groupadd --system oxidex 2>/dev/null || true
+sudo usermod -aG oxidex "$USER"
+newgrp oxidex
 oxidexd --foreground
 sudo oxidex-scannerd --foreground
 ```
 
-The first command installs the local Polkit action file and checks that `pkaction` can see `org.mahouya.oxidex.connect-scanner`. Without that, `pkcheck` will fail with `Action org.mahouya.oxidex.connect-scanner is not registered`.
-
-For local foreground testing, the scanner daemon socket is still protected by Unix permissions before Polkit can run. Create the socket group, add your user, and start a fresh login session or `newgrp` before running `oxidexd`:
+For local foreground testing, the scanner daemon socket is protected by Unix permissions. Create the socket group, add your user, and start a fresh login session or `newgrp` before running `oxidexd`:
 
 ```shell
 sudo groupadd --system oxidex 2>/dev/null || true
 sudo usermod -aG oxidex "$USER"
 newgrp oxidex
-scripts/dev-install-polkit.sh
 sudo target/release/oxidex-scannerd --foreground
 ```
 
-If the scanner daemon was already running before the group existed, restart it. The foreground daemon will create `/run/oxidex/scannerd.sock` as `root:oxidex` with mode `0660` when the group is available. Without that, `oxidexd` will see `Permission denied` before the Polkit authorization step.
+If the scanner daemon was already running before the group existed, restart it. The foreground daemon will create `/run/oxidex/scannerd.sock` as `root:oxidex` with mode `0660` when the group is available. Without that, `oxidexd` will see `Permission denied`.
 
 CLI examples:
 
@@ -135,7 +116,7 @@ rofi -dmenu -i -p Oxidex < <(oxidex-cli rofi "$query")
 Install Rust and the native libraries needed by `eframe`/`winit` for Linux desktop rendering. On Arch Linux:
 
 ```shell
-sudo pacman -S cargo clang polkit libx11 libxcb libxkbcommon wayland libglvnd fontconfig xdg-utils hicolor-icon-theme
+sudo pacman -S cargo clang libx11 libxcb libxkbcommon wayland libglvnd fontconfig xdg-utils hicolor-icon-theme
 ```
 
 Build all Rust crates:
@@ -156,7 +137,7 @@ Run the GUI from the build tree:
 target/release/oxidex
 ```
 
-For local scanner testing, `oxidexd` first tries `/run/oxidex/scannerd.sock`. If that daemon is unavailable, it looks for `oxidex-scanner-helper` beside the running daemon binary and then falls back to `PATH`. Installed systems should prefer the scanner daemon and keep the helper only as a compatibility fallback.
+For local scanner testing, `oxidexd` uses `/run/oxidex/scannerd.sock`. If that socket is unavailable or the user is not in the `oxidex` group, scans fail with a setup error instead of prompting for a password.
 
 ## Search Syntax
 
@@ -175,7 +156,7 @@ Typed filters and the GUI filter panel combine with AND semantics. Regex and OR 
 
 ## V4 Live Updates And Diagnostics
 
-V4 keeps raw unmounted scans as explicit rescan jobs, but mounted indexed devices can be watched by the unprivileged user daemon. The watcher uses normal Linux filename notifications through the Rust `notify` crate, updates the in-memory index for create/delete/rename/metadata events, and flushes dirty snapshots after a short debounce. If notification overflow or ambiguous state is detected, the index is marked stale and a raw rescan is recommended.
+V4 keeps raw unmounted scans as explicit rescan jobs, but mounted indexed devices can be watched by `oxidex-scannerd` as root. The privileged watcher uses normal Linux filename notifications through the Rust `notify` crate and sends structured events to `oxidexd`, which updates the in-memory index, applies include/exclude rules, and flushes dirty snapshots after a short debounce. If notification overflow, scanner disconnect, or ambiguous state is detected, the index is marked stale and a raw rescan is recommended.
 
 Use doctor after installation or when scanning fails:
 
@@ -186,7 +167,7 @@ oxidex-cli doctor --security
 oxidex-cli doctor --json
 ```
 
-Doctor checks the user daemon socket, scanner socket permissions, `oxidex` group membership, Polkit action registration, config validity, index loading, packaged systemd units, and helper fallback availability.
+Doctor checks the user daemon socket, scanner socket permissions, `oxidex` group membership, config validity, index loading, packaged systemd units, and security setup.
 
 ## Arch Package
 
@@ -202,15 +183,13 @@ The package installs:
 - `/usr/bin/oxidex-cli`
 - `/usr/bin/oxidexd`
 - `/usr/bin/oxidex-scannerd`
-- `/usr/bin/oxidex-scanner-helper`
 - `/usr/share/applications/org.mahouya.oxidex.desktop`
-- `/usr/share/polkit-1/actions/org.mahouya.oxidex.policy`
 - systemd user units for `oxidexd`
 - systemd system units for `oxidex-scannerd`
 - hicolor app icons
 - the GPL license
 
-It does not install the previous D-Bus service, systemd daemon service, Qt/KDE files, or CMake build outputs.
+It does not install the previous D-Bus service, Qt/KDE files, or CMake build outputs.
 
 ## Debian Package
 
@@ -222,20 +201,9 @@ scripts/package-deb.sh
 
 The package is written to `dist/oxidex_2.0.0_amd64.deb`. The GitHub Actions workflow in `.github/workflows/deb.yml` builds the same package inside an `ubuntu:20.04` job container and uploads it as a workflow artifact.
 
-The Debian package installs the GUI, CLI, user daemon, scanner daemon, compatibility scanner helper, desktop file, systemd units, Polkit policy, hicolor icons, and license into standard system paths. This avoids the AppImage helper permission issue because privileged components live under `/usr/bin`.
+The Debian package installs the GUI, CLI, user daemon, scanner daemon, desktop file, systemd units, hicolor icons, and license into standard system paths.
 
-The package creates a system group named `oxidex` for the privileged scanner socket. Users who should connect to the scanner daemon can be added to that group by the system administrator. Polkit authorization is still required by default.
-
-An optional passwordless Polkit rule can be installed by administrators, but it is not shipped by default:
-
-```js
-polkit.addRule(function(action, subject) {
-    if (action.id == "org.mahouya.oxidex.connect-scanner" &&
-        subject.isInGroup("oxidex")) {
-        return polkit.Result.YES;
-    }
-});
-```
+The package creates a system group named `oxidex` for the privileged scanner socket. Users who should scan disks and receive privileged live update events must be added to that group by the system administrator. After that one-time setup, Oxidex scans without password prompts.
 
 ## Current Scanner Status
 
@@ -256,9 +224,9 @@ V2-basic does not recurse into additional subvolumes or snapshots. Those entries
 ## Development Notes
 
 - The GUI must not run as root.
-- Helper stdout must contain only binary scan data.
-- Scanner daemon responses use framed IPC; only the final scan response carries binary `ScanStreamV1`.
-- Path/device validation in the helper and scanner daemon is security-sensitive.
+- `oxidex-scannerd` is the only privileged scanner path in normal builds.
+- Scanner daemon responses use framed IPC; only `scanner.take_result` carries binary `ScanStreamV1` payload data.
+- Path/device and watch mount validation in the scanner daemon is security-sensitive.
 - Old C++ snapshots are intentionally ignored.
 - Raw filesystem-specific delta scanning, NTFS USN Journal support, EXT4 journal parsing, Btrfs generation/transid scanning, open history/frecency, native rofi plugin ABI support, D-Bus APIs, full Btrfs subvolume traversal, Snapshot Format V2, regex search, OR groups, and rich drag-out/file-URI clipboard support are outside V4.
 

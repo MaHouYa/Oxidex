@@ -325,7 +325,6 @@ fn run_doctor(args: Vec<String>) -> anyhow::Result<()> {
     let mut report = run_local_doctor(&DoctorOptions {
         daemon_socket: default_daemon_socket_path().ok(),
         scanner_socket: None,
-        helper_path: Some(sibling_binary("oxidex-scanner-helper")),
         scanner_only,
         security_only,
     });
@@ -498,7 +497,6 @@ fn category_label(category: DoctorCategory) -> &'static str {
     match category {
         DoctorCategory::Daemon => "daemon",
         DoctorCategory::Scanner => "scanner",
-        DoctorCategory::Polkit => "polkit",
         DoctorCategory::Systemd => "systemd",
         DoctorCategory::Config => "config",
         DoctorCategory::Indexes => "indexes",

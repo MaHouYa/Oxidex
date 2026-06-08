@@ -2,14 +2,12 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::{config_path, load_config_from_path};
 use crate::snapshot;
 
-pub const SCANNER_POLKIT_ACTION: &str = "org.mahouya.oxidex.connect-scanner";
 pub const DEFAULT_SCANNER_SOCKET: &str = "/run/oxidex/scannerd.sock";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,7 +24,6 @@ pub enum DoctorSeverity {
 pub enum DoctorCategory {
     Daemon,
     Scanner,
-    Polkit,
     Systemd,
     Config,
     Indexes,
@@ -53,7 +50,6 @@ pub struct DoctorReport {
 pub struct DoctorOptions {
     pub daemon_socket: Option<PathBuf>,
     pub scanner_socket: Option<PathBuf>,
-    pub helper_path: Option<PathBuf>,
     pub scanner_only: bool,
     pub security_only: bool,
 }
@@ -113,12 +109,7 @@ pub fn run_local_doctor(options: &DoctorOptions) -> DoctorReport {
         check_systemd_units(&mut report);
     }
 
-    if !options.security_only {
-        check_helper(&mut report, options.helper_path.as_deref());
-    }
-
     check_scanner_socket(&mut report, &scanner_socket);
-    check_polkit(&mut report);
     check_security(&mut report, &scanner_socket);
     report
 }
@@ -316,46 +307,6 @@ fn check_scanner_socket(report: &mut DoctorReport, path: &Path) {
     }
 }
 
-fn check_polkit(report: &mut DoctorReport) {
-    match Command::new("pkaction").output() {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if text
-                .lines()
-                .any(|line| line.trim() == SCANNER_POLKIT_ACTION)
-            {
-                report.add(
-                    DoctorCategory::Polkit,
-                    DoctorSeverity::Ok,
-                    "polkit_action",
-                    format!("Polkit action {SCANNER_POLKIT_ACTION} is registered"),
-                );
-            } else {
-                report.add(
-                    DoctorCategory::Polkit,
-                    DoctorSeverity::Fail,
-                    "polkit_action",
-                    format!("Polkit action {SCANNER_POLKIT_ACTION} is not registered"),
-                );
-            }
-        }
-        Ok(output) => report.add_detail(
-            DoctorCategory::Polkit,
-            DoctorSeverity::Warn,
-            "pkaction",
-            "Could not query Polkit actions with pkaction",
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ),
-        Err(err) => report.add_detail(
-            DoctorCategory::Polkit,
-            DoctorSeverity::Warn,
-            "pkaction",
-            "pkaction is not available",
-            err.to_string(),
-        ),
-    }
-}
-
 fn check_security(report: &mut DoctorReport, scanner_socket: &Path) {
     if let Some(gid) = group_gid("oxidex") {
         let groups = process_groups();
@@ -371,7 +322,7 @@ fn check_security(report: &mut DoctorReport, scanner_socket: &Path) {
                 DoctorCategory::Security,
                 DoctorSeverity::Warn,
                 "scanner_group_membership",
-                "Current user is not in the oxidex group; scanner socket connection may fail before Polkit",
+                "Current user is not in the oxidex group; scanner socket connection will fail unless another access rule is configured",
             );
         }
     }
@@ -393,22 +344,6 @@ fn check_security(report: &mut DoctorReport, scanner_socket: &Path) {
                 "Scanner socket is world-writable",
             );
         }
-    }
-}
-
-fn check_helper(report: &mut DoctorReport, helper_path: Option<&Path>) {
-    if let Some(path) = helper_path {
-        let severity = if path.exists() {
-            DoctorSeverity::Ok
-        } else {
-            DoctorSeverity::Warn
-        };
-        report.add(
-            DoctorCategory::Packaging,
-            severity,
-            "scanner_helper",
-            format!("Compatibility scanner helper path: {}", path.display()),
-        );
     }
 }
 

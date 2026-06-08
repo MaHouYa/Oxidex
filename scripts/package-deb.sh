@@ -47,7 +47,6 @@ mkdir -p \
   "$PKG_DIR/usr/share/icons/hicolor/48x48/apps" \
   "$PKG_DIR/usr/share/icons/hicolor/256x256/apps" \
   "$PKG_DIR/usr/share/doc/oxidex" \
-  "$PKG_DIR/usr/share/polkit-1/actions" \
   "$PKG_DIR/usr/lib/systemd/user" \
   "$PKG_DIR/usr/lib/systemd/system" \
   "$DIST_DIR"
@@ -56,10 +55,8 @@ install -Dm755 "$ROOT_DIR/target/release/oxidex" "$PKG_DIR/usr/bin/oxidex"
 install -Dm755 "$ROOT_DIR/target/release/oxidex-cli" "$PKG_DIR/usr/bin/oxidex-cli"
 install -Dm755 "$ROOT_DIR/target/release/oxidexd" "$PKG_DIR/usr/bin/oxidexd"
 install -Dm755 "$ROOT_DIR/target/release/oxidex-scannerd" "$PKG_DIR/usr/bin/oxidex-scannerd"
-install -Dm755 "$ROOT_DIR/target/release/oxidex-scanner-helper" "$PKG_DIR/usr/bin/oxidex-scanner-helper"
 
 install -Dm644 "$ROOT_DIR/org.mahouya.oxidex.desktop" "$PKG_DIR/usr/share/applications/org.mahouya.oxidex.desktop"
-install -Dm644 "$ROOT_DIR/org.mahouya.oxidex.policy" "$PKG_DIR/usr/share/polkit-1/actions/org.mahouya.oxidex.policy"
 install -Dm644 "$ROOT_DIR/LICENSE" "$PKG_DIR/usr/share/doc/oxidex/copyright"
 install -Dm644 "$ROOT_DIR/systemd/user/oxidexd.service" "$PKG_DIR/usr/lib/systemd/user/oxidexd.service"
 install -Dm644 "$ROOT_DIR/systemd/user/oxidexd.socket" "$PKG_DIR/usr/lib/systemd/user/oxidexd.socket"
@@ -79,13 +76,13 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: Honghao <Rasphino@users.noreply.github.com>
 Installed-Size: $installed_size
-Depends: libc6 (>= 2.31), libgcc-s1, policykit-1, adduser, xdg-utils, hicolor-icon-theme, libgl1, libx11-6, libxcb1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libfontconfig1
+Depends: libc6 (>= 2.31), libgcc-s1, adduser, xdg-utils, hicolor-icon-theme, libgl1, libx11-6, libxcb1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libfontconfig1
 Recommends: fonts-noto-cjk | fonts-wqy-microhei, fcitx5 | ibus
 Homepage: https://github.com/MaHouYa/Oxidex
 Description: Fast filename search for NTFS, EXT4, and Btrfs devices
  Oxidex is a Linux desktop filename search utility built with Rust and egui.
- It keeps an unprivileged GUI/user daemon and uses a small Polkit-authorized
- scanner daemon for raw block-device metadata scans.
+ It keeps an unprivileged GUI/user daemon and uses a small privileged scanner
+ daemon protected by the oxidex Unix group for raw metadata scans and live updates.
 EOF
 
 cat >"$PKG_DIR/DEBIAN/postinst" <<'EOF'
@@ -106,9 +103,11 @@ cat <<'MSG'
 Oxidex installed.
 
 To let your user daemon connect to the privileged scanner daemon, add your user
-to the oxidex group, then log out and back in or run newgrp:
+to the oxidex group, enable the scanner socket, then log out and back in or run
+newgrp:
 
   sudo usermod -aG oxidex "$USER"
+  sudo systemctl enable --now oxidex-scannerd.socket
   newgrp oxidex
 
 Check the setup with:

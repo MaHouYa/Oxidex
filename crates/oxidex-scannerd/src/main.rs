@@ -2,21 +2,26 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
+use notify::event::{ModifyKind, RenameMode};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use oxidex_core::daemon_model::{
     ScanState, ScannerAuthorizeResult, ScannerCancelScanParams, ScannerJobId, ScannerJobSummary,
-    ScannerStartScanParams, ScannerStartScanResult, ScannerStatusResult, ScannerTakeResultParams,
-    ScannerTakeResultResult,
+    ScannerLiveMetadata, ScannerStartScanParams, ScannerStartScanResult, ScannerStartWatchParams,
+    ScannerStartWatchResult, ScannerStatusResult, ScannerStopWatchParams, ScannerTakeResultParams,
+    ScannerTakeResultResult, ScannerWatchErrorEvent, ScannerWatchEvent, ScannerWatchEventKind,
+    ScannerWatchId, ScannerWatchStoppedEvent, ScannerWatchSummary,
 };
 use oxidex_core::ipc::{IpcFrame, params_as, read_frame, write_frame};
 use oxidex_core::model::{FsType, ScanDatabase};
@@ -26,7 +31,6 @@ use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SOCKET: &str = "/run/oxidex/scannerd.sock";
-const POLKIT_ACTION: &str = "org.mahouya.oxidex.connect-scanner";
 
 fn main() {
     if let Err(err) = run() {
@@ -116,6 +120,7 @@ fn init_terminal_logging(binary: &str, debug: bool, log_level: Option<&str>) {
 fn serve(socket_path: PathBuf, idle_timeout: Duration) -> anyhow::Result<()> {
     let listener = if let Some(listener) = inherited_systemd_listener()? {
         tracing::info!("using inherited systemd socket");
+        verify_socket_security(&socket_path)?;
         listener
     } else {
         if let Some(parent) = socket_path.parent() {
@@ -126,6 +131,7 @@ fn serve(socket_path: PathBuf, idle_timeout: Duration) -> anyhow::Result<()> {
         }
         let listener = UnixListener::bind(&socket_path)?;
         configure_socket_permissions(&socket_path)?;
+        verify_socket_security(&socket_path)?;
         tracing::info!(socket = %socket_path.display(), "listening");
         listener
     };
@@ -161,6 +167,42 @@ fn configure_socket_permissions(socket_path: &Path) -> anyhow::Result<()> {
     }
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
     tracing::debug!(socket = %socket_path.display(), mode = "0660", "configured scanner socket permissions");
+    Ok(())
+}
+
+fn verify_socket_security(socket_path: &Path) -> anyhow::Result<()> {
+    let meta = fs::metadata(socket_path)?;
+    anyhow::ensure!(
+        meta.file_type().is_socket(),
+        "scanner path {} is not a Unix socket",
+        socket_path.display()
+    );
+    let mode = meta.permissions().mode() & 0o777;
+    anyhow::ensure!(
+        mode & !0o660 == 0,
+        "scanner socket {} has insecure mode {:o}; expected no broader than 0660",
+        socket_path.display(),
+        mode
+    );
+    if meta.uid() != 0 {
+        tracing::warn!(
+            socket = %socket_path.display(),
+            uid = meta.uid(),
+            "scanner socket is not root-owned"
+        );
+    }
+    if let Some(gid) = group_gid("oxidex")? {
+        if meta.gid() != gid {
+            tracing::warn!(
+                socket = %socket_path.display(),
+                gid = meta.gid(),
+                expected_gid = gid,
+                "scanner socket group is not oxidex"
+            );
+        }
+    } else {
+        tracing::warn!("group 'oxidex' does not exist; scanner socket group cannot be verified");
+    }
     Ok(())
 }
 
@@ -202,8 +244,11 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
     );
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let jobs: Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>> = Arc::new(Mutex::new(HashMap::new()));
+    let watch_summaries: Arc<Mutex<HashMap<ScannerWatchId, ScannerWatchSummary>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let mut watches: HashMap<ScannerWatchId, ScannerWatch> = HashMap::new();
     let next_job = Arc::new(AtomicU64::new(1));
-    let mut authorized = false;
+    let next_watch = Arc::new(AtomicU64::new(1));
     let mut last_error: Option<String> = None;
 
     while let Some(frame) = read_frame(&mut stream)? {
@@ -216,20 +261,18 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
             continue;
         };
         let method = frame.header.method.clone().unwrap_or_default();
-        tracing::debug!(id, method = %method, authorized, "scanner request received");
+        tracing::debug!(id, method = %method, "scanner request received");
         let response = match method.as_str() {
             "scanner.hello" => Ok((
                 json!({"name": "oxidex-scannerd", "version": VERSION}),
                 Vec::new(),
             )),
             "scanner.authorize" => {
-                authorize_peer(&peer)?;
-                authorized = true;
                 tracing::info!(
                     peer_pid = peer.pid,
                     peer_uid = peer.uid,
                     peer_gid = peer.gid,
-                    "scanner client authorized"
+                    "scanner.authorize is deprecated; socket access already granted"
                 );
                 Ok((
                     serde_json::to_value(ScannerAuthorizeResult {
@@ -242,8 +285,11 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
             }
             "scanner.status" => Ok((
                 serde_json::to_value(ScannerStatusResult {
-                    authorized,
+                    access_model: "unix_group_socket".into(),
+                    peer_uid: peer.uid,
+                    peer_gid: peer.gid,
                     active_jobs: job_summaries(&jobs),
+                    active_watches: scanner_watch_summaries(&watch_summaries),
                     idle_timeout_seconds: idle_timeout.as_secs(),
                     last_error: last_error.clone(),
                 })?,
@@ -251,20 +297,16 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
             )),
             "scanner.cancel_scan" => cancel_scan(&frame, &jobs),
             "scanner.shutdown_idle" => Ok((json!({"accepted": true}), Vec::new())),
-            "scanner.start_scan" => {
-                if !authorized {
-                    Err(anyhow::anyhow!("scanner connection is not authorized"))
-                } else {
-                    start_scan(&frame, &writer, &jobs, &next_job)
-                }
+            "scanner.start_scan" => start_scan(&frame, &writer, &jobs, &next_job),
+            "scanner.take_result" => take_result(&frame, &jobs),
+            "scanner.start_watch" => {
+                start_watch(&frame, &writer, &mut watches, &watch_summaries, &next_watch)
             }
-            "scanner.take_result" => {
-                if !authorized {
-                    Err(anyhow::anyhow!("scanner connection is not authorized"))
-                } else {
-                    take_result(&frame, &jobs)
-                }
-            }
+            "scanner.stop_watch" => stop_watch(&frame, &writer, &mut watches, &watch_summaries),
+            "scanner.watch_status" => Ok((
+                serde_json::to_value(scanner_watch_summaries(&watch_summaries))?,
+                Vec::new(),
+            )),
             other => Err(anyhow::anyhow!("unknown method: {other}")),
         };
 
@@ -300,6 +342,19 @@ fn handle_client(mut stream: UnixStream, idle_timeout: Duration) -> anyhow::Resu
         peer_uid = peer.uid,
         "scanner client disconnected"
     );
+    for (_, watch) in watches {
+        let _ = write_locked(
+            &writer,
+            &IpcFrame::event(
+                "scanner.watch_stopped",
+                serde_json::to_value(ScannerWatchStoppedEvent {
+                    watch_id: watch.summary.watch_id,
+                    device_id: watch.summary.device_id,
+                    reason: "client_disconnected".into(),
+                })?,
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -550,6 +605,14 @@ fn job_summaries(jobs: &Arc<Mutex<HashMap<ScannerJobId, ScannerJob>>>) -> Vec<Sc
     summaries
 }
 
+fn scanner_watch_summaries(
+    watches: &Arc<Mutex<HashMap<ScannerWatchId, ScannerWatchSummary>>>,
+) -> Vec<ScannerWatchSummary> {
+    let mut summaries: Vec<_> = watches.lock().unwrap().values().cloned().collect();
+    summaries.sort_by_key(|watch| watch.watch_id);
+    summaries
+}
+
 fn write_locked(writer: &Arc<Mutex<UnixStream>>, frame: &IpcFrame) -> anyhow::Result<()> {
     write_frame(&mut *writer.lock().unwrap(), frame)
 }
@@ -558,6 +621,306 @@ struct ScannerJob {
     summary: ScannerJobSummary,
     cancellation: ScanCancellation,
     payload: Option<Vec<u8>>,
+}
+
+struct ScannerWatch {
+    _watcher: RecommendedWatcher,
+    summary: ScannerWatchSummary,
+}
+
+fn start_watch(
+    frame: &IpcFrame,
+    writer: &Arc<Mutex<UnixStream>>,
+    watches: &mut HashMap<ScannerWatchId, ScannerWatch>,
+    watch_summaries: &Arc<Mutex<HashMap<ScannerWatchId, ScannerWatchSummary>>>,
+    next_watch: &Arc<AtomicU64>,
+) -> anyhow::Result<(Value, Vec<u8>)> {
+    let params: ScannerStartWatchParams = params_as(frame)?;
+    let (device_path, mount_point) = validate_watch_request(&params)?;
+    let watch_id = next_watch.fetch_add(1, Ordering::Relaxed);
+    let writer_for_callback = writer.clone();
+    let summaries_for_callback = watch_summaries.clone();
+    let callback_device_id = params.device_id.clone();
+    let callback_mount = mount_point.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |result: notify::Result<Event>| match result {
+            Ok(event) => {
+                for watch_event in
+                    scanner_watch_events(watch_id, &callback_device_id, &callback_mount, event)
+                {
+                    let _ = write_locked(
+                        &writer_for_callback,
+                        &IpcFrame::event(
+                            "scanner.watch_event",
+                            serde_json::to_value(watch_event).unwrap_or(Value::Null),
+                        ),
+                    );
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if let Some(summary) = summaries_for_callback.lock().unwrap().get_mut(&watch_id) {
+                    summary.state = "error".into();
+                    summary.last_error = Some(message.clone());
+                }
+                let _ = write_locked(
+                    &writer_for_callback,
+                    &IpcFrame::event(
+                        "scanner.watch_error",
+                        serde_json::to_value(ScannerWatchErrorEvent {
+                            watch_id: Some(watch_id),
+                            device_id: callback_device_id.clone(),
+                            message,
+                        })
+                        .unwrap_or(Value::Null),
+                    ),
+                );
+            }
+        },
+        NotifyConfig::default(),
+    )?;
+    watcher.watch(&mount_point, RecursiveMode::Recursive)?;
+    let watched_directories = 1;
+    let summary = ScannerWatchSummary {
+        watch_id,
+        device_id: params.device_id.clone(),
+        mount_point: mount_point.display().to_string(),
+        state: "watching".into(),
+        watched_directories,
+        last_error: None,
+    };
+    watch_summaries
+        .lock()
+        .unwrap()
+        .insert(watch_id, summary.clone());
+    watches.insert(
+        watch_id,
+        ScannerWatch {
+            _watcher: watcher,
+            summary,
+        },
+    );
+    tracing::info!(
+        watch_id,
+        device_id = %params.device_id,
+        device_path = %device_path.display(),
+        mount_point = %mount_point.display(),
+        watched_directories,
+        "scanner live watch started"
+    );
+    Ok((
+        serde_json::to_value(ScannerStartWatchResult { watch_id })?,
+        Vec::new(),
+    ))
+}
+
+fn stop_watch(
+    frame: &IpcFrame,
+    writer: &Arc<Mutex<UnixStream>>,
+    watches: &mut HashMap<ScannerWatchId, ScannerWatch>,
+    watch_summaries: &Arc<Mutex<HashMap<ScannerWatchId, ScannerWatchSummary>>>,
+) -> anyhow::Result<(Value, Vec<u8>)> {
+    let params: ScannerStopWatchParams = params_as(frame)?;
+    let Some(watch) = watches.remove(&params.watch_id) else {
+        return Ok((
+            json!({"stopped": false, "message": "unknown watch"}),
+            Vec::new(),
+        ));
+    };
+    watch_summaries.lock().unwrap().remove(&params.watch_id);
+    write_locked(
+        writer,
+        &IpcFrame::event(
+            "scanner.watch_stopped",
+            serde_json::to_value(ScannerWatchStoppedEvent {
+                watch_id: params.watch_id,
+                device_id: watch.summary.device_id,
+                reason: "stopped".into(),
+            })?,
+        ),
+    )?;
+    Ok((json!({"stopped": true}), Vec::new()))
+}
+
+fn validate_watch_request(params: &ScannerStartWatchParams) -> anyhow::Result<(PathBuf, PathBuf)> {
+    anyhow::ensure!(
+        params.fs_type.is_supported_for_scan(),
+        "unsupported filesystem type {}",
+        params.fs_type
+    );
+    let device = validate_device_path(&params.device_path)?;
+    anyhow::ensure!(
+        !params.mount_point.trim().is_empty(),
+        "mount point is empty"
+    );
+    let mount_point = PathBuf::from(&params.mount_point);
+    anyhow::ensure!(
+        mount_point.is_absolute(),
+        "mount point must be an absolute path"
+    );
+    let mount_point = mount_point.canonicalize()?;
+    let metadata = fs::metadata(&mount_point)?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "mount point {} is not a directory",
+        mount_point.display()
+    );
+    anyhow::ensure!(
+        mount_point_matches_requested_device(&mount_point, &device)?,
+        "mount point {} is not listed in /proc/self/mountinfo for device {}",
+        mount_point.display(),
+        device.display()
+    );
+    Ok((device, mount_point))
+}
+
+fn scanner_watch_events(
+    watch_id: ScannerWatchId,
+    device_id: &str,
+    mount_point: &Path,
+    event: Event,
+) -> Vec<ScannerWatchEvent> {
+    if event.paths.is_empty() {
+        return Vec::new();
+    }
+    match &event.kind {
+        EventKind::Create(_) => event
+            .paths
+            .iter()
+            .filter_map(|path| {
+                Some(ScannerWatchEvent {
+                    watch_id,
+                    device_id: device_id.to_owned(),
+                    kind: ScannerWatchEventKind::Created,
+                    internal_path: path_to_internal_path(mount_point, path)?,
+                    old_internal_path: None,
+                    metadata: metadata_for_live_path(path),
+                })
+            })
+            .collect(),
+        EventKind::Remove(_) => event
+            .paths
+            .iter()
+            .filter_map(|path| {
+                Some(ScannerWatchEvent {
+                    watch_id,
+                    device_id: device_id.to_owned(),
+                    kind: ScannerWatchEventKind::Removed,
+                    internal_path: path_to_internal_path(mount_point, path)?,
+                    old_internal_path: None,
+                    metadata: None,
+                })
+            })
+            .collect(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() >= 2 => {
+            let Some(old_internal) = path_to_internal_path(mount_point, &event.paths[0]) else {
+                return Vec::new();
+            };
+            let Some(new_internal) = path_to_internal_path(mount_point, &event.paths[1]) else {
+                return Vec::new();
+            };
+            vec![ScannerWatchEvent {
+                watch_id,
+                device_id: device_id.to_owned(),
+                kind: ScannerWatchEventKind::Renamed,
+                internal_path: new_internal,
+                old_internal_path: Some(old_internal),
+                metadata: metadata_for_live_path(&event.paths[1]),
+            }]
+        }
+        EventKind::Modify(_) => event
+            .paths
+            .iter()
+            .filter_map(|path| {
+                Some(ScannerWatchEvent {
+                    watch_id,
+                    device_id: device_id.to_owned(),
+                    kind: ScannerWatchEventKind::Metadata,
+                    internal_path: path_to_internal_path(mount_point, path)?,
+                    old_internal_path: None,
+                    metadata: metadata_for_live_path(path),
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn metadata_for_live_path(path: &Path) -> Option<ScannerLiveMetadata> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let file_type = metadata.file_type();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    Some(ScannerLiveMetadata {
+        size: metadata.len(),
+        mtime,
+        is_dir: file_type.is_dir(),
+        is_symlink: file_type.is_symlink(),
+    })
+}
+
+fn path_to_internal_path(mount_point: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(mount_point).ok()?;
+    let text = relative.to_string_lossy();
+    if text.is_empty() {
+        Some("/".into())
+    } else {
+        Some(format!("/{}", text.trim_start_matches('/')))
+    }
+}
+
+fn mount_point_matches_requested_device(mount_point: &Path, device: &Path) -> anyhow::Result<bool> {
+    let Ok(text) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Ok(true);
+    };
+    Ok(mountinfo_text_matches_requested_device(
+        &text,
+        mount_point,
+        device,
+    ))
+}
+
+fn mountinfo_text_matches_requested_device(text: &str, mount_point: &Path, device: &Path) -> bool {
+    let wanted_mount = mount_point.to_string_lossy();
+    let canonical_device = device
+        .canonicalize()
+        .unwrap_or_else(|_| device.to_path_buf());
+    for line in text.lines() {
+        let Some((prefix, suffix)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut fields = prefix.split_whitespace();
+        let mount = fields.nth(4).map(decode_mountinfo_path);
+        if mount.as_deref() != Some(wanted_mount.as_ref()) {
+            continue;
+        }
+
+        let mut suffix_fields = suffix.split_whitespace();
+        let _fs_type = suffix_fields.next();
+        let Some(source) = suffix_fields.next().map(decode_mountinfo_path) else {
+            return true;
+        };
+        if !source.starts_with("/dev/") {
+            return true;
+        }
+        let source_path = PathBuf::from(source);
+        let Ok(canonical_source) = source_path.canonicalize() else {
+            return true;
+        };
+        return canonical_source == canonical_device;
+    }
+    false
+}
+
+fn decode_mountinfo_path(path: &str) -> String {
+    path.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -594,70 +957,53 @@ fn peer_credentials(stream: &UnixStream) -> anyhow::Result<PeerCredentials> {
     })
 }
 
-fn authorize_peer(peer: &PeerCredentials) -> anyhow::Result<()> {
-    if std::env::var_os("OXIDEX_SCANNERD_SKIP_POLKIT").is_some() {
-        tracing::warn!(
-            "OXIDEX_SCANNERD_SKIP_POLKIT is set; allowing scanner client without Polkit"
-        );
-        return Ok(());
-    }
-    if peer.uid == 0 {
-        tracing::debug!(
-            peer_pid = peer.pid,
-            "allowing root scanner client without Polkit prompt"
-        );
-        return Ok(());
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    tracing::debug!(
-        action = POLKIT_ACTION,
-        peer_pid = peer.pid,
-        peer_uid = peer.uid,
-        "running pkcheck"
-    );
-    let output = Command::new("pkcheck")
-        .arg("--action-id")
-        .arg(POLKIT_ACTION)
-        .arg("--process")
-        .arg(peer.pid.to_string())
-        .arg("--allow-user-interaction")
-        .output()
-        .map_err(|err| anyhow::anyhow!("failed to run pkcheck: {err}"))?;
-
-    if output.status.success() {
-        tracing::debug!(
-            peer_pid = peer.pid,
-            peer_uid = peer.uid,
-            "pkcheck authorized peer"
+    #[test]
+    fn internal_path_strips_mount_root() {
+        assert_eq!(
+            path_to_internal_path(Path::new("/mnt/data"), Path::new("/mnt/data/home/a.txt")),
+            Some("/home/a.txt".into())
         );
-        return Ok(());
-    }
-
-    let diagnostics = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let details = format!("{}{}", diagnostics.trim(), stdout.trim());
-    tracing::warn!(
-        peer_pid = peer.pid,
-        peer_uid = peer.uid,
-        status = %output.status,
-        details = %details,
-        "pkcheck denied peer"
-    );
-    if details.contains("is not registered") || details.contains("not registered") {
-        anyhow::bail!(
-            "Polkit action {POLKIT_ACTION} is not registered. Install org.mahouya.oxidex.policy to /usr/share/polkit-1/actions/ and restart polkit, then reconnect. pkcheck said: {details}"
+        assert_eq!(
+            path_to_internal_path(Path::new("/mnt/data"), Path::new("/mnt/data")),
+            Some("/".into())
+        );
+        assert_eq!(
+            path_to_internal_path(Path::new("/mnt/data"), Path::new("/other/a.txt")),
+            None
         );
     }
 
-    anyhow::bail!(
-        "Polkit authorization denied for pid {} uid {} gid {}. pkcheck said: {}",
-        peer.pid,
-        peer.uid,
-        peer.gid,
-        if details.is_empty() {
-            output.status.to_string()
-        } else {
-            details
-        }
-    );
+    #[test]
+    fn mountinfo_match_checks_device_source_when_possible() {
+        let text = "36 25 1:5 / /mnt/data rw,relatime - ext4 /dev/null rw\n";
+        assert!(mountinfo_text_matches_requested_device(
+            text,
+            Path::new("/mnt/data"),
+            Path::new("/dev/null")
+        ));
+        assert!(!mountinfo_text_matches_requested_device(
+            text,
+            Path::new("/mnt/data"),
+            Path::new("/dev/zero")
+        ));
+        assert!(!mountinfo_text_matches_requested_device(
+            text,
+            Path::new("/mnt/missing"),
+            Path::new("/dev/null")
+        ));
+    }
+
+    #[test]
+    fn mountinfo_match_decodes_escaped_mount_point() {
+        let text = "36 25 1:5 / /mnt/Oxidex\\040Data rw,relatime - ext4 /dev/null rw\n";
+        assert!(mountinfo_text_matches_requested_device(
+            text,
+            Path::new("/mnt/Oxidex Data"),
+            Path::new("/dev/null")
+        ));
+    }
 }

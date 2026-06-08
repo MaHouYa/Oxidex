@@ -9,6 +9,7 @@ use crate::model::{FsType, SortDirection, SortKey};
 
 pub type ScanJobId = u64;
 pub type ScannerJobId = u64;
+pub type ScannerWatchId = u64;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientRequest {
@@ -299,8 +300,11 @@ pub struct ScannerCancelScanParams {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScannerStatusResult {
-    pub authorized: bool,
+    pub access_model: String,
+    pub peer_uid: u32,
+    pub peer_gid: u32,
     pub active_jobs: Vec<ScannerJobSummary>,
+    pub active_watches: Vec<ScannerWatchSummary>,
     pub idle_timeout_seconds: u64,
     pub last_error: Option<String>,
 }
@@ -309,8 +313,9 @@ pub struct ScannerStatusResult {
 pub struct ScannerStatusDetail {
     pub socket: String,
     pub reachable: bool,
-    pub authorized: bool,
-    pub using_helper_fallback: bool,
+    pub access_model: String,
+    pub peer_uid: Option<u32>,
+    pub peer_gid: Option<u32>,
     pub last_error: Option<String>,
 }
 
@@ -323,6 +328,75 @@ pub struct ScannerJobSummary {
     pub progress: u8,
     pub record_count: Option<usize>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerStartWatchParams {
+    pub device_id: String,
+    pub device_path: String,
+    pub fs_type: FsType,
+    pub mount_point: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerStartWatchResult {
+    pub watch_id: ScannerWatchId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerStopWatchParams {
+    pub watch_id: ScannerWatchId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerWatchSummary {
+    pub watch_id: ScannerWatchId,
+    pub device_id: String,
+    pub mount_point: String,
+    pub state: String,
+    pub watched_directories: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannerWatchEventKind {
+    Created,
+    Removed,
+    Renamed,
+    Metadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerLiveMetadata {
+    pub size: u64,
+    pub mtime: i64,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerWatchEvent {
+    pub watch_id: ScannerWatchId,
+    pub device_id: String,
+    pub kind: ScannerWatchEventKind,
+    pub internal_path: String,
+    pub old_internal_path: Option<String>,
+    pub metadata: Option<ScannerLiveMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerWatchErrorEvent {
+    pub watch_id: Option<ScannerWatchId>,
+    pub device_id: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScannerWatchStoppedEvent {
+    pub watch_id: ScannerWatchId,
+    pub device_id: String,
+    pub reason: String,
 }
 
 impl DeviceSummary {
