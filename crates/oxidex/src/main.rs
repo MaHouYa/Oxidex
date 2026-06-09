@@ -1117,7 +1117,7 @@ impl DaemonGuiApp {
                                 .map(|index| index.entry_count);
                             ui.horizontal(|ui| {
                                 ui.label(fit(&device_summary_label(&device), 30));
-                                ui.label(fit(device.fs_type.as_str(), 7));
+                                ui.label(fit(&device.fs_type_name, 7));
                                 ui.label(if device.mounted {
                                     self.t(Text::Mounted)
                                 } else {
@@ -1146,13 +1146,24 @@ impl DaemonGuiApp {
                                     {
                                         ui.label(fit(&watch.state, 16));
                                     }
+                                } else if let Some(reason) = &device.scan_unavailable_reason {
+                                    ui.label(fit(reason, 28));
                                 }
                                 let label = if indexed_count.is_some() {
                                     self.t(Text::Rescan)
                                 } else {
                                     self.t(Text::Index)
                                 };
-                                if ui.button(label).clicked() {
+                                if ui
+                                    .add_enabled(device.scan_supported, egui::Button::new(label))
+                                    .on_disabled_hover_text(
+                                        device
+                                            .scan_unavailable_reason
+                                            .as_deref()
+                                            .unwrap_or("Device cannot be scanned."),
+                                    )
+                                    .clicked()
+                                {
                                     self.scan_device(device.device_id.clone());
                                 }
                                 if indexed_count.is_some()
@@ -1476,9 +1487,7 @@ impl OxidexApp {
     }
 
     fn device_by_id(&self, device_id: &str) -> Option<&DeviceInfo> {
-        self.devices
-            .iter()
-            .find(|dev| dev.metadata.device_id == device_id)
+        self.devices.iter().find(|dev| dev.device_id == device_id)
     }
 
     fn index_by_id(&self, device_id: &str) -> Option<&SearchIndex> {
@@ -1581,9 +1590,9 @@ impl OxidexApp {
         }
         self.status = "Scanning requires oxidexd and oxidex-scannerd. Start Oxidex normally or use oxidex-cli scan.".into();
         tracing::info!(
-            device_id = %device.metadata.device_id,
-            fs_type = device.metadata.fs_type.as_str(),
-            dev_node = %device.metadata.dev_node,
+            device_id = %device.device_id,
+            fs_type = %device.fs_type_name,
+            dev_node = %device.dev_node,
             "standalone scan blocked; daemon scanner is required"
         );
     }
@@ -2133,17 +2142,16 @@ impl OxidexApp {
                     .show(ui, |ui| {
                         for device in self.devices.clone() {
                             ui.horizontal(|ui| {
-                                let meta = &device.metadata;
-                                let index = self.index_by_id(&meta.device_id);
-                                let count = indexed.get(&meta.device_id).copied();
-                                ui.label(fit(&device_label(meta), 28));
-                                ui.label(fit(meta.fs_type.as_str(), 7));
+                                let index = self.index_by_id(&device.device_id);
+                                let count = indexed.get(&device.device_id).copied();
+                                ui.label(fit(&device_info_label(&device), 28));
+                                ui.label(fit(&device.fs_type_name, 7));
                                 ui.label(if device.mounted {
                                     self.t(Text::Mounted)
                                 } else {
                                     self.t(Text::NotMounted)
                                 });
-                                ui.label(fit(&meta.dev_node, 22));
+                                ui.label(fit(&device.dev_node, 22));
                                 ui.label(match count {
                                     Some(n) => format!("{n} {}", self.t(Text::EntryPlural)),
                                     None => self.t(Text::NotIndexed).to_owned(),
@@ -2159,8 +2167,10 @@ impl OxidexApp {
                                         })
                                         .unwrap_or_else(|| self.t(Text::NeverIndexed).to_owned()),
                                 );
-                                if let Some(err) = self.last_scan_errors.get(&meta.device_id) {
+                                if let Some(err) = self.last_scan_errors.get(&device.device_id) {
                                     ui.label(fit(err, 36));
+                                } else if let Some(reason) = &device.scan_unavailable_reason {
+                                    ui.label(fit(reason, 36));
                                 }
 
                                 let busy = self.scan_job.is_some();
@@ -2186,7 +2196,7 @@ impl OxidexApp {
                                         )
                                         .clicked()
                                 {
-                                    self.forget_index(&meta.device_id);
+                                    self.forget_index(&device.device_id);
                                 }
                             });
                             ui.separator();
@@ -2538,6 +2548,14 @@ fn device_label(meta: &DeviceMetadata) -> String {
         format!("{} ({})", meta.label.trim(), meta.device_id)
     } else {
         meta.device_id.clone()
+    }
+}
+
+fn device_info_label(device: &DeviceInfo) -> String {
+    if !device.label.trim().is_empty() {
+        format!("{} ({})", device.label.trim(), device.device_id)
+    } else {
+        device.device_id.clone()
     }
 }
 

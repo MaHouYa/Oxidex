@@ -9,6 +9,7 @@ use crate::scanner::{ProgressCallback, ScanCancellation};
 
 pub fn scan(
     path: &Path,
+    fs_type: FsType,
     progress: &mut ProgressCallback<'_>,
     cancellation: &ScanCancellation,
 ) -> anyhow::Result<ScanDatabase> {
@@ -19,11 +20,12 @@ pub fn scan(
     let options = ext4::Options {
         checksums: ext4::Checksums::Ignored,
         load_xattrs: false,
+        require_clean: false,
     };
     let volume = ext4::SuperBlock::new_with_options(file, &options)?;
     let root = volume.root()?;
 
-    let mut db = ScanDatabase::new(FsType::Ext4);
+    let mut db = ScanDatabase::new(fs_type);
     db.push_record(ROOT_PARENT, "", 0, 0, true, false)?;
 
     let mut path_to_record = HashMap::new();
@@ -105,6 +107,7 @@ fn split_path(path: &str) -> (&str, &str) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
     use std::process::Command;
 
     #[test]
@@ -133,12 +136,103 @@ mod tests {
         }
 
         let mut progress = |_: u64, _: u64| {};
-        let result = scan(&image, &mut progress, &ScanCancellation::new());
+        let result = scan(
+            &image,
+            FsType::Ext4,
+            &mut progress,
+            &ScanCancellation::new(),
+        );
         let _ = fs::remove_file(&image);
 
         let db = result?;
         assert_eq!(db.fs_type, FsType::Ext4);
         assert!(!db.records.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn ext3_image_scans_when_mkfs_ext3_is_available() -> anyhow::Result<()> {
+        let image =
+            std::env::temp_dir().join(format!("oxidex-ext3-basic-{}.img", std::process::id()));
+        let text =
+            std::env::temp_dir().join(format!("oxidex-ext3-text-{}.txt", std::process::id()));
+        let commands =
+            std::env::temp_dir().join(format!("oxidex-ext3-debugfs-{}.cmd", std::process::id()));
+        let file = fs::File::create(&image)?;
+        file.set_len(64 * 1024 * 1024)?;
+        drop(file);
+        fs::File::create(&text)?.write_all(b"hello ext3")?;
+        fs::write(
+            &commands,
+            format!(
+                "mkdir /nested\nwrite {} /nested/hello.txt\n",
+                text.display()
+            ),
+        )?;
+
+        let mkfs = Command::new("mkfs.ext3")
+            .arg("-q")
+            .arg("-F")
+            .arg(&image)
+            .status();
+
+        let Ok(status) = mkfs else {
+            let _ = fs::remove_file(&image);
+            let _ = fs::remove_file(&text);
+            let _ = fs::remove_file(&commands);
+            return Ok(());
+        };
+        if !status.success() {
+            let _ = fs::remove_file(&image);
+            let _ = fs::remove_file(&text);
+            let _ = fs::remove_file(&commands);
+            return Ok(());
+        }
+
+        let debugfs = Command::new("debugfs")
+            .arg("-w")
+            .arg("-f")
+            .arg(&commands)
+            .arg(&image)
+            .status();
+        let Ok(status) = debugfs else {
+            let _ = fs::remove_file(&image);
+            let _ = fs::remove_file(&text);
+            let _ = fs::remove_file(&commands);
+            return Ok(());
+        };
+        if !status.success() {
+            let _ = fs::remove_file(&image);
+            let _ = fs::remove_file(&text);
+            let _ = fs::remove_file(&commands);
+            return Ok(());
+        }
+
+        let mut progress = |_: u64, _: u64| {};
+        let result = scan(
+            &image,
+            FsType::Ext3,
+            &mut progress,
+            &ScanCancellation::new(),
+        );
+        let _ = fs::remove_file(&image);
+        let _ = fs::remove_file(&text);
+        let _ = fs::remove_file(&commands);
+
+        let db = result?;
+        assert_eq!(db.fs_type, FsType::Ext3);
+        assert!(
+            db.records
+                .iter()
+                .enumerate()
+                .any(|(idx, _)| db.name(idx as u32) == "nested")
+        );
+        assert!(
+            db.records
+                .iter()
+                .enumerate()
+                .any(|(idx, _)| db.name(idx as u32) == "hello.txt")
+        );
         Ok(())
     }
 }

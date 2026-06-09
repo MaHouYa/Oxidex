@@ -14,6 +14,7 @@ pub fn write_scan_stream(mut w: impl Write, db: &ScanDatabase) -> anyhow::Result
         FsType::Ntfs => 1,
         FsType::Ext4 => 2,
         FsType::Btrfs => 3,
+        FsType::Ext3 => 4,
     })?;
     w.write_u64::<LittleEndian>(db.records.len() as u64)?;
     for rec in &db.records {
@@ -44,6 +45,7 @@ pub fn read_scan_stream(mut r: impl Read) -> anyhow::Result<ScanDatabase> {
         1 => FsType::Ntfs,
         2 => FsType::Ext4,
         3 => FsType::Btrfs,
+        4 => FsType::Ext3,
         other => anyhow::bail!("unknown scan stream filesystem tag {other}"),
     };
 
@@ -147,5 +149,17 @@ mod tests {
         buf.pop();
 
         assert!(read_scan_stream(&buf[..]).is_err());
+    }
+
+    #[test]
+    fn scan_stream_ext3_roundtrip() {
+        let mut db = ScanDatabase::new(FsType::Ext3);
+        db.push_record(ROOT_PARENT, "", 0, 0, true, false).unwrap();
+
+        let mut buf = Vec::new();
+        write_scan_stream(&mut buf, &db).unwrap();
+        let decoded = read_scan_stream(&buf[..]).unwrap();
+
+        assert_eq!(decoded.fs_type, FsType::Ext3);
     }
 }

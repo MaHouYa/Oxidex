@@ -39,6 +39,12 @@ pub mod parse;
 
 use crate::extents::TreeReader;
 
+const EXT2_N_BLOCKS: usize = 15;
+const EXT2_NDIR_BLOCKS: usize = 12;
+const EXT2_IND_BLOCK: usize = 12;
+const EXT2_DIND_BLOCK: usize = 13;
+const EXT2_TIND_BLOCK: usize = 14;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     /// The filesystem doesn't meet the code's expectations;
@@ -234,6 +240,7 @@ impl Default for Checksums {
 pub struct Options {
     pub checksums: Checksums,
     pub load_xattrs: bool,
+    pub require_clean: bool,
 }
 
 impl Default for Options {
@@ -241,6 +248,7 @@ impl Default for Options {
         Self {
             checksums: Checksums::default(),
             load_xattrs: true,
+            require_clean: true,
         }
     }
 }
@@ -382,7 +390,7 @@ where
     }
 
     /// Read the data from an inode. You might not want to call this on thigns that aren't regular files.
-    pub fn open(&self, inode: &Inode) -> Result<TreeReader<&R>, Error> {
+    pub fn open(&self, inode: &Inode) -> Result<InodeReader<&R>, Error> {
         inode.reader(&self.inner)
     }
 
@@ -403,18 +411,27 @@ where
 }
 
 impl Inode {
-    fn reader<R>(&self, inner: R) -> Result<TreeReader<R>, Error>
+    fn reader<R>(&self, inner: R) -> Result<InodeReader<R>, Error>
     where
         R: ReadAt,
     {
-        Ok(TreeReader::new(
-            inner,
-            self.block_size,
-            self.stat.size,
-            self.core,
-            self.checksum_prefix,
-        )
-        .with_context(|| anyhow!("opening inode <{}>", self.number))?)
+        let reader = if self.flags.contains(InodeFlags::EXTENTS) {
+            InodeReader::Extents(TreeReader::new(
+                inner,
+                self.block_size,
+                self.stat.size,
+                self.core,
+                self.checksum_prefix,
+            )?)
+        } else {
+            InodeReader::Blocks(BlockMapReader::new(
+                inner,
+                self.block_size,
+                self.stat.size,
+                self.core,
+            )?)
+        };
+        Ok(reader)
     }
 
     fn enhance<R>(&self, inner: R) -> Result<Enhanced, Error>
@@ -430,7 +447,7 @@ impl Inode {
             FileType::SymbolicLink => {
                 Enhanced::SymbolicLink(if self.stat.size < u64::try_from(INODE_CORE_SIZE)? {
                     ensure!(
-                        self.flags.is_empty(),
+                        self.has_no_unsupported_content_flags(),
                         unsupported_feature(format!(
                             "symbolic links may not have flags: {:?}",
                             self.flags
@@ -441,11 +458,8 @@ impl Inode {
                         .to_string()
                 } else {
                     ensure!(
-                        self.only_relevant_flag_is_extents(),
-                        unsupported_feature(format!(
-                            "symbolic links may not have non-extent flags: {:?}",
-                            self.flags
-                        ))
+                        self.has_no_unsupported_content_flags(),
+                        unsupported_feature(format!("symbolic links have unsupported flags: {:?}", self.flags))
                     );
                     std::str::from_utf8(&self.load_all(inner)?)
                         .with_context(|| anyhow!("long symlink is invalid utf-8"))?
@@ -482,9 +496,8 @@ impl Inode {
         let mut dirs = Vec::with_capacity(40);
 
         let data = {
-            // if the flags, minus irrelevant flags, isn't just EXTENTS...
             ensure!(
-                self.only_relevant_flag_is_extents(),
+                self.has_no_unsupported_content_flags(),
                 unsupported_feature(format!(
                     "inode with unsupported flags: {0:x} {0:b}",
                     self.flags
@@ -572,21 +585,210 @@ impl Inode {
         Ok(dirs)
     }
 
-    fn only_relevant_flag_is_extents(&self) -> bool {
-        self.flags
+    fn has_no_unsupported_content_flags(&self) -> bool {
+        (self.flags
             & (InodeFlags::COMPR
                 | InodeFlags::DIRTY
                 | InodeFlags::COMPRBLK
                 | InodeFlags::ENCRYPT
                 | InodeFlags::IMAGIC
                 | InodeFlags::NOTAIL
-                | InodeFlags::TOPDIR
                 | InodeFlags::HUGE_FILE
-                | InodeFlags::EXTENTS
                 | InodeFlags::EA_INODE
                 | InodeFlags::EOFBLOCKS
-                | InodeFlags::INLINE_DATA)
-            == InodeFlags::EXTENTS
+                | InodeFlags::INLINE_DATA))
+            .is_empty()
+    }
+}
+
+pub enum InodeReader<R> {
+    Extents(TreeReader<R>),
+    Blocks(BlockMapReader<R>),
+}
+
+impl<R> io::Read for InodeReader<R>
+where
+    R: ReadAt,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Extents(reader) => reader.read(buf),
+            Self::Blocks(reader) => reader.read(buf),
+        }
+    }
+}
+
+impl<R> io::Seek for InodeReader<R>
+where
+    R: ReadAt,
+{
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Extents(reader) => reader.seek(pos),
+            Self::Blocks(reader) => reader.seek(pos),
+        }
+    }
+}
+
+pub struct BlockMapReader<R> {
+    inner: R,
+    pos: u64,
+    len: u64,
+    block_size: u32,
+    blocks: [u32; EXT2_N_BLOCKS],
+}
+
+impl<R> BlockMapReader<R>
+where
+    R: ReadAt,
+{
+    fn new(
+        inner: R,
+        block_size: u32,
+        size: u64,
+        core: [u8; INODE_CORE_SIZE],
+    ) -> Result<BlockMapReader<R>, Error> {
+        let mut blocks = [0u32; EXT2_N_BLOCKS];
+        for (idx, block) in blocks.iter_mut().enumerate() {
+            let start = idx * 4;
+            *block = read_le32(&core[start..start + 4]);
+        }
+        Ok(BlockMapReader {
+            inner,
+            pos: 0,
+            len: size,
+            block_size,
+            blocks,
+        })
+    }
+
+    fn block_pointer(&self, logical_block: u64) -> io::Result<u32> {
+        let entries_per_block = u64::from(self.block_size / 4);
+        if logical_block < EXT2_NDIR_BLOCKS as u64 {
+            return Ok(self.blocks[logical_block as usize]);
+        }
+
+        let mut remaining = logical_block - EXT2_NDIR_BLOCKS as u64;
+        if remaining < entries_per_block {
+            return self.indirect_pointer(self.blocks[EXT2_IND_BLOCK], remaining);
+        }
+
+        remaining -= entries_per_block;
+        let double_span = entries_per_block * entries_per_block;
+        if remaining < double_span {
+            let first = remaining / entries_per_block;
+            let second = remaining % entries_per_block;
+            let indirect = self.indirect_pointer(self.blocks[EXT2_DIND_BLOCK], first)?;
+            return self.indirect_pointer(indirect, second);
+        }
+
+        remaining -= double_span;
+        let triple_span = entries_per_block
+            .checked_mul(entries_per_block)
+            .and_then(|span| span.checked_mul(entries_per_block))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "indirect span overflow"))?;
+        if remaining < triple_span {
+            let double_index = remaining / double_span;
+            let double_remainder = remaining % double_span;
+            let first = double_remainder / entries_per_block;
+            let second = double_remainder % entries_per_block;
+            let double = self.indirect_pointer(self.blocks[EXT2_TIND_BLOCK], double_index)?;
+            let indirect = self.indirect_pointer(double, first)?;
+            return self.indirect_pointer(indirect, second);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "logical block is outside ext block map",
+        ))
+    }
+
+    fn indirect_pointer(&self, block: u32, index: u64) -> io::Result<u32> {
+        if block == 0 {
+            return Ok(0);
+        }
+        let offset = u64::from(block) * u64::from(self.block_size) + index * 4;
+        let mut data = [0u8; 4];
+        self.inner.read_exact_at(offset, &mut data)?;
+        Ok(read_le32(&data))
+    }
+}
+
+impl<R> io::Read for BlockMapReader<R>
+where
+    R: ReadAt,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.len {
+            return Ok(0);
+        }
+
+        let remaining_file = usize::try_from((self.len - self.pos).min(buf.len() as u64))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "read size overflow"))?;
+        let block_size = u64::from(self.block_size);
+        let logical_block = self.pos / block_size;
+        let offset_in_block = self.pos % block_size;
+        let max_from_block = usize::try_from((block_size - offset_in_block).min(remaining_file as u64))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "block read overflow"))?;
+        let block = self.block_pointer(logical_block)?;
+
+        if block == 0 {
+            zero(&mut buf[..max_from_block]);
+        } else {
+            let offset = u64::from(block) * block_size + offset_in_block;
+            self.inner.read_exact_at(offset, &mut buf[..max_from_block])?;
+        }
+        self.pos += u64::try_from(max_from_block)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "position overflow"))?;
+        Ok(max_from_block)
+    }
+}
+
+fn zero(buf: &mut [u8]) {
+    #[allow(clippy::explicit_counter_loop)]
+    for item in buf {
+        *item = 0;
+    }
+}
+
+impl<R> io::Seek for BlockMapReader<R>
+where
+    R: ReadAt,
+{
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let next = match pos {
+            io::SeekFrom::Start(set) => set,
+            io::SeekFrom::Current(diff) => {
+                if diff >= 0 {
+                    self.pos
+                        .checked_add(diff as u64)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?
+                } else {
+                    self.pos.checked_sub(diff.unsigned_abs()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek before start")
+                    })?
+                }
+            }
+            io::SeekFrom::End(diff) => {
+                if diff >= 0 {
+                    self.len
+                        .checked_add(diff as u64)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek overflow"))?
+                } else {
+                    self.len.checked_sub(diff.unsigned_abs()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek before start")
+                    })?
+                }
+            }
+        };
+        if next > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek past end",
+            ));
+        }
+        self.pos = next;
+        Ok(self.pos)
     }
 }
 

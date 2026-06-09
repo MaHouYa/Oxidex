@@ -79,7 +79,7 @@ Installed-Size: $installed_size
 Depends: libc6 (>= 2.31), libgcc-s1, adduser, xdg-utils, hicolor-icon-theme, libgl1, libx11-6, libxcb1, libxkbcommon0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libfontconfig1
 Recommends: fonts-noto-cjk | fonts-wqy-microhei, fcitx5 | ibus
 Homepage: https://github.com/MaHouYa/Oxidex
-Description: Fast filename search for NTFS, EXT4, and Btrfs devices
+Description: Fast filename search for NTFS, EXT3, EXT4, and Btrfs devices
  Oxidex is a Linux desktop filename search utility built with Rust and egui.
  It keeps an unprivileged GUI/user daemon and uses a small privileged scanner
  daemon protected by the oxidex Unix group for raw metadata scans and live updates.

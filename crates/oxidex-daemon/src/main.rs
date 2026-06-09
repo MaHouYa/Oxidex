@@ -532,7 +532,7 @@ impl DaemonState {
                 let index = self
                     .indexes
                     .iter()
-                    .find(|index| index.metadata.device_id == device.metadata.device_id);
+                    .find(|index| index.metadata.device_id == device.device_id);
                 DeviceSummary::from_device(device, index)
             })
             .collect()
@@ -549,7 +549,7 @@ impl DaemonState {
             let device = self
                 .devices
                 .iter()
-                .find(|device| device.metadata.device_id == hit.device_id);
+                .find(|device| device.device_id == hit.device_id);
             let (mounted, mount_point) = device
                 .map(|device| (device.mounted, device.primary_mount_point.as_str()))
                 .unwrap_or((false, ""));
@@ -584,7 +584,7 @@ impl DaemonState {
         let device = self
             .devices
             .iter()
-            .find(|device| device.metadata.device_id == params.device_id);
+            .find(|device| device.device_id == params.device_id);
         let (mounted, mount_point) = device
             .map(|device| (device.mounted, device.primary_mount_point.as_str()))
             .unwrap_or((false, ""));
@@ -601,20 +601,39 @@ fn start_scan_job(
     state: Arc<Mutex<DaemonState>>,
     device_id: String,
 ) -> anyhow::Result<IndexStartScanResult> {
+    start_scan_job_with_refresh(state, device_id, true)
+}
+
+fn start_scan_job_with_refresh(
+    state: Arc<Mutex<DaemonState>>,
+    device_id: String,
+    refresh_devices: bool,
+) -> anyhow::Result<IndexStartScanResult> {
     let (job_id, device, cancellation) = {
         let mut state = state.lock().unwrap();
-        state.refresh_devices();
+        if refresh_devices {
+            state.refresh_devices();
+        }
         let device = state
             .devices
             .iter()
-            .find(|device| device.metadata.device_id == device_id)
+            .find(|device| device.device_id == device_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown device {device_id}"))?;
+        let metadata = device.metadata.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                device
+                    .scan_unavailable_reason
+                    .as_deref()
+                    .unwrap_or("device cannot be scanned")
+            )
+        })?;
         if let Some(device_config) = state
             .config
             .devices
             .iter()
-            .find(|entry| entry.device_id == device.metadata.device_id)
+            .find(|entry| entry.device_id == metadata.device_id)
         {
             anyhow::ensure!(device_config.enabled, "device is disabled in config");
         }
@@ -641,8 +660,8 @@ fn start_scan_job(
         tracing::info!(
             job_id,
             device_id = %device_id,
-            dev_node = %device.metadata.dev_node,
-            fs_type = device.metadata.fs_type.as_str(),
+            dev_node = %metadata.dev_node,
+            fs_type = metadata.fs_type.as_str(),
             "queued scan job"
         );
 
@@ -679,7 +698,7 @@ fn run_scan_worker(worker: ScanWorkerState) {
     let start = Instant::now();
     tracing::info!(
         job_id = worker.job_id,
-        device_id = %worker.device.metadata.device_id,
+        device_id = %worker.device.device_id,
         "scan worker started"
     );
     let (config, scanner_socket) = {
@@ -703,7 +722,7 @@ fn run_scan_worker(worker: ScanWorkerState) {
         Err(err) => {
             tracing::warn!(
                 job_id = worker.job_id,
-                device_id = %worker.device.metadata.device_id,
+                device_id = %worker.device.device_id,
                 error = %format!("{err:#}"),
                 "scan worker failed"
             );
@@ -820,7 +839,7 @@ fn finish_daemon_job_success(
 
 fn finish_daemon_job_failed(worker: ScanWorkerState, message: String, start: Instant) {
     let cancelled = worker.cancellation.is_cancelled() || message.contains("scan cancelled");
-    let device_id = worker.device.metadata.device_id.clone();
+    let device_id = worker.device.device_id.clone();
     let mut state_sidecar = snapshot::load_index_state(&device_id)
         .ok()
         .flatten()
@@ -1110,14 +1129,15 @@ fn desired_watches(state: &Arc<Mutex<DaemonState>>) -> Vec<DesiredWatch> {
             let device = state
                 .devices
                 .iter()
-                .find(|device| device.metadata.device_id == index.metadata.device_id)?;
+                .find(|device| device.device_id == index.metadata.device_id)?;
+            let metadata = device.metadata.as_ref()?;
             if !device.mounted || device.primary_mount_point.trim().is_empty() {
                 return None;
             }
             Some(DesiredWatch {
                 device_id: index.metadata.device_id.clone(),
-                device_path: device.metadata.dev_node.clone(),
-                fs_type: device.metadata.fs_type,
+                device_path: metadata.dev_node.clone(),
+                fs_type: metadata.fs_type,
                 mount_point: device.primary_mount_point.clone(),
                 watched_directories: index
                     .records
@@ -1573,25 +1593,34 @@ fn scan_and_index_device(
     cancellation: &ScanCancellation,
     progress: &mut dyn FnMut(u8),
 ) -> anyhow::Result<(SearchIndex, String)> {
+    let metadata = device.metadata.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            device
+                .scan_unavailable_reason
+                .as_deref()
+                .unwrap_or("device cannot be scanned")
+        )
+    })?;
     if let Some(device_config) = config
         .devices
         .iter()
-        .find(|entry| entry.device_id == device.metadata.device_id)
+        .find(|entry| entry.device_id == metadata.device_id)
     {
         anyhow::ensure!(device_config.enabled, "device is disabled in config");
     }
 
     let scan = scan_with_scannerd(scanner_socket, device, cancellation, progress)?;
     tracing::debug!(
-        device_id = %device.metadata.device_id,
+        device_id = %metadata.device_id,
         "scan completed through scanner daemon"
     );
 
-    let mut index = SearchIndex::from_scan(device.metadata.clone(), scan, now_unix())?;
+    let mut index = SearchIndex::from_scan(metadata.clone(), scan, now_unix())?;
     if let Some(device_config) = config
         .devices
         .iter()
-        .find(|entry| entry.device_id == device.metadata.device_id)
+        .find(|entry| entry.device_id == metadata.device_id)
     {
         let rules = compile_rules(&device_config.rules)?;
         index = filter_index(index, &rules)?;
@@ -1605,9 +1634,18 @@ fn scan_with_scannerd(
     cancellation: &ScanCancellation,
     progress: &mut dyn FnMut(u8),
 ) -> anyhow::Result<ScanDatabase> {
+    let metadata = device.metadata.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            device
+                .scan_unavailable_reason
+                .as_deref()
+                .unwrap_or("device cannot be scanned")
+        )
+    })?;
     tracing::debug!(
         socket = %socket_path.display(),
-        device_id = %device.metadata.device_id,
+        device_id = %metadata.device_id,
         "connecting to scanner daemon"
     );
     let mut stream = UnixStream::connect(socket_path).map_err(|err| {
@@ -1621,8 +1659,8 @@ fn scan_with_scannerd(
         }
     })?;
     let params = ScannerStartScanParams {
-        device_path: device.metadata.dev_node.clone(),
-        fs_type: device.metadata.fs_type,
+        device_path: metadata.dev_node.clone(),
+        fs_type: metadata.fs_type,
     };
     write_frame(
         &mut stream,
@@ -1631,7 +1669,7 @@ fn scan_with_scannerd(
     let frame = read_until_response(&mut stream, 1, progress)?;
     let started: ScannerStartScanResult = result_as(&frame)?;
     tracing::info!(
-        device_id = %device.metadata.device_id,
+        device_id = %metadata.device_id,
         scanner_job_id = started.job_id,
         "scanner daemon job started"
     );
@@ -1670,7 +1708,7 @@ fn scan_with_scannerd(
         if frame.header.ok == Some(true) {
             let _result: oxidex_core::daemon_model::ScannerTakeResultResult = result_as(&frame)?;
             tracing::debug!(
-                device_id = %device.metadata.device_id,
+                device_id = %metadata.device_id,
                 scanner_job_id = started.job_id,
                 payload_bytes = frame.payload.len(),
                 "scanner daemon result received"
@@ -1879,6 +1917,31 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxidex_core::daemon_model::ScannerStatusDetail;
+    use oxidex_core::device::DeviceInfo;
+    use std::collections::HashMap;
+
+    fn daemon_state_with_device(device: DeviceInfo) -> Arc<Mutex<DaemonState>> {
+        Arc::new(Mutex::new(DaemonState {
+            config_path: PathBuf::from("/tmp/oxidex-test-config.toml"),
+            config: AppConfig::default(),
+            indexes: Vec::new(),
+            index_states: HashMap::new(),
+            devices: vec![device],
+            scanner_socket: PathBuf::from("/tmp/oxidex-test-scannerd.sock"),
+            scanner_status: ScannerStatusDetail {
+                socket: "/tmp/oxidex-test-scannerd.sock".into(),
+                reachable: false,
+                access_model: "unix_group_socket".into(),
+                peer_uid: None,
+                peer_gid: None,
+                last_error: None,
+            },
+            jobs: HashMap::new(),
+            watch_summaries: HashMap::new(),
+            next_job_id: 1,
+        }))
+    }
 
     #[test]
     fn permission_denied_watch_setup_sidecar_becomes_unavailable_not_stale() {
@@ -1906,5 +1969,29 @@ mod tests {
             state.last_error.as_deref(),
             Some("Permission denied (os error 13)")
         );
+    }
+
+    #[test]
+    fn unsupported_device_scan_is_rejected_before_queueing() {
+        let state = daemon_state_with_device(DeviceInfo {
+            metadata: None,
+            device_id: "dev:/dev/sr0".into(),
+            dev_node: "/dev/sr0".into(),
+            fs_type: None,
+            fs_type_name: "iso9660".into(),
+            label: "Install Media".into(),
+            uuid: String::new(),
+            partuuid: String::new(),
+            scan_supported: false,
+            scan_unavailable_reason: Some("Unsupported filesystem: iso9660".into()),
+            mounted: true,
+            mount_points: vec!["/run/media/install".into()],
+            primary_mount_point: "/run/media/install".into(),
+        });
+
+        let err =
+            start_scan_job_with_refresh(state.clone(), "dev:/dev/sr0".into(), false).unwrap_err();
+        assert_eq!(format!("{err:#}"), "Unsupported filesystem: iso9660");
+        assert!(state.lock().unwrap().jobs.is_empty());
     }
 }

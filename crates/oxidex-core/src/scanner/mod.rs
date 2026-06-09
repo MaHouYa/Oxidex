@@ -47,7 +47,7 @@ pub fn scan_device(
 ) -> anyhow::Result<ScanDatabase> {
     match fs_type {
         FsType::Ntfs => ntfs::scan(path, progress, cancellation),
-        FsType::Ext4 => ext4::scan(path, progress, cancellation),
+        FsType::Ext3 | FsType::Ext4 => ext4::scan(path, fs_type, progress, cancellation),
         FsType::Btrfs => btrfs::scan(path, progress, cancellation),
     }
 }

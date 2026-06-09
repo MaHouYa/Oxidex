@@ -320,8 +320,10 @@ fn en_us(key: Text) -> &'static str {
         Text::Date => "Date",
         Text::Modified => "Modified",
         Text::NoIndexesYet => "No indexes yet",
-        Text::OpenIndexesHint => "Open Indexes to index an NTFS, EXT4, or Btrfs device.",
-        Text::OpenIndexManagerHint => "Open Index Manager to index an NTFS, EXT4, or Btrfs device.",
+        Text::OpenIndexesHint => "Open Indexes to index an NTFS, EXT3, EXT4, or Btrfs device.",
+        Text::OpenIndexManagerHint => {
+            "Open Index Manager to index an NTFS, EXT3, EXT4, or Btrfs device."
+        }
         Text::NoResults => "No results",
         Text::TryDifferentSearchHint => {
             "Try a different name, wildcard, extension, path, or type filter."
@@ -447,8 +449,8 @@ fn zh_cn(key: Text) -> &'static str {
         Text::Date => "日期",
         Text::Modified => "修改时间",
         Text::NoIndexesYet => "还没有索引",
-        Text::OpenIndexesHint => "打开索引窗口，为 NTFS、EXT4 或 Btrfs 设备建立索引。",
-        Text::OpenIndexManagerHint => "打开索引管理器，为 NTFS、EXT4 或 Btrfs 设备建立索引。",
+        Text::OpenIndexesHint => "打开索引窗口，为 NTFS、EXT3、EXT4 或 Btrfs 设备建立索引。",
+        Text::OpenIndexManagerHint => "打开索引管理器，为 NTFS、EXT3、EXT4 或 Btrfs 设备建立索引。",
         Text::NoResults => "没有结果",
         Text::TryDifferentSearchHint => "尝试其他名称、通配符、扩展名、路径或类型过滤器。",
         Text::RescanThisDevice => "重新扫描此设备",

@@ -10,6 +10,7 @@ pub const FLAG_IS_SYMLINK: u8 = 1 << 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub enum FsType {
     Ntfs,
+    Ext3,
     Ext4,
     Btrfs,
 }
@@ -18,13 +19,14 @@ impl FsType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ntfs => "ntfs",
+            Self::Ext3 => "ext3",
             Self::Ext4 => "ext4",
             Self::Btrfs => "btrfs",
         }
     }
 
     pub fn is_supported_for_scan(self) -> bool {
-        matches!(self, Self::Ntfs | Self::Ext4 | Self::Btrfs)
+        matches!(self, Self::Ntfs | Self::Ext3 | Self::Ext4 | Self::Btrfs)
     }
 }
 
@@ -40,10 +42,23 @@ impl FromStr for FsType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "ntfs" => Ok(Self::Ntfs),
+            "ext3" => Ok(Self::Ext3),
             "ext4" => Ok(Self::Ext4),
             "btrfs" => Ok(Self::Btrfs),
             other => Err(format!("unsupported filesystem type: {other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ext3_is_supported_for_scan() {
+        assert_eq!("ext3".parse::<FsType>(), Ok(FsType::Ext3));
+        assert_eq!(FsType::Ext3.as_str(), "ext3");
+        assert!(FsType::Ext3.is_supported_for_scan());
     }
 }
 

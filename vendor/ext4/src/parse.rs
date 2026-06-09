@@ -280,7 +280,7 @@ where
         );
     }
 
-    {
+    if options.require_clean {
         const S_STATE_UNMOUNTED_CLEANLY: u16 = 0b01;
         const S_STATE_ERRORS_DETECTED: u16 = 0b10;
 

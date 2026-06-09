@@ -2,7 +2,7 @@
 
 Oxidex is a Linux desktop filename search utility inspired by Voidtools Everything. This branch rewrites the application in Rust with an unprivileged `egui` GUI, an unprivileged per-user daemon, and a small privileged scanner daemon protected by a `root:oxidex` Unix socket.
 
-The Rust app indexes NTFS, EXT4, and basic Btrfs devices by reading filesystem metadata instead of crawling mounted directories or reading file contents. Btrfs V2 support is native and read-only through Rust crates; it indexes the default/main root and treats other subvolumes as boundaries for now.
+The Rust app indexes NTFS, EXT3, EXT4, and basic Btrfs devices by reading filesystem metadata instead of crawling mounted directories or reading file contents. Btrfs V2 support is native and read-only through Rust crates; it indexes the default/main root and treats other subvolumes as boundaries for now.
 
 Oxidex is a community project and is not affiliated with Voidtools.
 
@@ -12,7 +12,7 @@ Credit: Oxidex builds on the original project foundation created by Reikooters. 
 
 For installation, first indexing, search examples, rofi usage, troubleshooting, and exporting debug logs, see the [Oxidex User Guide](docs/user-guide.md).
 
-Rename note: version 2.1.0 continues the public Oxidex line. Commands, crates, config paths, index paths, systemd units, and the scanner socket group use the `oxidex` name.
+Rename note: version 2.2.0 continues the public Oxidex line. Commands, crates, config paths, index paths, systemd units, and the scanner socket group use the `oxidex` name.
 
 ## Features
 
@@ -21,7 +21,7 @@ Rename note: version 2.1.0 continues the public Oxidex line. Commands, crates, c
 - Persistent multi-device indexes under `$XDG_DATA_HOME/oxidex/indexes/`.
 - Stable device IDs using `partuuid:<id>`, then `uuid:<filesystem-uuid>`, then `dev:<canonical-dev-node>`.
 - NTFS V1 scanner reads MFT metadata, preserves hard-link names as separate entries, filters duplicate DOS 8.3 aliases, and hides early `$` system files.
-- EXT4 V1 scanner reads filesystem metadata, inode metadata, and directory entries through a Rust-native crate.
+- EXT3/EXT4 scanner reads filesystem metadata, inode metadata, and directory entries through a Rust-native crate.
 - Btrfs V2 scanner reads the default/main root through Rust-native Btrfs metadata APIs and rejects unsupported multi-device layouts clearly.
 - Search uses Unicode lowercase folding plus byte trigrams for positive name tokens of length three or more, with substring refinement, short-token fallback, relevance sorting, wildcards, quoted phrases, negation, and `ext:`/`type:`/`path:`/`size:`/`mtime:` filters.
 - V4 daemon scans are queued, asynchronous, cancellable, and tracked through job status. Mounted indexed filesystems can be kept fresh through privileged scanner-daemon `notify`/inotify events.
@@ -208,7 +208,7 @@ Build a local `.deb` after a release build:
 scripts/package-deb.sh
 ```
 
-The package is written to `dist/oxidex_2.1.0_amd64.deb`. The GitHub Actions workflow in `.github/workflows/deb.yml` builds the same package inside an `ubuntu:20.04` job container and uploads it as a workflow artifact.
+The package is written to `dist/oxidex_2.2.0_amd64.deb`. The GitHub Actions workflow in `.github/workflows/deb.yml` builds the same package inside an `ubuntu:20.04` job container and uploads it as a workflow artifact.
 
 The Debian package installs the GUI, CLI, user daemon, scanner daemon, desktop file, systemd units, hicolor icons, and license into standard system paths.
 
@@ -220,9 +220,9 @@ The package creates a system group named `oxidex` for the privileged scanner soc
 
 The NTFS scanner reads the MFT and file-name attributes. It records parent relationships, name, size, modification time, directory flag, and symlink/reparse-point flag. Multiple hard-link names are indexed as separate records.
 
-### EXT4 V1
+### EXT3/EXT4
 
-The EXT4 scanner reads filesystem metadata through the Rust `ext4` crate. It does not scan the whole disk byte-by-byte and does not read regular file contents. Directory entries provide names and parent relationships, while inodes provide size, modification time, and type.
+The EXT3/EXT4 scanner reads filesystem metadata through the Rust `ext4` crate. It does not scan the whole disk byte-by-byte and does not read regular file contents. Directory entries provide names and parent relationships, while inodes provide size, modification time, and type.
 
 ### Btrfs V2
 

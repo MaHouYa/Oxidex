@@ -60,16 +60,19 @@ fn run() -> anyhow::Result<()> {
         "devices" => {
             for device in client.devices()? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     device.device_id,
-                    device.fs_type.as_str(),
+                    device.fs_type_name,
                     label_or_dash(&device.label),
                     if device.mounted {
                         "mounted"
                     } else {
                         "not-mounted"
                     },
-                    device.dev_node
+                    device.dev_node,
+                    device
+                        .scan_unavailable_reason
+                        .unwrap_or_else(|| "scan-supported".into())
                 );
             }
             Ok(())

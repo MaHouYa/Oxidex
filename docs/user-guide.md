@@ -204,7 +204,7 @@ The GUI and CLI can also start `oxidexd` themselves if the user socket is not ac
 
 Open the GUI and click **Indexes**.
 
-The Indexes window shows known NTFS, EXT4, and Btrfs devices. For each device, it shows the filesystem type, mount state, device node, entry count, scan jobs, and recent errors when available.
+The Indexes window shows known devices, including unsupported filesystems. Oxidex can index NTFS, EXT3, EXT4, and basic Btrfs devices; unsupported rows stay visible with a reason and disabled scan controls.
 
 To index a device:
 

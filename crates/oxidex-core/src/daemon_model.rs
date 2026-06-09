@@ -83,10 +83,13 @@ pub struct DaemonDoctorResult {
 pub struct DeviceSummary {
     pub device_id: String,
     pub dev_node: String,
-    pub fs_type: FsType,
+    pub fs_type: Option<FsType>,
+    pub fs_type_name: String,
     pub label: String,
     pub uuid: String,
     pub partuuid: String,
+    pub scan_supported: bool,
+    pub scan_unavailable_reason: Option<String>,
     pub mounted: bool,
     pub mount_points: Vec<String>,
     pub primary_mount_point: String,
@@ -402,12 +405,15 @@ pub struct ScannerWatchStoppedEvent {
 impl DeviceSummary {
     pub fn from_device(device: &DeviceInfo, index: Option<&SearchIndex>) -> Self {
         Self {
-            device_id: device.metadata.device_id.clone(),
-            dev_node: device.metadata.dev_node.clone(),
-            fs_type: device.metadata.fs_type,
-            label: device.metadata.label.clone(),
-            uuid: device.metadata.uuid.clone(),
-            partuuid: device.metadata.partuuid.clone(),
+            device_id: device.device_id.clone(),
+            dev_node: device.dev_node.clone(),
+            fs_type: device.fs_type,
+            fs_type_name: device.fs_type_name.clone(),
+            label: device.label.clone(),
+            uuid: device.uuid.clone(),
+            partuuid: device.partuuid.clone(),
+            scan_supported: device.scan_supported,
+            scan_unavailable_reason: device.scan_unavailable_reason.clone(),
             mounted: device.mounted,
             mount_points: device.mount_points.clone(),
             primary_mount_point: device.primary_mount_point.clone(),
@@ -438,5 +444,42 @@ impl IndexSummary {
         self.stale |= state.stale_reason.is_some();
         self.state = Some(state);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::DeviceInfo;
+
+    #[test]
+    fn device_summary_supports_unsupported_filesystems() {
+        let device = DeviceInfo {
+            metadata: None,
+            device_id: "dev:/dev/sr0".into(),
+            dev_node: "/dev/sr0".into(),
+            fs_type: None,
+            fs_type_name: "iso9660".into(),
+            label: "Install Media".into(),
+            uuid: "2026-06-01".into(),
+            partuuid: String::new(),
+            scan_supported: false,
+            scan_unavailable_reason: Some("Unsupported filesystem: iso9660".into()),
+            mounted: true,
+            mount_points: vec!["/run/media/install".into()],
+            primary_mount_point: "/run/media/install".into(),
+        };
+
+        let summary = DeviceSummary::from_device(&device, None);
+        let json = serde_json::to_value(&summary).unwrap();
+
+        assert_eq!(summary.fs_type, None);
+        assert_eq!(summary.fs_type_name, "iso9660");
+        assert!(!summary.scan_supported);
+        assert_eq!(
+            summary.scan_unavailable_reason.as_deref(),
+            Some("Unsupported filesystem: iso9660")
+        );
+        assert!(json.get("fs_type").unwrap().is_null());
     }
 }

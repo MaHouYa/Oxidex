@@ -187,6 +187,7 @@ pub fn write_index(mut w: impl Write, index: &SearchIndex) -> anyhow::Result<()>
         FsType::Ntfs => 1,
         FsType::Ext4 => 2,
         FsType::Btrfs => 3,
+        FsType::Ext3 => 4,
     })?;
     write_string(&mut w, &index.metadata.label)?;
     write_string(&mut w, &index.metadata.uuid)?;
@@ -221,6 +222,7 @@ pub fn read_index(mut r: impl Read) -> anyhow::Result<SearchIndex> {
         1 => FsType::Ntfs,
         2 => FsType::Ext4,
         3 => FsType::Btrfs,
+        4 => FsType::Ext3,
         other => anyhow::bail!("unknown snapshot filesystem tag {other}"),
     };
     let label = read_string(&mut r)?;
@@ -491,8 +493,8 @@ mod tests {
     use crate::index::SearchIndex;
     use crate::model::{DeviceMetadata, FsType, ROOT_PARENT, ScanDatabase};
 
-    fn sample_index() -> SearchIndex {
-        let mut scan = ScanDatabase::new(FsType::Ext4);
+    fn sample_index_with_fs(fs_type: FsType) -> SearchIndex {
+        let mut scan = ScanDatabase::new(fs_type);
         scan.push_record(ROOT_PARENT, "", 0, 0, true, false)
             .unwrap();
         scan.push_record(0, "hello.txt", 5, 100, false, false)
@@ -501,7 +503,7 @@ mod tests {
             DeviceMetadata {
                 device_id: "uuid:test".into(),
                 dev_node: "/dev/test".into(),
-                fs_type: FsType::Ext4,
+                fs_type,
                 label: "Test".into(),
                 uuid: "test".into(),
                 partuuid: String::new(),
@@ -510,6 +512,10 @@ mod tests {
             42,
         )
         .unwrap()
+    }
+
+    fn sample_index() -> SearchIndex {
+        sample_index_with_fs(FsType::Ext4)
     }
 
     #[test]
@@ -549,6 +555,15 @@ mod tests {
         write_index(&mut bytes, &index).unwrap();
 
         assert!(read_index(&bytes[..]).is_err());
+    }
+
+    #[test]
+    fn snapshot_ext3_roundtrip() {
+        let index = sample_index_with_fs(FsType::Ext3);
+        let mut bytes = Vec::new();
+        write_index(&mut bytes, &index).unwrap();
+        let decoded = read_index(&bytes[..]).unwrap();
+        assert_eq!(decoded.metadata.fs_type, FsType::Ext3);
     }
 
     #[test]

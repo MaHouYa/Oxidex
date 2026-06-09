@@ -10,7 +10,16 @@ use crate::model::{DeviceMetadata, FsType};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeviceInfo {
-    pub metadata: DeviceMetadata,
+    pub metadata: Option<DeviceMetadata>,
+    pub device_id: String,
+    pub dev_node: String,
+    pub fs_type: Option<FsType>,
+    pub fs_type_name: String,
+    pub label: String,
+    pub uuid: String,
+    pub partuuid: String,
+    pub scan_supported: bool,
+    pub scan_unavailable_reason: Option<String>,
     pub mounted: bool,
     pub mount_points: Vec<String>,
     pub primary_mount_point: String,
@@ -23,6 +32,7 @@ struct Candidate {
     partuuid: String,
     label: String,
     fs_type: Option<FsType>,
+    fs_type_name: String,
 }
 
 pub fn list_known_devices() -> anyhow::Result<Vec<DeviceInfo>> {
@@ -33,6 +43,7 @@ pub fn list_known_devices() -> anyhow::Result<Vec<DeviceInfo>> {
     add_symlink_dir(&mut by_dev, "/dev/disk/by-uuid", LinkKind::Uuid)?;
     add_symlink_dir(&mut by_dev, "/dev/disk/by-label", LinkKind::Label)?;
     add_udev_devices(&mut by_dev)?;
+    add_mounted_devices(&mut by_dev, &mount_info)?;
 
     for cand in by_dev.values_mut() {
         if let Ok(meta) = fs::metadata(&cand.dev_node) {
@@ -47,10 +58,11 @@ pub fn list_known_devices() -> anyhow::Result<Vec<DeviceInfo>> {
                 if cand.label.is_empty() {
                     cand.label = udev.get("ID_FS_LABEL").cloned().unwrap_or_default();
                 }
-                if cand.fs_type.is_none() {
-                    cand.fs_type = udev
-                        .get("ID_FS_TYPE")
-                        .and_then(|s| FsType::from_str(s).ok());
+                if cand.fs_type.is_none()
+                    && let Some(fs_type_name) = udev.get("ID_FS_TYPE")
+                {
+                    cand.fs_type_name = fs_type_name.to_ascii_lowercase();
+                    cand.fs_type = FsType::from_str(fs_type_name).ok();
                 }
             }
         }
@@ -58,9 +70,9 @@ pub fn list_known_devices() -> anyhow::Result<Vec<DeviceInfo>> {
 
     let mut out = Vec::new();
     for cand in by_dev.into_values() {
-        let Some(fs_type) = cand.fs_type else {
+        if cand.fs_type.is_none() && cand.fs_type_name.is_empty() {
             continue;
-        };
+        }
 
         let device_id = if !cand.partuuid.is_empty() {
             format!("partuuid:{}", cand.partuuid.to_ascii_lowercase())
@@ -85,15 +97,36 @@ pub fn list_known_devices() -> anyhow::Result<Vec<DeviceInfo>> {
         mount_points.dedup();
 
         let primary_mount_point = pick_primary_mount_point(&mount_points);
+        let fs_type_name = match cand.fs_type {
+            Some(fs_type) => fs_type.as_str().to_owned(),
+            None if cand.fs_type_name.is_empty() => "unknown".to_owned(),
+            None => cand.fs_type_name.clone(),
+        };
+        let scan_supported = cand
+            .fs_type
+            .map(FsType::is_supported_for_scan)
+            .unwrap_or(false);
+        let scan_unavailable_reason =
+            (!scan_supported).then(|| format!("Unsupported filesystem: {}", fs_type_name));
+        let metadata = cand.fs_type.map(|fs_type| DeviceMetadata {
+            device_id: device_id.clone(),
+            dev_node: cand.dev_node.clone(),
+            fs_type,
+            label: cand.label.clone(),
+            uuid: cand.uuid.to_ascii_lowercase(),
+            partuuid: cand.partuuid.to_ascii_lowercase(),
+        });
         out.push(DeviceInfo {
-            metadata: DeviceMetadata {
-                device_id,
-                dev_node: cand.dev_node,
-                fs_type,
-                label: cand.label,
-                uuid: cand.uuid.to_ascii_lowercase(),
-                partuuid: cand.partuuid.to_ascii_lowercase(),
-            },
+            metadata,
+            device_id,
+            dev_node: cand.dev_node,
+            fs_type: cand.fs_type,
+            fs_type_name,
+            label: cand.label,
+            uuid: cand.uuid.to_ascii_lowercase(),
+            partuuid: cand.partuuid.to_ascii_lowercase(),
+            scan_supported,
+            scan_unavailable_reason,
             mounted: !mount_points.is_empty(),
             mount_points,
             primary_mount_point,
@@ -101,10 +134,9 @@ pub fn list_known_devices() -> anyhow::Result<Vec<DeviceInfo>> {
     }
 
     out.sort_by(|a, b| {
-        a.metadata
-            .label
-            .cmp(&b.metadata.label)
-            .then_with(|| a.metadata.dev_node.cmp(&b.metadata.dev_node))
+        a.label
+            .cmp(&b.label)
+            .then_with(|| a.dev_node.cmp(&b.dev_node))
     });
     Ok(out)
 }
@@ -112,7 +144,7 @@ pub fn list_known_devices() -> anyhow::Result<Vec<DeviceInfo>> {
 pub fn find_device_by_id(device_id: &str) -> anyhow::Result<Option<DeviceInfo>> {
     Ok(list_known_devices()?
         .into_iter()
-        .find(|dev| dev.metadata.device_id == device_id))
+        .find(|dev| dev.device_id == device_id))
 }
 
 pub fn current_mount_for(device_id: &str) -> anyhow::Result<Option<String>> {
@@ -196,10 +228,11 @@ fn add_udev_devices(by_dev: &mut HashMap<String, Candidate>) -> anyhow::Result<(
         if cand.label.is_empty() {
             cand.label = udev.get("ID_FS_LABEL").cloned().unwrap_or_default();
         }
-        if cand.fs_type.is_none() {
-            cand.fs_type = udev
-                .get("ID_FS_TYPE")
-                .and_then(|s| FsType::from_str(s).ok());
+        if cand.fs_type.is_none()
+            && let Some(fs_type_name) = udev.get("ID_FS_TYPE")
+        {
+            cand.fs_type_name = fs_type_name.to_ascii_lowercase();
+            cand.fs_type = FsType::from_str(fs_type_name).ok();
         }
     }
 
@@ -226,6 +259,31 @@ fn read_udev_data(key: &str) -> Option<HashMap<String, String>> {
 struct MountInfoEntry {
     mount_point: String,
     mount_source: String,
+    fs_type_name: String,
+}
+
+fn add_mounted_devices(
+    by_dev: &mut HashMap<String, Candidate>,
+    mount_info: &[MountInfoEntry],
+) -> anyhow::Result<()> {
+    for mi in mount_info {
+        if !mi.mount_source.starts_with("/dev/") {
+            continue;
+        }
+        let Ok(real) = fs::canonicalize(&mi.mount_source) else {
+            continue;
+        };
+        let dev_node = real.to_string_lossy().to_string();
+        let cand = by_dev.entry(dev_node.clone()).or_insert_with(|| Candidate {
+            dev_node,
+            ..Candidate::default()
+        });
+        if cand.fs_type.is_none() && !mi.fs_type_name.is_empty() {
+            cand.fs_type_name = mi.fs_type_name.to_ascii_lowercase();
+            cand.fs_type = FsType::from_str(&mi.fs_type_name).ok();
+        }
+    }
+    Ok(())
 }
 
 fn read_mount_info() -> anyhow::Result<Vec<MountInfoEntry>> {
@@ -242,6 +300,7 @@ fn read_mount_info() -> anyhow::Result<Vec<MountInfoEntry>> {
         }
         out.push(MountInfoEntry {
             mount_point: unescape_mountinfo(left_fields[4]),
+            fs_type_name: right_fields[0].to_ascii_lowercase(),
             mount_source: unescape_mountinfo(right_fields[1]),
         });
     }
