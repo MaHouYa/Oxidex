@@ -125,8 +125,18 @@ fn init_terminal_logging(binary: &str, debug: bool, log_level: Option<&str>) {
     }
 }
 
-fn update_ime_tracking(ctx: &egui::Context, composing: &mut bool) {
+#[derive(Clone, Debug, Default)]
+struct ImeFrame {
+    composing: bool,
+    commit_text: Option<String>,
+}
+
+fn update_ime_tracking(ctx: &egui::Context, composing: &mut bool) -> ImeFrame {
     let debug_enabled = tracing::enabled!(tracing::Level::DEBUG);
+    let mut frame = ImeFrame {
+        composing: *composing,
+        commit_text: None,
+    };
     ctx.input(|input| {
         for event in &input.events {
             let egui::Event::Ime(ime_event) = event else {
@@ -134,13 +144,13 @@ fn update_ime_tracking(ctx: &egui::Context, composing: &mut bool) {
             };
             match ime_event {
                 egui::ImeEvent::Enabled => {
-                    *composing = true;
                     if debug_enabled {
                         tracing::debug!("IME enabled");
                     }
                 }
                 egui::ImeEvent::Preedit(text) => {
                     *composing = !text.is_empty();
+                    frame.composing = *composing;
                     if debug_enabled {
                         tracing::debug!(
                             chars = text.chars().count(),
@@ -151,6 +161,10 @@ fn update_ime_tracking(ctx: &egui::Context, composing: &mut bool) {
                 }
                 egui::ImeEvent::Commit(text) => {
                     *composing = false;
+                    frame.composing = false;
+                    if !text.is_empty() {
+                        frame.commit_text = Some(text.clone());
+                    }
                     if debug_enabled {
                         tracing::debug!(
                             chars = text.chars().count(),
@@ -161,6 +175,7 @@ fn update_ime_tracking(ctx: &egui::Context, composing: &mut bool) {
                 }
                 egui::ImeEvent::Disabled => {
                     *composing = false;
+                    frame.composing = false;
                     if debug_enabled {
                         tracing::debug!("IME disabled");
                     }
@@ -168,6 +183,7 @@ fn update_ime_tracking(ctx: &egui::Context, composing: &mut bool) {
             }
         }
     });
+    frame
 }
 
 fn keep_ime_enabled(response: &egui::Response) {
@@ -183,6 +199,99 @@ fn keep_ime_enabled(response: &egui::Response) {
         response
             .ctx
             .send_viewport_cmd(egui::ViewportCommand::IMERect(response.rect));
+    }
+}
+
+fn ime_singleline_text_edit(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    id_salt: &'static str,
+    hint_text: impl Into<egui::WidgetText>,
+    desired_width: f32,
+    ime_frame: &ImeFrame,
+) -> (egui::Response, bool) {
+    let id = ui.make_persistent_id(id_salt);
+    let before = text.clone();
+    let before_cursor_range =
+        egui::TextEdit::load_state(ui.ctx(), id).and_then(|state| state.cursor.char_range());
+    let output = egui::TextEdit::singleline(text)
+        .id(id)
+        .hint_text(hint_text)
+        .desired_width(desired_width)
+        .show(ui);
+    keep_ime_enabled(&output.response);
+
+    let mut changed = output.response.changed();
+    if output.response.has_focus()
+        && let Some(commit_text) = ime_frame.commit_text.as_deref()
+        && !commit_text.is_empty()
+        && let Some(range) = before_cursor_range
+    {
+        let expected = replace_char_range(&before, range, commit_text);
+        let should_restore = !range.is_empty() || *text == before;
+        if should_restore && expected != *text {
+            let insert_at = range.sorted_cursors()[0].index + commit_text.chars().count();
+            *text = expected;
+            changed = true;
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(insert_at),
+                    )));
+                egui::TextEdit::store_state(ui.ctx(), id, state);
+            }
+            tracing::debug!(
+                id = id_salt,
+                chars = commit_text.chars().count(),
+                "restored IME commit text after text edit dropped it"
+            );
+        }
+    }
+
+    (output.response.response, changed)
+}
+
+fn replace_char_range(source: &str, range: egui::text::CCursorRange, replacement: &str) -> String {
+    let [min, max] = range.sorted_cursors();
+    let start = byte_index_for_char(source, min.index);
+    let end = byte_index_for_char(source, max.index);
+    let mut out = String::with_capacity(source.len() + replacement.len());
+    out.push_str(&source[..start.min(end)]);
+    out.push_str(replacement);
+    out.push_str(&source[end.max(start)..]);
+    out
+}
+
+fn byte_index_for_char(source: &str, char_index: usize) -> usize {
+    source
+        .char_indices()
+        .nth(char_index)
+        .map(|(idx, _)| idx)
+        .unwrap_or(source.len())
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+
+    #[test]
+    fn replace_char_range_inserts_cjk_at_cursor() {
+        let range = egui::text::CCursorRange::one(egui::text::CCursor::new(3));
+        assert_eq!(replace_char_range("abc", range, "你"), "abc你");
+    }
+
+    #[test]
+    fn replace_char_range_replaces_preedit_selection() {
+        let range =
+            egui::text::CCursorRange::two(egui::text::CCursor::new(3), egui::text::CCursor::new(5));
+        assert_eq!(replace_char_range("abcni.txt", range, "你"), "abc你.txt");
+    }
+
+    #[test]
+    fn replace_char_range_uses_character_indices_not_bytes() {
+        let range = egui::text::CCursorRange::one(egui::text::CCursor::new(2));
+        assert_eq!(replace_char_range("测a", range, "试"), "测a试");
     }
 }
 
@@ -655,7 +764,7 @@ impl DaemonGuiApp {
 impl eframe::App for DaemonGuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        update_ime_tracking(&ctx, &mut self.ime_composing);
+        let ime_frame = update_ime_tracking(&ctx, &mut self.ime_composing);
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
             self.open_selected();
         }
@@ -738,19 +847,20 @@ impl eframe::App for DaemonGuiApp {
                     self.show_filters = !self.show_filters;
                 }
                 let search_hint = self.t(Text::SearchHintDaemon);
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .id_salt("daemon-search-query")
-                        .hint_text(search_hint)
-                        .desired_width(f32::INFINITY),
+                let (_response, changed) = ime_singleline_text_edit(
+                    ui,
+                    &mut self.query,
+                    "daemon-search-query",
+                    search_hint,
+                    f32::INFINITY,
+                    &ime_frame,
                 );
-                keep_ime_enabled(&response);
-                if response.changed() && !self.ime_composing {
+                if changed && !ime_frame.composing {
                     self.recompute_rows();
                 }
             });
             if self.show_filters {
-                self.daemon_filter_panel(ui);
+                self.daemon_filter_panel(ui, &ime_frame);
             }
             if let Some(summary) = self.filter_summary() {
                 ui.small(summary);
@@ -786,7 +896,7 @@ impl eframe::App for DaemonGuiApp {
 }
 
 impl DaemonGuiApp {
-    fn daemon_filter_panel(&mut self, ui: &mut egui::Ui) {
+    fn daemon_filter_panel(&mut self, ui: &mut egui::Ui, ime_frame: &ImeFrame) {
         let mut changed = false;
         ui.horizontal(|ui| {
             let ext_label = self.t(Text::Ext);
@@ -798,14 +908,15 @@ impl DaemonGuiApp {
             let path_label = self.t(Text::Path);
             let clear_label = self.t(Text::Clear);
             ui.label(ext_label);
-            let extensions_response = ui.add(
-                egui::TextEdit::singleline(&mut self.filter_extensions)
-                    .id_salt("daemon-filter-extensions")
-                    .hint_text("rs,txt")
-                    .desired_width(140.0),
+            let (_extensions_response, extensions_changed) = ime_singleline_text_edit(
+                ui,
+                &mut self.filter_extensions,
+                "daemon-filter-extensions",
+                "rs,txt",
+                140.0,
+                ime_frame,
             );
-            keep_ime_enabled(&extensions_response);
-            changed |= extensions_response.changed();
+            changed |= extensions_changed;
             ui.label(type_label);
             let before_type = self.filter_type;
             egui::ComboBox::from_id_salt("daemon-type-filter")
@@ -830,14 +941,15 @@ impl DaemonGuiApp {
                 });
             changed |= before_type != self.filter_type;
             ui.label(path_label);
-            let path_response = ui.add(
-                egui::TextEdit::singleline(&mut self.filter_path)
-                    .id_salt("daemon-filter-path")
-                    .hint_text("src")
-                    .desired_width(180.0),
+            let (_path_response, path_changed) = ime_singleline_text_edit(
+                ui,
+                &mut self.filter_path,
+                "daemon-filter-path",
+                "src",
+                180.0,
+                ime_frame,
             );
-            keep_ime_enabled(&path_response);
-            changed |= path_response.changed();
+            changed |= path_changed;
             if ui.button(clear_label).clicked() {
                 self.filter_extensions.clear();
                 self.filter_path.clear();
@@ -845,7 +957,7 @@ impl DaemonGuiApp {
                 changed = true;
             }
         });
-        if changed && !self.ime_composing {
+        if changed && !ime_frame.composing {
             self.recompute_rows();
         }
     }
@@ -1596,7 +1708,7 @@ impl OxidexApp {
 impl eframe::App for OxidexApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        update_ime_tracking(&ctx, &mut self.ime_composing);
+        let ime_frame = update_ime_tracking(&ctx, &mut self.ime_composing);
         self.handle_keyboard(&ctx);
         if self.scan_job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1659,20 +1771,21 @@ impl eframe::App for OxidexApp {
                 }
 
                 let search_hint = self.t(Text::SearchHint);
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .id_salt("standalone-search-query")
-                        .hint_text(search_hint)
-                        .desired_width(f32::INFINITY),
+                let (_response, changed) = ime_singleline_text_edit(
+                    ui,
+                    &mut self.query,
+                    "standalone-search-query",
+                    search_hint,
+                    f32::INFINITY,
+                    &ime_frame,
                 );
-                keep_ime_enabled(&response);
-                if response.changed() && !self.ime_composing {
+                if changed && !ime_frame.composing {
                     self.recompute_hits();
                 }
             });
             if self.show_filters {
                 ui.separator();
-                self.filter_panel(ui);
+                self.filter_panel(ui, &ime_frame);
             }
             if let Some(summary) = self.filter_summary() {
                 ui.horizontal_wrapped(|ui| {
@@ -1747,7 +1860,7 @@ impl OxidexApp {
         }
     }
 
-    fn filter_panel(&mut self, ui: &mut egui::Ui) {
+    fn filter_panel(&mut self, ui: &mut egui::Ui, ime_frame: &ImeFrame) {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             let extension_label = self.t(Text::Extension);
@@ -1759,14 +1872,15 @@ impl OxidexApp {
             let path_label = self.t(Text::Path);
             let clear_filters_label = self.t(Text::ClearFilters);
             ui.label(extension_label);
-            let extensions_response = ui.add(
-                egui::TextEdit::singleline(&mut self.filter_extensions)
-                    .id_salt("standalone-filter-extensions")
-                    .hint_text("rs,txt")
-                    .desired_width(120.0),
+            let (_extensions_response, extensions_changed) = ime_singleline_text_edit(
+                ui,
+                &mut self.filter_extensions,
+                "standalone-filter-extensions",
+                "rs,txt",
+                120.0,
+                ime_frame,
             );
-            keep_ime_enabled(&extensions_response);
-            changed |= extensions_response.changed();
+            changed |= extensions_changed;
 
             ui.label(type_label);
             egui::ComboBox::from_id_salt("type-filter")
@@ -1799,14 +1913,15 @@ impl OxidexApp {
                 });
 
             ui.label(path_label);
-            let path_response = ui.add(
-                egui::TextEdit::singleline(&mut self.filter_path)
-                    .id_salt("standalone-filter-path")
-                    .hint_text("src")
-                    .desired_width(180.0),
+            let (_path_response, path_changed) = ime_singleline_text_edit(
+                ui,
+                &mut self.filter_path,
+                "standalone-filter-path",
+                "src",
+                180.0,
+                ime_frame,
             );
-            keep_ime_enabled(&path_response);
-            changed |= path_response.changed();
+            changed |= path_changed;
 
             if ui.button(clear_filters_label).clicked() {
                 self.filter_extensions.clear();
@@ -1816,7 +1931,7 @@ impl OxidexApp {
             }
         });
 
-        if changed && !self.ime_composing {
+        if changed && !ime_frame.composing {
             self.recompute_hits();
         }
     }
