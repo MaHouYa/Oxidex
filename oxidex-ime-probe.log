@@ -1,0 +1,393 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running `target/debug/examples/ime_probe`
+frame 214 field=prefilled changed=false focus=true gained=true lost=false before="abc" after="abc"
+frame 216 IME Disabled
+frame 216 IME Disabled
+frame 217 IME Disabled
+frame 218 IME Disabled
+frame 219 IME Disabled
+frame 220 IME Disabled
+frame 221 IME Disabled
+frame 222 IME Disabled
+frame 223 IME Disabled
+frame 224 IME Disabled
+frame 225 IME Disabled
+frame 226 IME Disabled
+frame 227 IME Disabled
+frame 228 IME Disabled
+frame 229 IME Disabled
+frame 230 IME Disabled
+frame 231 IME Disabled
+frame 232 IME Disabled
+frame 233 IME Disabled
+frame 234 IME Disabled
+frame 235 IME Disabled
+frame 236 IME Disabled
+frame 237 IME Disabled
+frame 238 IME Disabled
+frame 239 IME Disabled
+frame 240 IME Disabled
+frame 241 IME Disabled
+frame 242 IME Disabled
+frame 243 IME Disabled
+frame 244 IME Disabled
+frame 245 IME Disabled
+frame 246 IME Disabled
+frame 247 IME Disabled
+frame 248 IME Disabled
+frame 249 IME Disabled
+frame 250 IME Disabled
+frame 251 IME Disabled
+frame 252 IME Disabled
+frame 253 IME Disabled
+frame 254 IME Disabled
+frame 255 IME Disabled
+frame 256 IME Disabled
+frame 257 IME Disabled
+frame 258 IME Disabled
+frame 259 IME Disabled
+frame 260 IME Disabled
+frame 261 IME Disabled
+frame 262 IME Disabled
+frame 263 IME Disabled
+frame 264 IME Disabled
+frame 265 IME Disabled
+frame 266 IME Disabled
+frame 267 IME Disabled
+frame 268 IME Disabled
+frame 269 IME Disabled
+frame 270 IME Disabled
+frame 271 IME Disabled
+frame 272 IME Disabled
+frame 273 IME Disabled
+frame 274 IME Disabled
+frame 275 IME Disabled
+frame 276 IME Disabled
+frame 277 IME Disabled
+frame 278 IME Disabled
+frame 279 IME Disabled
+frame 280 IME Disabled
+frame 281 IME Disabled
+frame 282 IME Disabled
+frame 283 IME Disabled
+frame 283 IME Enabled
+frame 283 IME Preedit chars=1 bytes=1 text="n"
+frame 283 field=prefilled changed=true focus=true gained=false lost=false before="abc" after="abcn"
+frame 284 IME Preedit chars=1 bytes=1 text="n"
+frame 284 field=prefilled changed=true focus=true gained=false lost=false before="abcn" after="abcn"
+frame 285 IME Preedit chars=1 bytes=1 text="n"
+frame 285 field=prefilled changed=true focus=true gained=false lost=false before="abcn" after="abcn"
+frame 286 IME Preedit chars=1 bytes=1 text="n"
+frame 286 field=prefilled changed=true focus=true gained=false lost=false before="abcn" after="abcn"
+frame 287 IME Preedit chars=1 bytes=1 text="n"
+frame 287 field=prefilled changed=true focus=true gained=false lost=false before="abcn" after="abcn"
+frame 288 IME Preedit chars=2 bytes=2 text="ni"
+frame 288 IME Preedit chars=2 bytes=2 text="ni"
+frame 288 field=prefilled changed=true focus=true gained=false lost=false before="abcn" after="abcni"
+frame 289 IME Preedit chars=2 bytes=2 text="ni"
+frame 289 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni"
+frame 290 IME Preedit chars=2 bytes=2 text="ni"
+frame 290 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni"
+frame 291 IME Preedit chars=2 bytes=2 text="ni"
+frame 291 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni"
+frame 292 IME Preedit chars=2 bytes=2 text="ni"
+frame 292 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni"
+frame 293 IME Preedit chars=2 bytes=2 text="ni"
+frame 293 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni"
+frame 294 IME Preedit chars=2 bytes=2 text="ni"
+frame 294 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni"
+frame 295 IME Preedit chars=2 bytes=2 text="ni"
+frame 295 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni"
+frame 296 IME Preedit chars=2 bytes=2 text="ni"
+frame 296 IME Preedit chars=4 bytes=4 text="ni h"
+frame 296 field=prefilled changed=true focus=true gained=false lost=false before="abcni" after="abcni h"
+frame 297 IME Preedit chars=4 bytes=4 text="ni h"
+frame 297 field=prefilled changed=true focus=true gained=false lost=false before="abcni h" after="abcni h"
+frame 298 IME Preedit chars=4 bytes=4 text="ni h"
+frame 298 field=prefilled changed=true focus=true gained=false lost=false before="abcni h" after="abcni h"
+frame 299 IME Preedit chars=4 bytes=4 text="ni h"
+frame 299 field=prefilled changed=true focus=true gained=false lost=false before="abcni h" after="abcni h"
+frame 300 IME Preedit chars=4 bytes=4 text="ni h"
+frame 300 field=prefilled changed=true focus=true gained=false lost=false before="abcni h" after="abcni h"
+frame 301 IME Preedit chars=4 bytes=4 text="ni h"
+frame 301 field=prefilled changed=true focus=true gained=false lost=false before="abcni h" after="abcni h"
+frame 302 IME Preedit chars=4 bytes=4 text="ni h"
+frame 302 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 302 field=prefilled changed=true focus=true gained=false lost=false before="abcni h" after="abcni ha"
+frame 303 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 303 field=prefilled changed=true focus=true gained=false lost=false before="abcni ha" after="abcni ha"
+frame 304 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 304 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 304 field=prefilled changed=true focus=true gained=false lost=false before="abcni ha" after="abcni hao"
+frame 305 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 305 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 306 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 306 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 307 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 307 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 308 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 308 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 309 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 309 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 310 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 310 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 311 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 311 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 312 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 312 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 313 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 313 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 314 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 314 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 315 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 315 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 316 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 316 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 317 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 317 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 318 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 318 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 319 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 319 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 320 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 320 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 321 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 321 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 322 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 322 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abcni hao"
+frame 323 IME Disabled
+frame 323 IME Commit chars=2 bytes=6 text="你好"
+frame 323 IME Disabled
+frame 323 IME Enabled
+frame 323 IME Preedit chars=0 bytes=0 text=""
+frame 323 IME Disabled
+frame 323 field=prefilled changed=true focus=true gained=false lost=false before="abcni hao" after="abc你好"
+frame 324 IME Disabled
+frame 325 IME Disabled
+frame 326 IME Disabled
+frame 327 IME Disabled
+frame 328 IME Disabled
+frame 329 IME Disabled
+frame 330 IME Disabled
+frame 331 IME Disabled
+frame 332 IME Disabled
+frame 333 IME Disabled
+frame 334 IME Disabled
+frame 335 IME Disabled
+frame 336 IME Disabled
+frame 337 IME Disabled
+frame 338 IME Disabled
+frame 339 IME Disabled
+frame 340 IME Disabled
+frame 341 IME Disabled
+frame 342 IME Disabled
+frame 343 IME Disabled
+frame 344 IME Disabled
+frame 345 IME Disabled
+frame 346 IME Disabled
+frame 347 IME Disabled
+frame 348 IME Disabled
+frame 349 IME Disabled
+frame 350 IME Disabled
+frame 351 IME Disabled
+frame 352 IME Disabled
+frame 353 IME Disabled
+frame 354 IME Disabled
+frame 355 IME Disabled
+frame 356 IME Disabled
+frame 357 IME Disabled
+frame 358 IME Disabled
+frame 359 IME Disabled
+frame 360 IME Disabled
+frame 361 IME Disabled
+frame 362 IME Disabled
+frame 363 IME Disabled
+frame 364 IME Disabled
+frame 365 IME Disabled
+frame 365 field=unicode_prefix changed=false focus=true gained=true lost=false before="测试" after="测试"
+frame 366 IME Disabled
+frame 367 IME Disabled
+frame 368 IME Disabled
+frame 369 IME Disabled
+frame 370 IME Disabled
+frame 371 IME Disabled
+frame 372 IME Disabled
+frame 373 IME Disabled
+frame 374 IME Disabled
+frame 375 IME Disabled
+frame 376 IME Disabled
+frame 377 IME Disabled
+frame 378 IME Disabled
+frame 379 IME Disabled
+frame 380 IME Disabled
+frame 381 IME Disabled
+frame 382 IME Disabled
+frame 383 IME Disabled
+frame 384 IME Disabled
+frame 385 IME Disabled
+frame 386 IME Disabled
+frame 387 IME Disabled
+frame 388 IME Disabled
+frame 389 IME Disabled
+frame 390 IME Disabled
+frame 391 IME Disabled
+frame 392 IME Disabled
+frame 393 IME Disabled
+frame 394 IME Disabled
+frame 395 IME Disabled
+frame 396 IME Disabled
+frame 397 IME Disabled
+frame 398 IME Disabled
+frame 399 IME Disabled
+frame 400 IME Disabled
+frame 401 IME Disabled
+frame 402 IME Disabled
+frame 403 IME Disabled
+frame 404 IME Disabled
+frame 405 IME Disabled
+frame 406 IME Disabled
+frame 407 IME Disabled
+frame 407 IME Enabled
+frame 407 IME Preedit chars=1 bytes=1 text="n"
+frame 407 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试" after="测试n"
+frame 408 IME Preedit chars=1 bytes=1 text="n"
+frame 408 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试n" after="测试n"
+frame 409 IME Preedit chars=2 bytes=2 text="ni"
+frame 409 IME Preedit chars=2 bytes=2 text="ni"
+frame 409 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试n" after="测试ni"
+frame 410 IME Preedit chars=2 bytes=2 text="ni"
+frame 410 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 411 IME Preedit chars=2 bytes=2 text="ni"
+frame 411 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 412 IME Preedit chars=2 bytes=2 text="ni"
+frame 412 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 413 IME Preedit chars=2 bytes=2 text="ni"
+frame 413 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 414 IME Preedit chars=2 bytes=2 text="ni"
+frame 414 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 415 IME Preedit chars=2 bytes=2 text="ni"
+frame 415 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 416 IME Preedit chars=2 bytes=2 text="ni"
+frame 416 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 417 IME Preedit chars=2 bytes=2 text="ni"
+frame 417 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni"
+frame 418 IME Preedit chars=2 bytes=2 text="ni"
+frame 418 IME Preedit chars=4 bytes=4 text="ni h"
+frame 418 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni" after="测试ni h"
+frame 419 IME Preedit chars=4 bytes=4 text="ni h"
+frame 419 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni h" after="测试ni h"
+frame 420 IME Preedit chars=4 bytes=4 text="ni h"
+frame 420 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni h" after="测试ni h"
+frame 421 IME Preedit chars=4 bytes=4 text="ni h"
+frame 421 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni h" after="测试ni h"
+frame 422 IME Preedit chars=4 bytes=4 text="ni h"
+frame 422 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 422 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni h" after="测试ni ha"
+frame 423 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 423 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni ha" after="测试ni ha"
+frame 424 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 424 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni ha" after="测试ni ha"
+frame 425 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 425 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni ha" after="测试ni ha"
+frame 426 IME Preedit chars=5 bytes=5 text="ni ha"
+frame 426 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 426 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni ha" after="测试ni hao"
+frame 427 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 427 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 428 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 428 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 429 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 429 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 430 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 430 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 431 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 431 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 432 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 432 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 433 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 433 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 434 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 434 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 435 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 435 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 436 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 436 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 437 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 437 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 438 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 438 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 439 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 439 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 440 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 440 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 441 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 441 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 442 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 442 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 443 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 443 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 444 IME Preedit chars=6 bytes=6 text="ni hao"
+frame 444 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试ni hao"
+frame 445 IME Disabled
+frame 445 IME Commit chars=2 bytes=6 text="你好"
+frame 445 IME Disabled
+frame 445 IME Enabled
+frame 445 IME Preedit chars=0 bytes=0 text=""
+frame 445 IME Disabled
+frame 445 field=unicode_prefix changed=true focus=true gained=false lost=false before="测试ni hao" after="测试你好"
+frame 446 IME Disabled
+frame 447 IME Disabled
+frame 448 IME Disabled
+frame 449 IME Disabled
+frame 450 IME Disabled
+frame 451 IME Disabled
+frame 452 IME Disabled
+frame 453 IME Disabled
+frame 454 IME Disabled
+frame 455 IME Disabled
+frame 456 IME Disabled
+frame 457 IME Disabled
+frame 458 IME Disabled
+frame 459 IME Disabled
+frame 460 IME Disabled
+frame 461 IME Disabled
+frame 462 IME Disabled
+frame 463 IME Disabled
+frame 464 IME Disabled
+frame 465 IME Disabled
+frame 466 IME Disabled
+frame 467 IME Disabled
+frame 468 IME Disabled
+frame 469 IME Disabled
+frame 470 IME Disabled
+frame 471 IME Disabled
+frame 472 IME Disabled
+frame 473 IME Disabled
+frame 474 IME Disabled
+frame 475 IME Disabled
+frame 476 IME Disabled
+frame 477 IME Disabled
+frame 478 IME Disabled
+frame 479 IME Disabled
+frame 480 IME Disabled
+frame 481 IME Disabled
+frame 482 IME Disabled
+frame 483 IME Disabled
+frame 484 IME Disabled
+frame 485 IME Disabled
+frame 486 IME Disabled
+frame 488 IME Disabled
+frame 489 IME Disabled
+frame 490 IME Disabled
+frame 491 IME Disabled
+frame 492 IME Disabled
+frame 493 IME Disabled
+frame 494 IME Disabled
+frame 495 IME Disabled
+frame 496 IME Disabled
+frame 497 IME Disabled
+frame 498 IME Disabled
+frame 499 IME Disabled
+frame 499 field=unicode_prefix changed=false focus=false gained=false lost=true before="测试你好" after="测试你好"
+frame 500 IME Disabled
+frame 500 IME Disabled

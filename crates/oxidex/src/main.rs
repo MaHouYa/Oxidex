@@ -212,6 +212,41 @@ mod ime_tests {
         );
         assert!(!frame.active_preedit);
     }
+
+    #[test]
+    fn commit_only_ime_event_inserts_after_existing_text() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("commit-only-ime");
+        let mut text = "abc".to_owned();
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::TextEdit::singleline(&mut text)
+                .id(id)
+                .show(ui)
+                .response
+                .response
+                .request_focus();
+        });
+
+        let mut state = egui::TextEdit::load_state(&ctx, id).expect("text edit state");
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(text.chars().count()),
+            )));
+        egui::TextEdit::store_state(&ctx, id, state);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        let mut input = egui::RawInput::default();
+        input
+            .events
+            .push(egui::Event::Ime(egui::ImeEvent::Commit("你好".into())));
+        let _ = ctx.run_ui(input, |ui| {
+            egui::TextEdit::singleline(&mut text).id(id).show(ui);
+        });
+
+        assert_eq!(text, "abc你好");
+    }
 }
 
 struct OxidexApp {

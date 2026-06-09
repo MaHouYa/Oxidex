@@ -43,4 +43,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 xdg = "3.0"
 
 [patch.crates-io]
+egui = { path = "vendor/egui" }
 ext4 = { path = "vendor/ext4" }
