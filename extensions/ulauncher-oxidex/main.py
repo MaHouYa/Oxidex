@@ -4,7 +4,6 @@ import time
 
 from ulauncher.api.client.EventListener import EventListener
 from ulauncher.api.client.Extension import Extension
-from ulauncher.api.shared.action.ActionList import ActionList
 from ulauncher.api.shared.action.CopyToClipboardAction import CopyToClipboardAction
 from ulauncher.api.shared.action.DoNothingAction import DoNothingAction
 from ulauncher.api.shared.action.ExtensionCustomAction import ExtensionCustomAction
@@ -94,11 +93,7 @@ class ItemEnterEventListener(EventListener):
         action = data.get("action")
         try:
             if action == "result_actions":
-                return RenderResultListAction(result_action_items(data.get("row") or {}))
-            if action == "open":
-                return open_result_action(extension, data.get("row") or {}, data.get("mode"))
-            if action == "copy_path":
-                return copy_path_action(extension, data.get("row") or {})
+                return RenderResultListAction(result_action_items(extension, data.get("row") or {}))
             if action == "scan_device":
                 return RenderResultListAction(scan_device_items(extension, data.get("device_id")))
             if action == "scan_menu":
@@ -151,37 +146,47 @@ def search_result_item(extension, row):
     )
 
 
-def result_action_items(row):
+def result_action_items(extension, row):
     name = row.get("name") or "(unnamed)"
     mounted = row.get("mounted") is True
+    resolved_path = row.get("display_path") or row.get("internal_path") or name
+    resolved_mounted = mounted
+    resolve_error = None
+
+    try:
+        resolved = resolve_result(extension, row)
+        resolved_path = resolved.get("path") or resolved_path
+        resolved_mounted = resolved.get("mounted") is True
+    except Exception as err:
+        resolve_error = err
+        logger.exception("failed to resolve result action path")
+
     actions = []
 
-    if mounted:
+    if resolved_mounted and resolved_path:
         actions.append(
             item(
                 "Open",
                 "Open %s" % name,
-                ExtensionCustomAction(
-                    {"action": "open", "mode": "file", "row": row},
-                    keep_app_open=False,
-                ),
+                OpenAction(resolved_path),
             )
         )
+        folder_path = resolved_path if row.get("is_dir") else os.path.dirname(resolved_path)
         actions.append(
             item(
                 "Open Folder",
                 "Open the containing folder",
-                ExtensionCustomAction(
-                    {"action": "open", "mode": "folder", "row": row},
-                    keep_app_open=False,
-                ),
+                OpenAction(folder_path or resolved_path),
             )
         )
     else:
+        detail = "This indexed device is not currently mounted."
+        if resolve_error:
+            detail = str(resolve_error)
         actions.append(
             item(
                 "Open unavailable",
-                "This indexed device is not currently mounted.",
+                detail,
                 DoNothingAction(),
             )
         )
@@ -190,17 +195,14 @@ def result_action_items(row):
         item(
             "Copy Path",
             "Copy the resolved path when mounted, otherwise the indexed display path",
-            ExtensionCustomAction(
-                {"action": "copy_path", "row": row},
-                keep_app_open=False,
-            ),
+            CopyToClipboardAction(resolved_path),
         )
     )
     actions.append(
         item(
             "Copy Name",
             "Copy %s" % name,
-            ActionList([CopyToClipboardAction(name), HideWindowAction()]),
+            CopyToClipboardAction(name),
         )
     )
     actions.append(
@@ -217,35 +219,6 @@ def result_action_items(row):
         )
     )
     return actions
-
-
-def open_result_action(extension, row, mode):
-    resolved = resolve_result(extension, row)
-    if not resolved.get("mounted"):
-        return RenderResultListAction(
-            [
-                item(
-                    "Open unavailable",
-                    "The indexed device is not currently mounted.",
-                    DoNothingAction(),
-                )
-            ]
-        )
-
-    path = resolved.get("path") or ""
-    if mode == "folder" and not row.get("is_dir"):
-        path = os.path.dirname(path) or path
-    return ActionList([OpenAction(path), HideWindowAction()])
-
-
-def copy_path_action(extension, row):
-    path = row.get("display_path") or row.get("internal_path") or row.get("name") or ""
-    try:
-        resolved = resolve_result(extension, row)
-        path = resolved.get("path") or path
-    except Exception:
-        logger.exception("failed to resolve path before copying")
-    return ActionList([CopyToClipboardAction(path), HideWindowAction()])
 
 
 def resolve_result(extension, row):
