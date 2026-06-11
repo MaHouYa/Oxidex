@@ -4,7 +4,7 @@
 
 
 pkgname=oxidex
-pkgver=2.2.0
+pkgver=2.3.0
 pkgrel=1
 pkgdesc="Oxidex, a fast Rust/egui filename search app for NTFS, EXT3, EXT4, and Btrfs devices"
 arch=('x86_64')

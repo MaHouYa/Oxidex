@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "oxidex"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -2768,7 +2768,7 @@ dependencies = [
 
 [[package]]
 name = "oxidex-cli"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "open",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "oxidex-client"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "oxidex-core",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "oxidex-core"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "btrfs-fs",
@@ -2812,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "oxidex-daemon"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "oxidex-scannerd"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "libc",
