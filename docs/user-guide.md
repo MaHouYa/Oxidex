@@ -253,7 +253,20 @@ The default settings are:
 watch_mounted = true
 live_update_flush_seconds = 10
 live_update_max_dirty_seconds = 60
+periodic_rescan_when_unwatched = true
+periodic_rescan_minutes = 60
 ```
+
+To keep CPU use low, Oxidex does not recursively live-watch the root mount `/`
+unless that device has at least one absolute include rule that can be reduced to
+a concrete watch root. For example, `/home/hiroshi/**`, `/home/*/Documents/**`,
+and `/data/projects` allow Oxidex to watch `/home/hiroshi`, `/home`, and
+`/data/projects` instead of all of `/`. Name-only rules such as `node_modules`
+or `*.rs`, and exclude-only rules, do not enable root live watching.
+
+If a mounted index is not watched because live updates are disabled, unavailable,
+or suppressed by the root-watch policy, Oxidex can periodically enqueue a normal
+rescan for already-indexed supported devices. The default interval is 60 minutes.
 
 ## Searching
 
@@ -443,6 +456,8 @@ oxidex-cli config set ui.language zh_cn
 oxidex-cli config set ui.language system
 oxidex-cli config set search.default_sort relevance
 oxidex-cli config set indexing.watch_mounted true
+oxidex-cli config set indexing.periodic_rescan_when_unwatched true
+oxidex-cli config set indexing.periodic_rescan_minutes 60
 oxidex-cli config set rofi.max_results 200
 ```
 

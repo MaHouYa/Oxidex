@@ -1311,6 +1311,19 @@ impl DaemonGuiApp {
                     ));
                     ui.label(format!(
                         "{}: {}",
+                        self.t(Text::PeriodicRescanWhenUnwatched),
+                        yes_no(
+                            self.language,
+                            config.config.indexing.periodic_rescan_when_unwatched
+                        )
+                    ));
+                    ui.label(format!(
+                        "{}: {}",
+                        self.t(Text::PeriodicRescanMinutes),
+                        config.config.indexing.periodic_rescan_minutes
+                    ));
+                    ui.label(format!(
+                        "{}: {}",
                         self.t(Text::MaxParallelScans),
                         config.config.indexing.max_parallel_scans
                     ));

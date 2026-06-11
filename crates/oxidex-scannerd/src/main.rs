@@ -636,7 +636,7 @@ fn start_watch(
     next_watch: &Arc<AtomicU64>,
 ) -> anyhow::Result<(Value, Vec<u8>)> {
     let params: ScannerStartWatchParams = params_as(frame)?;
-    let (device_path, mount_point) = validate_watch_request(&params)?;
+    let (device_path, mount_point, watch_roots) = validate_watch_request(&params)?;
     let watch_id = next_watch.fetch_add(1, Ordering::Relaxed);
     let writer_for_callback = writer.clone();
     let summaries_for_callback = watch_summaries.clone();
@@ -679,8 +679,10 @@ fn start_watch(
         },
         NotifyConfig::default(),
     )?;
-    watcher.watch(&mount_point, RecursiveMode::Recursive)?;
-    let watched_directories = 1;
+    for watch_root in &watch_roots {
+        watcher.watch(watch_root, RecursiveMode::Recursive)?;
+    }
+    let watched_directories = watch_roots.len();
     let summary = ScannerWatchSummary {
         watch_id,
         device_id: params.device_id.clone(),
@@ -742,7 +744,9 @@ fn stop_watch(
     Ok((json!({"stopped": true}), Vec::new()))
 }
 
-fn validate_watch_request(params: &ScannerStartWatchParams) -> anyhow::Result<(PathBuf, PathBuf)> {
+fn validate_watch_request(
+    params: &ScannerStartWatchParams,
+) -> anyhow::Result<(PathBuf, PathBuf, Vec<PathBuf>)> {
     anyhow::ensure!(
         params.fs_type.is_supported_for_scan(),
         "unsupported filesystem type {}",
@@ -771,7 +775,42 @@ fn validate_watch_request(params: &ScannerStartWatchParams) -> anyhow::Result<(P
         mount_point.display(),
         device.display()
     );
-    Ok((device, mount_point))
+    let requested_roots = if params.watch_roots.is_empty() {
+        vec![mount_point.clone()]
+    } else {
+        params.watch_roots.iter().map(PathBuf::from).collect()
+    };
+    let mut watch_roots = Vec::with_capacity(requested_roots.len());
+    for watch_root in requested_roots {
+        anyhow::ensure!(
+            watch_root.is_absolute(),
+            "watch root {} must be an absolute path",
+            watch_root.display()
+        );
+        let watch_root = watch_root.canonicalize()?;
+        anyhow::ensure!(
+            watch_root.starts_with(&mount_point),
+            "watch root {} is outside mount point {}",
+            watch_root.display(),
+            mount_point.display()
+        );
+        anyhow::ensure!(
+            fs::metadata(&watch_root)?.is_dir(),
+            "watch root {} is not a directory",
+            watch_root.display()
+        );
+        anyhow::ensure!(
+            watch_root_belongs_to_requested_mount(&watch_root, &mount_point, &device)?,
+            "watch root {} belongs to a different mounted device than {}",
+            watch_root.display(),
+            device.display()
+        );
+        if !watch_roots.contains(&watch_root) {
+            watch_roots.push(watch_root);
+        }
+    }
+    anyhow::ensure!(!watch_roots.is_empty(), "no valid watch roots");
+    Ok((device, mount_point, watch_roots))
 }
 
 fn scanner_watch_events(
@@ -884,6 +923,22 @@ fn mount_point_matches_requested_device(mount_point: &Path, device: &Path) -> an
     ))
 }
 
+fn watch_root_belongs_to_requested_mount(
+    watch_root: &Path,
+    mount_point: &Path,
+    device: &Path,
+) -> anyhow::Result<bool> {
+    let Ok(text) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Ok(true);
+    };
+    Ok(mountinfo_text_watch_root_belongs_to_requested_mount(
+        &text,
+        watch_root,
+        mount_point,
+        device,
+    ))
+}
+
 fn mountinfo_text_matches_requested_device(text: &str, mount_point: &Path, device: &Path) -> bool {
     let wanted_mount = mount_point.to_string_lossy();
     let canonical_device = device
@@ -914,6 +969,63 @@ fn mountinfo_text_matches_requested_device(text: &str, mount_point: &Path, devic
         return canonical_source == canonical_device;
     }
     false
+}
+
+fn mountinfo_text_watch_root_belongs_to_requested_mount(
+    text: &str,
+    watch_root: &Path,
+    requested_mount: &Path,
+    device: &Path,
+) -> bool {
+    let canonical_device = device
+        .canonicalize()
+        .unwrap_or_else(|_| device.to_path_buf());
+    let mut deepest: Option<(PathBuf, String)> = None;
+    for line in text.lines() {
+        let Some((prefix, suffix)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut fields = prefix.split_whitespace();
+        let Some(mount) = fields.nth(4).map(decode_mountinfo_path) else {
+            continue;
+        };
+        let mount_path = PathBuf::from(&mount);
+        if !path_contains_or_equals(&mount_path, watch_root) {
+            continue;
+        }
+        if deepest
+            .as_ref()
+            .map(|(current, _)| mount_path.as_os_str().len() > current.as_os_str().len())
+            .unwrap_or(true)
+        {
+            deepest = Some((mount_path, suffix.to_owned()));
+        }
+    }
+
+    let Some((deepest_mount, suffix)) = deepest else {
+        return true;
+    };
+    if deepest_mount == requested_mount {
+        return true;
+    }
+
+    let mut suffix_fields = suffix.split_whitespace();
+    let _fs_type = suffix_fields.next();
+    let Some(source) = suffix_fields.next().map(decode_mountinfo_path) else {
+        return true;
+    };
+    if !source.starts_with("/dev/") {
+        return true;
+    }
+    let source_path = PathBuf::from(source);
+    let Ok(canonical_source) = source_path.canonicalize() else {
+        return true;
+    };
+    canonical_source == canonical_device
+}
+
+fn path_contains_or_equals(root: &Path, path: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 fn decode_mountinfo_path(path: &str) -> String {
@@ -968,6 +1080,10 @@ mod tests {
             Some("/home/a.txt".into())
         );
         assert_eq!(
+            path_to_internal_path(Path::new("/"), Path::new("/home/a.txt")),
+            Some("/home/a.txt".into())
+        );
+        assert_eq!(
             path_to_internal_path(Path::new("/mnt/data"), Path::new("/mnt/data")),
             Some("/".into())
         );
@@ -1003,6 +1119,30 @@ mod tests {
         assert!(mountinfo_text_matches_requested_device(
             text,
             Path::new("/mnt/Oxidex Data"),
+            Path::new("/dev/null")
+        ));
+    }
+
+    #[test]
+    fn watch_root_mountinfo_allows_subroot_on_same_mount() {
+        let text = "36 25 1:5 / /mnt/data rw,relatime - ext4 /dev/null rw\n";
+        assert!(mountinfo_text_watch_root_belongs_to_requested_mount(
+            text,
+            Path::new("/mnt/data/home"),
+            Path::new("/mnt/data"),
+            Path::new("/dev/null")
+        ));
+    }
+
+    #[test]
+    fn watch_root_mountinfo_rejects_nested_different_device() {
+        let text = "\
+36 25 1:5 / / rw,relatime - ext4 /dev/null rw\n\
+37 36 1:3 / /home rw,relatime - ext4 /dev/zero rw\n";
+        assert!(!mountinfo_text_watch_root_belongs_to_requested_mount(
+            text,
+            Path::new("/home/hiroshi"),
+            Path::new("/"),
             Path::new("/dev/null")
         ));
     }

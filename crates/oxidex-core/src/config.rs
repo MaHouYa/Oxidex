@@ -78,6 +78,10 @@ pub struct IndexingConfig {
     pub live_update_flush_seconds: u64,
     #[serde(default = "default_live_update_max_dirty_seconds")]
     pub live_update_max_dirty_seconds: u64,
+    #[serde(default = "default_true")]
+    pub periodic_rescan_when_unwatched: bool,
+    #[serde(default = "default_periodic_rescan_minutes")]
+    pub periodic_rescan_minutes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -157,6 +161,8 @@ impl Default for IndexingConfig {
             watch_mounted: true,
             live_update_flush_seconds: default_live_update_flush_seconds(),
             live_update_max_dirty_seconds: default_live_update_max_dirty_seconds(),
+            periodic_rescan_when_unwatched: true,
+            periodic_rescan_minutes: default_periodic_rescan_minutes(),
         }
     }
 }
@@ -237,6 +243,10 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         "indexing.live_update_max_dirty_seconds must be at least live_update_flush_seconds"
     );
     anyhow::ensure!(
+        (1..=1440).contains(&config.indexing.periodic_rescan_minutes),
+        "indexing.periodic_rescan_minutes must be between 1 and 1440"
+    );
+    anyhow::ensure!(
         config.rofi.max_results > 0,
         "rofi.max_results must be greater than zero"
     );
@@ -280,6 +290,10 @@ fn default_live_update_max_dirty_seconds() -> u64 {
     60
 }
 
+fn default_periodic_rescan_minutes() -> u64 {
+    60
+}
+
 fn default_rofi_max_results() -> usize {
     200
 }
@@ -301,6 +315,8 @@ mod tests {
         assert_eq!(config.search.max_results, 20_000);
         assert_eq!(config.indexing.max_parallel_scans, 1);
         assert!(config.indexing.watch_mounted);
+        assert!(config.indexing.periodic_rescan_when_unwatched);
+        assert_eq!(config.indexing.periodic_rescan_minutes, 60);
         assert_eq!(config.rofi.max_results, 200);
     }
 
@@ -333,6 +349,19 @@ mod tests {
     }
 
     #[test]
+    fn periodic_rescan_minutes_are_limited() {
+        let mut config = AppConfig::default();
+        for minutes in [1, 60, 1440] {
+            config.indexing.periodic_rescan_minutes = minutes;
+            assert!(validate_config(&config).is_ok());
+        }
+        config.indexing.periodic_rescan_minutes = 0;
+        assert!(validate_config(&config).is_err());
+        config.indexing.periodic_rescan_minutes = 1441;
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
     fn old_ui_config_loads_with_cjk_defaults() {
         let text = r#"
 version = 1
@@ -355,6 +384,8 @@ max_parallel_scans = 1
         assert_eq!(config.ui.language, LanguageMode::System);
         assert!(config.ui.cjk_font_fallback);
         assert!(config.ui.cjk_preferred_font.is_empty());
+        assert!(config.indexing.periodic_rescan_when_unwatched);
+        assert_eq!(config.indexing.periodic_rescan_minutes, 60);
         validate_config(&config).unwrap();
     }
 }

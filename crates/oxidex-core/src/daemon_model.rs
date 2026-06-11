@@ -339,6 +339,8 @@ pub struct ScannerStartWatchParams {
     pub device_path: String,
     pub fs_type: FsType,
     pub mount_point: String,
+    #[serde(default)]
+    pub watch_roots: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

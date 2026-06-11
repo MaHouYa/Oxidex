@@ -716,6 +716,25 @@ impl SearchIndex {
     }
 
     pub fn apply_live_event(&mut self, event: LiveUpdateEvent) -> anyhow::Result<bool> {
+        self.apply_live_events(std::iter::once(event))
+    }
+
+    pub fn apply_live_events(
+        &mut self,
+        events: impl IntoIterator<Item = LiveUpdateEvent>,
+    ) -> anyhow::Result<bool> {
+        let mut changed = false;
+        for event in events {
+            changed |= self.apply_live_event_without_rebuild(event)?;
+        }
+        if changed {
+            self.generation = self.generation.saturating_add(1);
+            self.rebuild_accelerators();
+        }
+        Ok(changed)
+    }
+
+    fn apply_live_event_without_rebuild(&mut self, event: LiveUpdateEvent) -> anyhow::Result<bool> {
         let changed = match event {
             LiveUpdateEvent::Created {
                 internal_path,
@@ -745,10 +764,6 @@ impl SearchIndex {
                 .map(|idx| self.refresh_record_metadata(idx, &metadata))
                 .unwrap_or(false),
         };
-        if changed {
-            self.generation = self.generation.saturating_add(1);
-            self.rebuild_accelerators();
-        }
         Ok(changed)
     }
 
@@ -1781,5 +1796,37 @@ mod tests {
             .unwrap()
         );
         assert!(idx.record_by_internal_path("/src/new_name.rs").is_none());
+    }
+
+    #[test]
+    fn live_update_batch_rebuilds_once() {
+        let mut idx = sample_index();
+        let generation = idx.generation;
+        assert!(
+            idx.apply_live_events([
+                LiveUpdateEvent::Created {
+                    internal_path: "/src/a.rs".into(),
+                    metadata: LiveRecordMetadata {
+                        size: 1,
+                        mtime: 1,
+                        is_dir: false,
+                        is_symlink: false,
+                    },
+                },
+                LiveUpdateEvent::Created {
+                    internal_path: "/src/b.rs".into(),
+                    metadata: LiveRecordMetadata {
+                        size: 2,
+                        mtime: 2,
+                        is_dir: false,
+                        is_symlink: false,
+                    },
+                },
+            ])
+            .unwrap()
+        );
+        assert_eq!(idx.generation, generation + 1);
+        assert!(idx.record_by_internal_path("/src/a.rs").is_some());
+        assert!(idx.record_by_internal_path("/src/b.rs").is_some());
     }
 }

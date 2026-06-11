@@ -9,8 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use oxidex_core::config::{
-    AppConfig, LanguageMode, ThemeMode, config_path as default_config_path, load_config_from_path,
-    save_config_to_path, validate_config,
+    AppConfig, LanguageMode, RuleKind, ThemeMode, config_path as default_config_path,
+    load_config_from_path, save_config_to_path, validate_config,
 };
 use oxidex_core::daemon_model::{
     ConfigGetResult, ConfigSetParams, ConfigValidateParams, DaemonDoctorResult, DaemonStatus,
@@ -38,6 +38,8 @@ use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_SCANNER_SOCKET: &str = "/run/oxidex/scannerd.sock";
+const LIVE_EVENT_BATCH_DELAY_MS: u64 = 500;
+const PERIODIC_RESCAN_POLL_SECONDS: u64 = 30;
 
 fn main() {
     if let Err(err) = run() {
@@ -103,6 +105,7 @@ fn run() -> anyhow::Result<()> {
         DEFAULT_SCANNER_SOCKET.into(),
     )?));
     start_watch_manager(state.clone());
+    start_periodic_rescan_manager(state.clone());
     serve(socket_path, state)
 }
 
@@ -917,6 +920,111 @@ fn cancel_scan_job(
     }
 }
 
+fn start_periodic_rescan_manager(state: Arc<Mutex<DaemonState>>) {
+    thread::spawn(move || periodic_rescan_loop(state));
+}
+
+fn periodic_rescan_loop(state: Arc<Mutex<DaemonState>>) {
+    let mut last_seen: HashMap<String, Instant> = HashMap::new();
+    loop {
+        thread::sleep(Duration::from_secs(PERIODIC_RESCAN_POLL_SECONDS));
+        let now = Instant::now();
+        let (interval, candidates) = periodic_rescan_candidates(&state, &mut last_seen, now);
+        if candidates.is_empty() {
+            continue;
+        }
+        for device_id in candidates {
+            tracing::info!(
+                device_id = %device_id,
+                interval_minutes = interval.as_secs() / 60,
+                "queueing periodic rescan for unwatched index"
+            );
+            if let Err(err) = start_scan_job_with_refresh(state.clone(), device_id.clone(), true) {
+                tracing::warn!(
+                    device_id = %device_id,
+                    error = %format!("{err:#}"),
+                    "failed to queue periodic rescan"
+                );
+            } else {
+                last_seen.insert(device_id, now);
+            }
+        }
+    }
+}
+
+fn periodic_rescan_candidates(
+    state: &Arc<Mutex<DaemonState>>,
+    last_seen: &mut HashMap<String, Instant>,
+    now: Instant,
+) -> (Duration, Vec<String>) {
+    let mut state = state.lock().unwrap();
+    state.refresh_devices();
+    let interval = Duration::from_secs(state.config.indexing.periodic_rescan_minutes * 60);
+    let candidates = periodic_rescan_candidates_from_state(&state, last_seen, now, interval);
+    (interval, candidates)
+}
+
+fn periodic_rescan_candidates_from_state(
+    state: &DaemonState,
+    last_seen: &mut HashMap<String, Instant>,
+    now: Instant,
+    interval: Duration,
+) -> Vec<String> {
+    if !state.config.indexing.periodic_rescan_when_unwatched {
+        return Vec::new();
+    }
+
+    state
+        .indexes
+        .iter()
+        .filter_map(|index| {
+            let device_id = &index.metadata.device_id;
+            let device = state
+                .devices
+                .iter()
+                .find(|device| device.device_id == *device_id)?;
+            if device.metadata.is_none() || !device.scan_supported {
+                return None;
+            }
+            if state
+                .config
+                .devices
+                .iter()
+                .find(|config| config.device_id == *device_id)
+                .is_some_and(|config| !config.enabled)
+            {
+                return None;
+            }
+            if scan_job_active_for_device(state, device_id) {
+                return None;
+            }
+            if state.config.indexing.watch_mounted && device_is_actively_watched(state, device_id) {
+                return None;
+            }
+            let last = last_seen.entry(device_id.clone()).or_insert(now);
+            if now.duration_since(*last) < interval {
+                return None;
+            }
+            Some(device_id.clone())
+        })
+        .collect()
+}
+
+fn scan_job_active_for_device(state: &DaemonState, device_id: &str) -> bool {
+    state.jobs.values().any(|job| {
+        job.summary.device_id == device_id
+            && matches!(job.summary.state, ScanState::Queued | ScanState::Running)
+    })
+}
+
+fn device_is_actively_watched(state: &DaemonState, device_id: &str) -> bool {
+    state
+        .watch_summaries
+        .get(device_id)
+        .map(|summary| summary.enabled && summary.state == "watching")
+        .unwrap_or(false)
+}
+
 fn start_watch_manager(state: Arc<Mutex<DaemonState>>) {
     thread::spawn(move || watch_manager_loop(state));
 }
@@ -924,6 +1032,11 @@ fn start_watch_manager(state: Arc<Mutex<DaemonState>>) {
 struct DirtyState {
     first_dirty: Instant,
     last_dirty: Instant,
+}
+
+struct PendingLiveBatch {
+    last_event: Instant,
+    events: Vec<ScannerWatchEvent>,
 }
 
 struct ScannerWatchConnection {
@@ -935,14 +1048,23 @@ struct ScannerWatchConnection {
 fn watch_manager_loop(state: Arc<Mutex<DaemonState>>) {
     let mut connection: Option<ScannerWatchConnection> = None;
     let mut dirty: HashMap<String, DirtyState> = HashMap::new();
+    let mut pending: HashMap<String, PendingLiveBatch> = HashMap::new();
     let mut last_reconcile = Instant::now() - Duration::from_secs(60);
 
     loop {
         if connection.is_none() {
+            let watch_enabled = state.lock().unwrap().config.indexing.watch_mounted;
+            if !watch_enabled {
+                flush_pending_live_batches(&state, &mut pending, &mut dirty, true);
+                flush_dirty_indexes(&state, &mut dirty);
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
             match connect_scanner_watch_session(&state) {
                 Ok(conn) => connection = Some(conn),
                 Err(err) => {
                     mark_scanner_connection_error(&state, format!("{err:#}"));
+                    flush_pending_live_batches(&state, &mut pending, &mut dirty, true);
                     flush_dirty_indexes(&state, &mut dirty);
                     thread::sleep(Duration::from_secs(2));
                     continue;
@@ -952,12 +1074,13 @@ fn watch_manager_loop(state: Arc<Mutex<DaemonState>>) {
 
         let mut drop_connection = false;
         if let Some(conn) = connection.as_mut() {
-            if let Err(err) = drain_scanner_watch_frames(conn, &state, &mut dirty) {
+            if let Err(err) = drain_scanner_watch_frames(conn, &state, &mut pending) {
                 let active = conn.active.clone();
                 mark_active_watches_desynced(&state, &active, format!("{err:#}"));
                 drop_connection = true;
             } else if last_reconcile.elapsed() >= Duration::from_secs(5) {
-                if let Err(err) = reconcile_scanner_watches(&state, conn, &mut dirty) {
+                if let Err(err) = reconcile_scanner_watches(&state, conn, &mut dirty, &mut pending)
+                {
                     let active = conn.active.clone();
                     mark_active_watches_desynced(&state, &active, format!("{err:#}"));
                     drop_connection = true;
@@ -969,6 +1092,7 @@ fn watch_manager_loop(state: Arc<Mutex<DaemonState>>) {
             connection = None;
         }
 
+        flush_pending_live_batches(&state, &mut pending, &mut dirty, false);
         flush_dirty_indexes(&state, &mut dirty);
         thread::sleep(Duration::from_millis(200));
     }
@@ -980,7 +1104,13 @@ struct DesiredWatch {
     device_path: String,
     fs_type: oxidex_core::model::FsType,
     mount_point: String,
+    watch_roots: Vec<String>,
     watched_directories: usize,
+}
+
+enum RootWatchPolicy {
+    Watch(Vec<String>),
+    Suppressed(String),
 }
 
 fn connect_scanner_watch_session(
@@ -1016,6 +1146,7 @@ fn reconcile_scanner_watches(
     state: &Arc<Mutex<DaemonState>>,
     conn: &mut ScannerWatchConnection,
     dirty: &mut HashMap<String, DirtyState>,
+    pending: &mut HashMap<String, PendingLiveBatch>,
 ) -> anyhow::Result<()> {
     let desired = desired_watches(state);
     let desired_ids: HashSet<_> = desired
@@ -1026,6 +1157,7 @@ fn reconcile_scanner_watches(
     for device_id in current_ids {
         if !desired_ids.contains(&device_id) {
             if let Some(watch_id) = conn.active.remove(&device_id) {
+                flush_device_pending_live_batch(state, pending, dirty, &device_id);
                 let params = ScannerStopWatchParams { watch_id };
                 let _ = scanner_watch_request(
                     conn,
@@ -1033,6 +1165,7 @@ fn reconcile_scanner_watches(
                     serde_json::to_value(params)?,
                     state,
                     dirty,
+                    pending,
                 );
             }
             state.lock().unwrap().watch_summaries.remove(&device_id);
@@ -1067,6 +1200,7 @@ fn reconcile_scanner_watches(
             device_path: desired.device_path.clone(),
             fs_type: desired.fs_type,
             mount_point: desired.mount_point.clone(),
+            watch_roots: desired.watch_roots.clone(),
         };
         match scanner_watch_request(
             conn,
@@ -1074,6 +1208,7 @@ fn reconcile_scanner_watches(
             serde_json::to_value(params)?,
             state,
             dirty,
+            pending,
         )
         .and_then(|frame| result_as::<ScannerStartWatchResult>(&frame))
         {
@@ -1105,48 +1240,158 @@ fn desired_watches(state: &Arc<Mutex<DaemonState>>) -> Vec<DesiredWatch> {
     if !state.config.indexing.watch_mounted {
         return Vec::new();
     }
-    state
-        .indexes
+    let mut desired = Vec::new();
+    let mut suppressed = Vec::new();
+    for index in &state.indexes {
+        if state
+            .index_states
+            .get(&index.metadata.device_id)
+            .and_then(|state| state.stale_reason.as_deref())
+            .map(|reason| reason.starts_with("watch_"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if state
+            .index_states
+            .get(&index.metadata.device_id)
+            .and_then(|state| state.live_watch_state.as_deref())
+            .is_some_and(|watch_state| watch_state == "unavailable")
+        {
+            continue;
+        }
+        if state
+            .config
+            .devices
+            .iter()
+            .find(|config| config.device_id == index.metadata.device_id)
+            .is_some_and(|config| !config.enabled)
+        {
+            suppressed.push((
+                index.metadata.device_id.clone(),
+                "unwatched_disabled".into(),
+            ));
+            continue;
+        }
+        let Some(device) = state
+            .devices
+            .iter()
+            .find(|device| device.device_id == index.metadata.device_id)
+        else {
+            continue;
+        };
+        let Some(metadata) = device.metadata.as_ref() else {
+            continue;
+        };
+        if !device.mounted || device.primary_mount_point.trim().is_empty() {
+            continue;
+        }
+        let watch_roots = match watch_roots_for_device(&state, index, device) {
+            RootWatchPolicy::Watch(roots) => roots,
+            RootWatchPolicy::Suppressed(reason) => {
+                suppressed.push((index.metadata.device_id.clone(), reason));
+                continue;
+            }
+        };
+        desired.push(DesiredWatch {
+            device_id: index.metadata.device_id.clone(),
+            device_path: metadata.dev_node.clone(),
+            fs_type: metadata.fs_type,
+            mount_point: device.primary_mount_point.clone(),
+            watched_directories: watch_roots.len(),
+            watch_roots,
+        });
+    }
+    for (device_id, reason) in suppressed {
+        update_watch_summary_locked(
+            &mut state,
+            WatchSummary {
+                device_id: device_id.clone(),
+                mounted: true,
+                enabled: false,
+                state: reason.clone(),
+                watched_directories: 0,
+                dirty: false,
+                last_error: None,
+            },
+        );
+        let sidecar = state
+            .index_states
+            .entry(device_id.clone())
+            .or_insert_with(|| snapshot::IndexStateV1::new(device_id));
+        if sidecar.live_watch_state.as_deref() != Some(reason.as_str()) {
+            sidecar.live_watch_state = Some(reason);
+            let _ = snapshot::save_index_state(sidecar);
+        }
+    }
+    desired
+}
+
+fn watch_roots_for_device(
+    state: &DaemonState,
+    index: &SearchIndex,
+    device: &DeviceInfo,
+) -> RootWatchPolicy {
+    if !is_root_mount(&device.primary_mount_point) {
+        return RootWatchPolicy::Watch(vec![device.primary_mount_point.clone()]);
+    }
+
+    let Some(device_config) = state
+        .config
+        .devices
         .iter()
-        .filter_map(|index| {
-            if state
-                .index_states
-                .get(&index.metadata.device_id)
-                .and_then(|state| state.stale_reason.as_deref())
-                .map(|reason| reason.starts_with("watch_"))
-                .unwrap_or(false)
-            {
-                return None;
-            }
-            if state
-                .index_states
-                .get(&index.metadata.device_id)
-                .and_then(|state| state.live_watch_state.as_deref())
-                .is_some_and(|watch_state| watch_state == "unavailable")
-            {
-                return None;
-            }
-            let device = state
-                .devices
-                .iter()
-                .find(|device| device.device_id == index.metadata.device_id)?;
-            let metadata = device.metadata.as_ref()?;
-            if !device.mounted || device.primary_mount_point.trim().is_empty() {
-                return None;
-            }
-            Some(DesiredWatch {
-                device_id: index.metadata.device_id.clone(),
-                device_path: metadata.dev_node.clone(),
-                fs_type: metadata.fs_type,
-                mount_point: device.primary_mount_point.clone(),
-                watched_directories: index
-                    .records
-                    .iter()
-                    .filter(|record| record.is_dir())
-                    .count(),
-            })
-        })
-        .collect()
+        .find(|config| config.device_id == index.metadata.device_id)
+    else {
+        return RootWatchPolicy::Suppressed("unwatched_root_without_include".into());
+    };
+    if !device_config.enabled {
+        return RootWatchPolicy::Suppressed("unwatched_disabled".into());
+    }
+
+    let mut roots = Vec::new();
+    for rule in &device_config.rules {
+        if rule.kind != RuleKind::Include {
+            continue;
+        }
+        if let Some(root) = rootable_include_rule(&rule.pattern)
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
+    if roots.is_empty() {
+        RootWatchPolicy::Suppressed("unwatched_root_without_include".into())
+    } else {
+        roots.sort();
+        RootWatchPolicy::Watch(roots)
+    }
+}
+
+fn is_root_mount(mount_point: &str) -> bool {
+    mount_point.trim_end_matches('/').is_empty() || mount_point == "/"
+}
+
+fn rootable_include_rule(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim();
+    if !pattern.starts_with('/') {
+        return None;
+    }
+    let wildcard = pattern.find(['*', '?', '[', '{']);
+    let root = match wildcard {
+        Some(idx) => pattern[..idx].trim_end_matches('/'),
+        None => pattern.trim_end_matches('/'),
+    };
+    if root.is_empty() || root == "/" {
+        None
+    } else {
+        Some(root.to_owned())
+    }
+}
+
+fn update_watch_summary_locked(state: &mut DaemonState, summary: WatchSummary) {
+    state
+        .watch_summaries
+        .insert(summary.device_id.clone(), summary);
 }
 
 fn scanner_watch_request(
@@ -1155,6 +1400,7 @@ fn scanner_watch_request(
     params: Value,
     state: &Arc<Mutex<DaemonState>>,
     dirty: &mut HashMap<String, DirtyState>,
+    pending: &mut HashMap<String, PendingLiveBatch>,
 ) -> anyhow::Result<IpcFrame> {
     let id = conn.next_id;
     conn.next_id = conn.next_id.saturating_add(1);
@@ -1166,17 +1412,18 @@ fn scanner_watch_request(
         if frame.header.id == Some(id) {
             return Ok(frame);
         }
-        handle_scanner_watch_frame(state, dirty, frame)?;
+        handle_scanner_watch_frame(state, pending, frame)?;
+        flush_pending_live_batches(state, pending, dirty, true);
     }
 }
 
 fn drain_scanner_watch_frames(
     conn: &mut ScannerWatchConnection,
     state: &Arc<Mutex<DaemonState>>,
-    dirty: &mut HashMap<String, DirtyState>,
+    pending: &mut HashMap<String, PendingLiveBatch>,
 ) -> anyhow::Result<()> {
     while let Some(frame) = read_scanner_watch_frame(&mut conn.stream)? {
-        handle_scanner_watch_frame(state, dirty, frame)?;
+        handle_scanner_watch_frame(state, pending, frame)?;
     }
     Ok(())
 }
@@ -1197,7 +1444,7 @@ fn is_timeout_error(err: &anyhow::Error) -> bool {
 
 fn handle_scanner_watch_frame(
     state: &Arc<Mutex<DaemonState>>,
-    dirty: &mut HashMap<String, DirtyState>,
+    pending: &mut HashMap<String, PendingLiveBatch>,
     frame: IpcFrame,
 ) -> anyhow::Result<()> {
     let Some(event) = frame.header.event.as_deref() else {
@@ -1207,17 +1454,7 @@ fn handle_scanner_watch_frame(
         "scanner.watch_event" => {
             let event: ScannerWatchEvent =
                 serde_json::from_value(frame.header.params.unwrap_or(Value::Null))?;
-            if apply_scanner_watch_event(state, &event)? {
-                let now = Instant::now();
-                dirty
-                    .entry(event.device_id.clone())
-                    .and_modify(|entry| entry.last_dirty = now)
-                    .or_insert(DirtyState {
-                        first_dirty: now,
-                        last_dirty: now,
-                    });
-                set_watch_dirty(state, &event.device_id, true);
-            }
+            queue_pending_live_event(pending, event);
         }
         "scanner.watch_error" => {
             let event: ScannerWatchErrorEvent =
@@ -1242,101 +1479,248 @@ fn handle_scanner_watch_frame(
     Ok(())
 }
 
-fn apply_scanner_watch_event(
+fn queue_pending_live_event(
+    pending: &mut HashMap<String, PendingLiveBatch>,
+    event: ScannerWatchEvent,
+) {
+    let now = Instant::now();
+    let entry = pending
+        .entry(event.device_id.clone())
+        .or_insert_with(|| PendingLiveBatch {
+            last_event: now,
+            events: Vec::new(),
+        });
+    entry.last_event = now;
+    entry.events.push(event);
+}
+
+fn flush_pending_live_batches(
     state: &Arc<Mutex<DaemonState>>,
-    event: &ScannerWatchEvent,
-) -> anyhow::Result<bool> {
-    match event.kind {
-        ScannerWatchEventKind::Created => {
-            let Some(metadata) = event.metadata.clone() else {
-                return Ok(false);
-            };
-            apply_live_created(
-                state,
-                &event.device_id,
-                event.internal_path.clone(),
-                live_metadata(metadata),
-            )
-        }
-        ScannerWatchEventKind::Removed => {
-            let mut state = state.lock().unwrap();
-            let Some(index) = state
-                .indexes
-                .iter_mut()
-                .find(|index| index.metadata.device_id == event.device_id)
-            else {
-                return Ok(false);
-            };
-            index.apply_live_event(LiveUpdateEvent::Removed {
-                internal_path: event.internal_path.clone(),
-            })
-        }
-        ScannerWatchEventKind::Renamed => {
-            let Some(old_internal) = event.old_internal_path.clone() else {
-                return Ok(false);
-            };
-            let Some(metadata) = event.metadata.clone() else {
-                let mut state = state.lock().unwrap();
-                let Some(index) = state
-                    .indexes
-                    .iter_mut()
-                    .find(|index| index.metadata.device_id == event.device_id)
-                else {
-                    return Ok(false);
-                };
-                return index.apply_live_event(LiveUpdateEvent::Removed {
-                    internal_path: old_internal,
+    pending: &mut HashMap<String, PendingLiveBatch>,
+    dirty: &mut HashMap<String, DirtyState>,
+    force: bool,
+) {
+    let now = Instant::now();
+    let due: Vec<_> = pending
+        .iter()
+        .filter(|(_, batch)| {
+            force
+                || now.duration_since(batch.last_event)
+                    >= Duration::from_millis(LIVE_EVENT_BATCH_DELAY_MS)
+        })
+        .map(|(device_id, _)| device_id.clone())
+        .collect();
+
+    for device_id in due {
+        flush_device_pending_live_batch(state, pending, dirty, &device_id);
+    }
+}
+
+fn flush_device_pending_live_batch(
+    state: &Arc<Mutex<DaemonState>>,
+    pending: &mut HashMap<String, PendingLiveBatch>,
+    dirty: &mut HashMap<String, DirtyState>,
+    device_id: &str,
+) {
+    let Some(batch) = pending.remove(device_id) else {
+        return;
+    };
+    if batch.events.is_empty() {
+        return;
+    }
+    match apply_scanner_watch_events_batch(state, device_id, batch.events) {
+        Ok(true) => {
+            let now = Instant::now();
+            dirty
+                .entry(device_id.to_owned())
+                .and_modify(|entry| entry.last_dirty = now)
+                .or_insert(DirtyState {
+                    first_dirty: now,
+                    last_dirty: now,
                 });
-            };
-            if !rules_allow(
-                &state.lock().unwrap(),
-                &event.device_id,
-                &event.internal_path,
-            )? {
-                let mut state = state.lock().unwrap();
-                let Some(index) = state
-                    .indexes
-                    .iter_mut()
-                    .find(|index| index.metadata.device_id == event.device_id)
-                else {
-                    return Ok(false);
+            set_watch_dirty(state, device_id, true);
+        }
+        Ok(false) => {}
+        Err(err) => mark_watch_error(state, device_id, format!("{err:#}")),
+    }
+}
+
+fn apply_scanner_watch_events_batch(
+    state: &Arc<Mutex<DaemonState>>,
+    device_id: &str,
+    events: Vec<ScannerWatchEvent>,
+) -> anyhow::Result<bool> {
+    let events = coalesce_watch_events(events);
+    let mut state = state.lock().unwrap();
+    let rules = state
+        .config
+        .devices
+        .iter()
+        .find(|device| device.device_id == device_id)
+        .and_then(|device| (!device.rules.is_empty()).then(|| compile_rules(&device.rules)))
+        .transpose()?;
+
+    let mut live_events = Vec::new();
+    for event in events {
+        if event.device_id != device_id {
+            continue;
+        }
+        match event.kind {
+            ScannerWatchEventKind::Created => {
+                let Some(metadata) = event.metadata else {
+                    continue;
                 };
-                return index.apply_live_event(LiveUpdateEvent::Removed {
-                    internal_path: old_internal,
+                if rules_allow_compiled(rules.as_ref(), &event.internal_path) {
+                    live_events.push(LiveUpdateEvent::Created {
+                        internal_path: event.internal_path,
+                        metadata: live_metadata(metadata),
+                    });
+                }
+            }
+            ScannerWatchEventKind::Removed => {
+                live_events.push(LiveUpdateEvent::Removed {
+                    internal_path: event.internal_path,
                 });
             }
-            let mut state = state.lock().unwrap();
-            let Some(index) = state
-                .indexes
-                .iter_mut()
-                .find(|index| index.metadata.device_id == event.device_id)
-            else {
-                return Ok(false);
-            };
-            index.apply_live_event(LiveUpdateEvent::Renamed {
-                old_internal_path: old_internal,
-                new_internal_path: event.internal_path.clone(),
-                metadata: live_metadata(metadata),
-            })
-        }
-        ScannerWatchEventKind::Metadata => {
-            let Some(metadata) = event.metadata.clone() else {
-                return Ok(false);
-            };
-            let mut state = state.lock().unwrap();
-            let Some(index) = state
-                .indexes
-                .iter_mut()
-                .find(|index| index.metadata.device_id == event.device_id)
-            else {
-                return Ok(false);
-            };
-            index.apply_live_event(LiveUpdateEvent::Metadata {
-                internal_path: event.internal_path.clone(),
-                metadata: live_metadata(metadata),
-            })
+            ScannerWatchEventKind::Renamed => {
+                let Some(old_internal_path) = event.old_internal_path else {
+                    continue;
+                };
+                let Some(metadata) = event.metadata else {
+                    live_events.push(LiveUpdateEvent::Removed {
+                        internal_path: old_internal_path,
+                    });
+                    continue;
+                };
+                if rules_allow_compiled(rules.as_ref(), &event.internal_path) {
+                    live_events.push(LiveUpdateEvent::Renamed {
+                        old_internal_path,
+                        new_internal_path: event.internal_path,
+                        metadata: live_metadata(metadata),
+                    });
+                } else {
+                    live_events.push(LiveUpdateEvent::Removed {
+                        internal_path: old_internal_path,
+                    });
+                }
+            }
+            ScannerWatchEventKind::Metadata => {
+                let Some(metadata) = event.metadata else {
+                    continue;
+                };
+                live_events.push(LiveUpdateEvent::Metadata {
+                    internal_path: event.internal_path,
+                    metadata: live_metadata(metadata),
+                });
+            }
         }
     }
+    if live_events.is_empty() {
+        return Ok(false);
+    }
+
+    let Some(index) = state
+        .indexes
+        .iter_mut()
+        .find(|index| index.metadata.device_id == device_id)
+    else {
+        return Ok(false);
+    };
+    index.apply_live_events(live_events)
+}
+
+fn coalesce_watch_events(events: Vec<ScannerWatchEvent>) -> Vec<ScannerWatchEvent> {
+    let mut out: Vec<ScannerWatchEvent> = Vec::new();
+    for event in collapse_rename_chains(events) {
+        if let Some(event) = coalesce_with_existing(&mut out, event) {
+            out.push(event);
+        } else {
+            continue;
+        }
+    }
+    out
+}
+
+fn collapse_rename_chains(events: Vec<ScannerWatchEvent>) -> Vec<ScannerWatchEvent> {
+    let mut out: Vec<ScannerWatchEvent> = Vec::new();
+    for event in events {
+        if event.kind == ScannerWatchEventKind::Renamed
+            && let Some(old) = event.old_internal_path.clone()
+        {
+            let mut collapsed = false;
+            for previous in out.iter_mut().rev() {
+                if previous.kind == ScannerWatchEventKind::Renamed
+                    && previous.device_id == event.device_id
+                    && previous.internal_path == old
+                {
+                    previous.internal_path = event.internal_path.clone();
+                    previous.metadata = event.metadata.clone();
+                    collapsed = true;
+                    break;
+                }
+            }
+            if collapsed {
+                continue;
+            }
+        }
+        out.push(event);
+    }
+    out
+}
+
+fn coalesce_with_existing(
+    out: &mut [ScannerWatchEvent],
+    event: ScannerWatchEvent,
+) -> Option<ScannerWatchEvent> {
+    match event.kind {
+        ScannerWatchEventKind::Metadata => {
+            if let Some(existing) = out.iter_mut().rev().find(|existing| {
+                existing.device_id == event.device_id
+                    && existing.internal_path == event.internal_path
+                    && matches!(
+                        existing.kind,
+                        ScannerWatchEventKind::Created | ScannerWatchEventKind::Metadata
+                    )
+            }) {
+                existing.metadata = event.metadata;
+                return None;
+            }
+        }
+        ScannerWatchEventKind::Removed => {
+            if let Some(pos) = out.iter().rposition(|existing| {
+                existing.device_id == event.device_id
+                    && existing.internal_path == event.internal_path
+                    && matches!(
+                        existing.kind,
+                        ScannerWatchEventKind::Created | ScannerWatchEventKind::Metadata
+                    )
+            }) {
+                out[pos] = event;
+                return None;
+            }
+        }
+        ScannerWatchEventKind::Created => {
+            if let Some(existing) = out.iter_mut().rev().find(|existing| {
+                existing.device_id == event.device_id
+                    && existing.internal_path == event.internal_path
+                    && existing.kind == ScannerWatchEventKind::Removed
+            }) {
+                *existing = event;
+                return None;
+            }
+        }
+        ScannerWatchEventKind::Renamed => {}
+    }
+    Some(event)
+}
+
+fn rules_allow_compiled(
+    rules: Option<&oxidex_core::rules::CompiledRules>,
+    internal_path: &str,
+) -> bool {
+    rules
+        .map(|rules| rules.matches(internal_path, internal_name(internal_path)))
+        .unwrap_or(true)
 }
 
 fn live_metadata(metadata: ScannerLiveMetadata) -> LiveRecordMetadata {
@@ -1346,45 +1730,6 @@ fn live_metadata(metadata: ScannerLiveMetadata) -> LiveRecordMetadata {
         is_dir: metadata.is_dir,
         is_symlink: metadata.is_symlink,
     }
-}
-
-fn apply_live_created(
-    state: &Arc<Mutex<DaemonState>>,
-    device_id: &str,
-    internal_path: String,
-    metadata: LiveRecordMetadata,
-) -> anyhow::Result<bool> {
-    if !rules_allow(&state.lock().unwrap(), device_id, &internal_path)? {
-        return Ok(false);
-    }
-    let mut state = state.lock().unwrap();
-    let Some(index) = state
-        .indexes
-        .iter_mut()
-        .find(|index| index.metadata.device_id == device_id)
-    else {
-        return Ok(false);
-    };
-    index.apply_live_event(LiveUpdateEvent::Created {
-        internal_path,
-        metadata,
-    })
-}
-
-fn rules_allow(state: &DaemonState, device_id: &str, internal_path: &str) -> anyhow::Result<bool> {
-    let Some(device_config) = state
-        .config
-        .devices
-        .iter()
-        .find(|device| device.device_id == device_id)
-    else {
-        return Ok(true);
-    };
-    if device_config.rules.is_empty() {
-        return Ok(true);
-    }
-    let rules = compile_rules(&device_config.rules)?;
-    Ok(rules.matches(internal_path, internal_name(internal_path)))
 }
 
 fn internal_name(internal_path: &str) -> &str {
@@ -1857,6 +2202,17 @@ fn apply_config_set(config: &mut AppConfig, params: &ConfigSetParams) -> anyhow:
                     )
                 })?;
         }
+        "indexing.periodic_rescan_when_unwatched" => {
+            config.indexing.periodic_rescan_when_unwatched =
+                params.value.as_bool().ok_or_else(|| {
+                    anyhow::anyhow!("indexing.periodic_rescan_when_unwatched must be a boolean")
+                })?;
+        }
+        "indexing.periodic_rescan_minutes" => {
+            config.indexing.periodic_rescan_minutes = params.value.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("indexing.periodic_rescan_minutes must be a positive integer")
+            })?;
+        }
         "rofi.max_results" => {
             config.rofi.max_results = params
                 .value
@@ -1917,9 +2273,58 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxidex_core::config::{DeviceConfig, PathRule};
     use oxidex_core::daemon_model::ScannerStatusDetail;
     use oxidex_core::device::DeviceInfo;
+    use oxidex_core::model::{DeviceMetadata, FsType, ROOT_PARENT, ScanDatabase};
     use std::collections::HashMap;
+
+    fn sample_index(device_id: &str) -> SearchIndex {
+        let mut scan = ScanDatabase::new(FsType::Ext4);
+        scan.push_record(ROOT_PARENT, "", 0, 0, true, false)
+            .unwrap();
+        let src = scan.push_record(0, "src", 0, 1, true, false).unwrap();
+        scan.push_record(src, "main.rs", 1, 2, false, false)
+            .unwrap();
+        SearchIndex::from_scan(
+            DeviceMetadata {
+                device_id: device_id.into(),
+                dev_node: "/dev/test".into(),
+                fs_type: FsType::Ext4,
+                label: "Test".into(),
+                uuid: "test".into(),
+                partuuid: String::new(),
+            },
+            scan,
+            123,
+        )
+        .unwrap()
+    }
+
+    fn supported_device(device_id: &str, mount_point: &str) -> DeviceInfo {
+        DeviceInfo {
+            metadata: Some(DeviceMetadata {
+                device_id: device_id.into(),
+                dev_node: "/dev/test".into(),
+                fs_type: FsType::Ext4,
+                label: "Test".into(),
+                uuid: "test".into(),
+                partuuid: String::new(),
+            }),
+            device_id: device_id.into(),
+            dev_node: "/dev/test".into(),
+            fs_type: Some(FsType::Ext4),
+            fs_type_name: "ext4".into(),
+            label: "Test".into(),
+            uuid: "test".into(),
+            partuuid: String::new(),
+            scan_supported: true,
+            scan_unavailable_reason: None,
+            mounted: true,
+            mount_points: vec![mount_point.into()],
+            primary_mount_point: mount_point.into(),
+        }
+    }
 
     fn daemon_state_with_device(device: DeviceInfo) -> Arc<Mutex<DaemonState>> {
         Arc::new(Mutex::new(DaemonState {
@@ -1941,6 +2346,27 @@ mod tests {
             watch_summaries: HashMap::new(),
             next_job_id: 1,
         }))
+    }
+
+    fn live_event(
+        kind: ScannerWatchEventKind,
+        path: &str,
+        old: Option<&str>,
+        size: u64,
+    ) -> ScannerWatchEvent {
+        ScannerWatchEvent {
+            watch_id: 1,
+            device_id: "partuuid:test".into(),
+            kind,
+            internal_path: path.into(),
+            old_internal_path: old.map(str::to_owned),
+            metadata: (kind != ScannerWatchEventKind::Removed).then_some(ScannerLiveMetadata {
+                size,
+                mtime: size as i64,
+                is_dir: false,
+                is_symlink: false,
+            }),
+        }
     }
 
     #[test]
@@ -1993,5 +2419,158 @@ mod tests {
             start_scan_job_with_refresh(state.clone(), "dev:/dev/sr0".into(), false).unwrap_err();
         assert_eq!(format!("{err:#}"), "Unsupported filesystem: iso9660");
         assert!(state.lock().unwrap().jobs.is_empty());
+    }
+
+    #[test]
+    fn rootable_include_rules_extract_watch_roots() {
+        assert_eq!(
+            rootable_include_rule("/home/hiroshi/**").as_deref(),
+            Some("/home/hiroshi")
+        );
+        assert_eq!(
+            rootable_include_rule("/home/*/Documents/**").as_deref(),
+            Some("/home")
+        );
+        assert_eq!(
+            rootable_include_rule("/data/projects").as_deref(),
+            Some("/data/projects")
+        );
+        assert_eq!(rootable_include_rule("node_modules"), None);
+        assert_eq!(rootable_include_rule("*.rs"), None);
+        assert_eq!(rootable_include_rule("/**"), None);
+    }
+
+    #[test]
+    fn root_watch_requires_absolute_include_rules() {
+        let device_id = "partuuid:test";
+        let index = sample_index(device_id);
+        let mut state = DaemonState {
+            config_path: PathBuf::from("/tmp/oxidex-test-config.toml"),
+            config: AppConfig::default(),
+            indexes: vec![index.clone()],
+            index_states: HashMap::new(),
+            devices: vec![supported_device(device_id, "/")],
+            scanner_socket: PathBuf::from("/tmp/oxidex-test-scannerd.sock"),
+            scanner_status: ScannerStatusDetail {
+                socket: "/tmp/oxidex-test-scannerd.sock".into(),
+                reachable: false,
+                access_model: "unix_group_socket".into(),
+                peer_uid: None,
+                peer_gid: None,
+                last_error: None,
+            },
+            jobs: HashMap::new(),
+            watch_summaries: HashMap::new(),
+            next_job_id: 1,
+        };
+
+        let device = state.devices.first().unwrap();
+        assert!(matches!(
+            watch_roots_for_device(&state, &index, device),
+            RootWatchPolicy::Suppressed(reason) if reason == "unwatched_root_without_include"
+        ));
+
+        state.config.devices.push(DeviceConfig {
+            device_id: device_id.into(),
+            enabled: true,
+            display_name: None,
+            rules: vec![PathRule {
+                kind: RuleKind::Exclude,
+                pattern: "node_modules".into(),
+            }],
+        });
+        assert!(matches!(
+            watch_roots_for_device(&state, &index, device),
+            RootWatchPolicy::Suppressed(reason) if reason == "unwatched_root_without_include"
+        ));
+
+        state.config.devices[0].rules = vec![PathRule {
+            kind: RuleKind::Include,
+            pattern: "/home/hiroshi/**".into(),
+        }];
+        match watch_roots_for_device(&state, &index, device) {
+            RootWatchPolicy::Watch(roots) => assert_eq!(roots, vec!["/home/hiroshi"]),
+            RootWatchPolicy::Suppressed(reason) => panic!("unexpected suppression: {reason}"),
+        }
+    }
+
+    #[test]
+    fn non_root_mount_watches_mount_point() {
+        let device_id = "partuuid:test";
+        let index = sample_index(device_id);
+        let state = daemon_state_with_device(supported_device(device_id, "/mnt/data"));
+        let mut state = state.lock().unwrap();
+        state.indexes.push(index.clone());
+        let device = state.devices.first().unwrap();
+        match watch_roots_for_device(&state, &index, device) {
+            RootWatchPolicy::Watch(roots) => assert_eq!(roots, vec!["/mnt/data"]),
+            RootWatchPolicy::Suppressed(reason) => panic!("unexpected suppression: {reason}"),
+        }
+    }
+
+    #[test]
+    fn watch_event_coalescing_collapses_safe_duplicates() {
+        let events = coalesce_watch_events(vec![
+            live_event(ScannerWatchEventKind::Created, "/tmp/a", None, 1),
+            live_event(ScannerWatchEventKind::Metadata, "/tmp/a", None, 2),
+            live_event(ScannerWatchEventKind::Metadata, "/tmp/b", None, 3),
+            live_event(ScannerWatchEventKind::Removed, "/tmp/b", None, 0),
+            live_event(ScannerWatchEventKind::Renamed, "/tmp/d", Some("/tmp/c"), 4),
+            live_event(ScannerWatchEventKind::Renamed, "/tmp/e", Some("/tmp/d"), 5),
+        ]);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind, ScannerWatchEventKind::Created);
+        assert_eq!(events[0].internal_path, "/tmp/a");
+        assert_eq!(events[0].metadata.as_ref().unwrap().size, 2);
+        assert_eq!(events[1].kind, ScannerWatchEventKind::Removed);
+        assert_eq!(events[1].internal_path, "/tmp/b");
+        assert_eq!(events[2].kind, ScannerWatchEventKind::Renamed);
+        assert_eq!(events[2].old_internal_path.as_deref(), Some("/tmp/c"));
+        assert_eq!(events[2].internal_path, "/tmp/e");
+    }
+
+    #[test]
+    fn periodic_rescan_skips_watched_and_active_jobs() {
+        let device_id = "partuuid:test";
+        let state = daemon_state_with_device(supported_device(device_id, "/"));
+        {
+            let mut state = state.lock().unwrap();
+            state.indexes.push(sample_index(device_id));
+            state.config.indexing.watch_mounted = false;
+        }
+        let now = Instant::now();
+        let mut last_seen = HashMap::from([(device_id.to_owned(), now - Duration::from_secs(120))]);
+        let candidates = periodic_rescan_candidates_from_state(
+            &state.lock().unwrap(),
+            &mut last_seen,
+            now,
+            Duration::from_secs(60),
+        );
+        assert_eq!(candidates, vec![device_id]);
+
+        let mut state = state.lock().unwrap();
+        state.config.indexing.watch_mounted = true;
+        state.watch_summaries.insert(
+            device_id.into(),
+            WatchSummary {
+                device_id: device_id.into(),
+                mounted: true,
+                enabled: true,
+                state: "watching".into(),
+                watched_directories: 1,
+                dirty: false,
+                last_error: None,
+            },
+        );
+        let mut last_seen = HashMap::from([(device_id.to_owned(), now - Duration::from_secs(120))]);
+        assert!(
+            periodic_rescan_candidates_from_state(
+                &state,
+                &mut last_seen,
+                now,
+                Duration::from_secs(60),
+            )
+            .is_empty()
+        );
     }
 }
