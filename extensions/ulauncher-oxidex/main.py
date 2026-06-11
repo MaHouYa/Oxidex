@@ -22,6 +22,7 @@ ICON = "images/icon.png"
 START_COOLDOWN_SECONDS = 5.0
 START_WAIT_SECONDS = 1.0
 MAX_RESULTS_CAP = 100
+MIN_SEARCH_QUERY_BYTES = 3
 
 
 class OxidexExtension(Extension):
@@ -81,6 +82,8 @@ class KeywordQueryEventListener(EventListener):
                 return RenderResultListAction(home_items(extension))
             if query.startswith(":"):
                 return RenderResultListAction(command_items(extension, query))
+            if not search_query_ready(query):
+                return RenderResultListAction(search_threshold_items())
             return RenderResultListAction(search_items(extension, query))
         except Exception as err:
             logger.exception("oxidex query failed")
@@ -106,6 +109,10 @@ class ItemEnterEventListener(EventListener):
         except Exception as err:
             logger.exception("oxidex item action failed")
             return RenderResultListAction(error_items(err))
+
+
+def search_query_ready(query):
+    return len(query.strip().encode("utf-8")) >= MIN_SEARCH_QUERY_BYTES
 
 
 def search_items(extension, query):
@@ -258,7 +265,11 @@ def command_items(extension, query):
 
 def home_items(extension):
     items = [
-        item("Search Oxidex", "Type file name terms after the keyword.", DoNothingAction()),
+        item(
+            "Search Oxidex",
+            "Type at least 3 UTF-8 bytes after the keyword.",
+            DoNothingAction(),
+        ),
         item(
             "Rescan devices",
             "Use :scan or :rescan to choose a device.",
@@ -278,9 +289,23 @@ def home_items(extension):
     return items
 
 
+def search_threshold_items():
+    return [
+        item(
+            "Keep typing to search Oxidex",
+            "Search starts after at least 3 UTF-8 bytes; one CJK character is enough.",
+            DoNothingAction(),
+        )
+    ]
+
+
 def help_items():
     return [
-        item("ox query terms", "Search indexed file names.", DoNothingAction()),
+        item(
+            "ox query terms",
+            "Search indexed file names after at least 3 UTF-8 bytes.",
+            DoNothingAction(),
+        ),
         item("ox :scan", "Choose a known or indexed device to scan.", DoNothingAction()),
         item("ox :rescan", "Alias for :scan.", DoNothingAction()),
         item("ox :status", "Show daemon, scanner, index, and job status.", DoNothingAction()),

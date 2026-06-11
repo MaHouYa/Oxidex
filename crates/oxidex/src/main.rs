@@ -30,6 +30,8 @@ use tracing_subscriber::EnvFilter;
 mod fonts;
 mod i18n;
 
+const MIN_SEARCH_QUERY_BYTES: usize = 3;
+
 #[derive(Clone, Debug, Default)]
 struct GuiArgs {
     standalone: bool,
@@ -182,6 +184,10 @@ fn ime_frame_from_events(events: &[egui::Event], debug_enabled: bool) -> ImeFram
     frame
 }
 
+fn search_query_ready(query: &str) -> bool {
+    query.trim().len() >= MIN_SEARCH_QUERY_BYTES
+}
+
 #[cfg(test)]
 mod ime_tests {
     use super::*;
@@ -246,6 +252,16 @@ mod ime_tests {
         });
 
         assert_eq!(text, "abc你好");
+    }
+
+    #[test]
+    fn search_threshold_counts_utf8_bytes() {
+        assert!(!search_query_ready(""));
+        assert!(!search_query_ready("a"));
+        assert!(!search_query_ready("ab"));
+        assert!(search_query_ready("abc"));
+        assert!(search_query_ready("中"));
+        assert!(!search_query_ready("  ab  "));
     }
 }
 
@@ -382,6 +398,12 @@ impl DaemonGuiApp {
     }
 
     fn recompute_rows(&mut self) {
+        if !search_query_ready(&self.query) {
+            self.rows.clear();
+            self.selected_hit = None;
+            self.status = self.t(Text::SearchMinimumBytes).into();
+            return;
+        }
         let request = match self.search_request() {
             Ok(request) => request,
             Err(err) => {
@@ -1496,6 +1518,12 @@ impl OxidexApp {
     }
 
     fn recompute_hits(&mut self) {
+        if !search_query_ready(&self.query) {
+            self.hits.clear();
+            self.selected_hit = None;
+            self.status = self.t(Text::SearchMinimumBytes).into();
+            return;
+        }
         let previous_selection = self.selected_hit.clone();
         let filter = (!self.selected_scope.is_empty()).then_some(self.selected_scope.as_str());
         let request = match self.search_request() {

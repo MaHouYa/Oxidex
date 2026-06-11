@@ -364,12 +364,18 @@ The default keyword is `ox`:
 
 ```text
 ox main
+ox 中
 ox ext:rs path:src
 ox :scan
 ox :rescan
 ox :status
 ox :help
 ```
+
+The GUI and Ulauncher extension begin filename search after at least 3 UTF-8
+bytes of query text. This means one or two ASCII characters do not trigger a
+search, while one typical CJK character is enough. Ulauncher commands beginning
+with `:` remain available immediately.
 
 Search results open an action menu. From there you can open the file, open the
 containing folder, copy the resolved path, copy the file name, or queue a

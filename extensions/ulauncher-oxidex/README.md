@@ -21,12 +21,18 @@ The default keyword is `ox`.
 
 ```text
 ox main
+ox 中
 ox ext:rs path:src
 ox :scan
 ox :rescan
 ox :status
 ox :help
 ```
+
+Normal filename search starts after the query contains at least 3 UTF-8 bytes.
+This avoids daemon searches for one or two ASCII characters, while one typical
+CJK character is enough to start searching. Inline commands beginning with `:`
+are not subject to this threshold.
 
 Search results open an action menu. From there you can open the file, open its
 folder, copy the resolved path, copy the file name, or queue a rescan for the

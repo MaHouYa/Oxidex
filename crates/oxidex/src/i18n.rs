@@ -18,6 +18,7 @@ pub enum Text {
     Filters,
     SearchHint,
     SearchHintDaemon,
+    SearchMinimumBytes,
     ActiveFilters,
     ObjectsFound,
     Ext,
@@ -140,6 +141,7 @@ pub const ALL_TEXT_KEYS: &[Text] = &[
     Text::Filters,
     Text::SearchHint,
     Text::SearchHintDaemon,
+    Text::SearchMinimumBytes,
     Text::ActiveFilters,
     Text::ObjectsFound,
     Text::Ext,
@@ -296,10 +298,11 @@ fn en_us(key: Text) -> &'static str {
         Text::AllDevices => "All devices",
         Text::AllIndexedDevices => "All indexed devices",
         Text::Filters => "Filters",
-        Text::SearchHint => "Search files, e.g. *.rs ext:txt path:src type:dir",
+        Text::SearchHint => "Type 3 bytes to search, e.g. *.rs ext:txt path:src type:dir",
         Text::SearchHintDaemon => {
-            "Search files, e.g. *.rs ext:txt path:src type:dir !cache size:<10mb"
+            "Type 3 bytes to search, e.g. *.rs ext:txt path:src type:dir !cache size:<10mb"
         }
+        Text::SearchMinimumBytes => "Type at least 3 UTF-8 bytes to search.",
         Text::ActiveFilters => "Active filters",
         Text::ObjectsFound => "objects found",
         Text::Ext => "Ext",
@@ -429,8 +432,11 @@ fn zh_cn(key: Text) -> &'static str {
         Text::AllDevices => "所有设备",
         Text::AllIndexedDevices => "所有已索引设备",
         Text::Filters => "过滤器",
-        Text::SearchHint => "搜索文件，例如 *.rs ext:txt path:src type:dir",
-        Text::SearchHintDaemon => "搜索文件，例如 *.rs ext:txt path:src type:dir !cache size:<10mb",
+        Text::SearchHint => "输入至少 3 个 UTF-8 字节后搜索，例如 *.rs ext:txt path:src type:dir",
+        Text::SearchHintDaemon => {
+            "输入至少 3 个 UTF-8 字节后搜索，例如 *.rs ext:txt path:src type:dir !cache size:<10mb"
+        }
+        Text::SearchMinimumBytes => "请输入至少 3 个 UTF-8 字节后搜索。",
         Text::ActiveFilters => "活动过滤器",
         Text::ObjectsFound => "个对象",
         Text::Ext => "扩展名",
