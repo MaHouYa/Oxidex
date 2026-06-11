@@ -315,7 +315,11 @@ Sort modes:
 - **Size**
 - **Date**
 
-Relevance is stateless. Oxidex does not store open history or frecency data.
+Relevance is stateless. Text match quality remains the strongest signal: exact
+basenames, prefixes, substrings, and wildcards are ranked in that order. Within
+the same match-quality class, recently modified files receive a small,
+bucketed boost before shorter names and shallower paths are considered. Oxidex
+does not store open history or frecency data.
 
 To see how a query is interpreted:
 

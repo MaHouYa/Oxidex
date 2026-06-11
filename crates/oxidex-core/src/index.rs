@@ -978,6 +978,21 @@ impl SearchIndex {
         sort_key: SortKey,
         direction: SortDirection,
     ) -> Vec<u32> {
+        self.search_request_with_relevance_context(
+            request,
+            sort_key,
+            direction,
+            RelevanceContext::current(),
+        )
+    }
+
+    fn search_request_with_relevance_context(
+        &self,
+        request: &SearchRequest,
+        sort_key: SortKey,
+        direction: SortDirection,
+        relevance_context: RelevanceContext,
+    ) -> Vec<u32> {
         let mut hits = if request.is_empty() {
             self.pick_order(sort_key).clone()
         } else {
@@ -992,8 +1007,8 @@ impl SearchIndex {
         if !request.is_empty() {
             if sort_key == SortKey::Relevance {
                 hits.par_sort_unstable_by(|a, b| {
-                    self.relevance_score(*a, request)
-                        .cmp(&self.relevance_score(*b, request))
+                    self.relevance_score(*a, request, relevance_context)
+                        .cmp(&self.relevance_score(*b, request, relevance_context))
                         .then_with(|| self.folded_name(*a).cmp(self.folded_name(*b)))
                         .then_with(|| a.cmp(b))
                 });
@@ -1230,8 +1245,14 @@ impl SearchIndex {
         }
     }
 
-    fn relevance_score(&self, record_idx: u32, request: &SearchRequest) -> RelevanceScore {
+    fn relevance_score(
+        &self,
+        record_idx: u32,
+        request: &SearchRequest,
+        context: RelevanceContext,
+    ) -> RelevanceScore {
         let name = self.folded_name(record_idx);
+        let rec = &self.records[record_idx as usize];
         let path_depth = self
             .internal_path(record_idx)
             .trim_matches('/')
@@ -1277,15 +1298,57 @@ impl SearchIndex {
 
         RelevanceScore {
             match_score,
+            recency_bucket: context.recency_bucket(rec.mtime),
             name_len: name.len() as u32,
             path_depth,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RelevanceContext {
+    now_unix: i64,
+}
+
+impl RelevanceContext {
+    fn current() -> Self {
+        Self {
+            now_unix: now_unix(),
+        }
+    }
+
+    fn recency_bucket(self, mtime: i64) -> u32 {
+        const DAY: i64 = 86_400;
+        const WEEK: i64 = 7 * DAY;
+        const MONTH: i64 = 30 * DAY;
+        const HALF_YEAR: i64 = 180 * DAY;
+        const UNKNOWN_RECENCY: u32 = 5;
+
+        if self.now_unix <= 0 || mtime <= 0 {
+            return UNKNOWN_RECENCY;
+        }
+
+        let age = self.now_unix.saturating_sub(mtime);
+        if age <= DAY {
+            0
+        } else if age <= WEEK {
+            1
+        } else if age <= MONTH {
+            2
+        } else if age <= HALF_YEAR {
+            3
+        } else {
+            4
+        }
+    }
+}
+
+// Field order is the relevance ranking order. Text match quality stays dominant;
+// recency only promotes a result within the same match-quality class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct RelevanceScore {
     match_score: u32,
+    recency_bucket: u32,
     name_len: u32,
     path_depth: u32,
 }
@@ -1314,6 +1377,7 @@ pub fn merge_search_request(
     sort_key: SortKey,
     direction: SortDirection,
 ) -> Vec<SearchHit> {
+    let relevance_context = RelevanceContext::current();
     let mut hits = Vec::new();
     for index in indexes {
         if let Some(device_id) = device_filter
@@ -1324,7 +1388,12 @@ pub fn merge_search_request(
 
         hits.extend(
             index
-                .search_request(request, sort_key, SortDirection::Asc)
+                .search_request_with_relevance_context(
+                    request,
+                    sort_key,
+                    SortDirection::Asc,
+                    relevance_context,
+                )
                 .into_iter()
                 .map(|record_idx| SearchHit {
                     device_id: index.metadata.device_id.clone(),
@@ -1341,9 +1410,15 @@ pub fn merge_search_request(
             .iter()
             .find(|idx| idx.metadata.device_id == b.device_id);
         match (ia, ib) {
-            (Some(ia), Some(ib)) => {
-                compare_hits(ia, a.record_idx, ib, b.record_idx, sort_key, request)
-            }
+            (Some(ia), Some(ib)) => compare_hits(
+                ia,
+                a.record_idx,
+                ib,
+                b.record_idx,
+                sort_key,
+                request,
+                relevance_context,
+            ),
             _ => a
                 .device_id
                 .cmp(&b.device_id)
@@ -1364,13 +1439,14 @@ fn compare_hits(
     b: u32,
     sort_key: SortKey,
     request: &SearchRequest,
+    relevance_context: RelevanceContext,
 ) -> Ordering {
     let ar = &a_idx.records[a as usize];
     let br = &b_idx.records[b as usize];
     let ord = match sort_key {
         SortKey::Relevance => a_idx
-            .relevance_score(a, request)
-            .cmp(&b_idx.relevance_score(b, request))
+            .relevance_score(a, request, relevance_context)
+            .cmp(&b_idx.relevance_score(b, request, relevance_context))
             .then_with(|| a_idx.folded_name(a).cmp(b_idx.folded_name(b))),
         SortKey::Name => a_idx.folded_name(a).cmp(b_idx.folded_name(b)),
         SortKey::Path => a_idx.internal_path(a).cmp(b_idx.internal_path(b)),
@@ -1633,6 +1709,28 @@ mod tests {
         .unwrap()
     }
 
+    fn index_with_files(device_id: &str, files: &[(&str, i64)]) -> SearchIndex {
+        let mut scan = ScanDatabase::new(FsType::Ext4);
+        scan.push_record(ROOT_PARENT, "", 0, 0, true, false)
+            .unwrap();
+        for (name, mtime) in files {
+            scan.push_record(0, name, 10, *mtime, false, false).unwrap();
+        }
+        SearchIndex::from_scan(
+            DeviceMetadata {
+                device_id: device_id.into(),
+                dev_node: format!("/dev/{device_id}"),
+                fs_type: FsType::Ext4,
+                label: device_id.into(),
+                uuid: device_id.into(),
+                partuuid: String::new(),
+            },
+            scan,
+            1_000_000,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn unicode_lowercase_search_works() {
         let idx = sample_index();
@@ -1753,6 +1851,99 @@ mod tests {
         let request = parse_search_query("main").unwrap();
         let hits = idx.search_request(&request, SortKey::Relevance, SortDirection::Asc);
         assert_eq!(hits.first().copied(), Some(4));
+    }
+
+    #[test]
+    fn relevance_uses_recency_within_same_match_quality() {
+        let idx = index_with_files(
+            "uuid:recency",
+            &[("report-a.txt", 10_000), ("report-b.txt", 999_000)],
+        );
+        let request = parse_search_query("report").unwrap();
+
+        let hits = idx.search_request_with_relevance_context(
+            &request,
+            SortKey::Relevance,
+            SortDirection::Asc,
+            RelevanceContext {
+                now_unix: 1_000_000,
+            },
+        );
+
+        assert_eq!(hits, vec![2, 1]);
+    }
+
+    #[test]
+    fn relevance_keeps_match_quality_above_recency() {
+        let idx = index_with_files(
+            "uuid:quality",
+            &[("report.txt", 10_000), ("fresh-report.txt", 999_000)],
+        );
+        let request = parse_search_query("report").unwrap();
+
+        let hits = idx.search_request_with_relevance_context(
+            &request,
+            SortKey::Relevance,
+            SortDirection::Asc,
+            RelevanceContext {
+                now_unix: 1_000_000,
+            },
+        );
+
+        assert_eq!(hits, vec![1, 2]);
+    }
+
+    #[test]
+    fn relevance_treats_unknown_mtime_as_least_recent() {
+        const DAY: i64 = 86_400;
+        let context = RelevanceContext {
+            now_unix: 20_000_000,
+        };
+
+        assert_eq!(context.recency_bucket(context.now_unix - DAY), 0);
+        assert_eq!(context.recency_bucket(context.now_unix - DAY - 1), 1);
+        assert_eq!(context.recency_bucket(context.now_unix - 7 * DAY - 1), 2);
+        assert_eq!(context.recency_bucket(context.now_unix - 30 * DAY - 1), 3);
+        assert_eq!(context.recency_bucket(context.now_unix - 180 * DAY - 1), 4);
+        assert_eq!(context.recency_bucket(0), 5);
+        assert_eq!(context.recency_bucket(-1), 5);
+    }
+
+    #[test]
+    fn merged_relevance_uses_recency_and_keeps_deterministic_ties() {
+        let now = now_unix();
+        let indexes = vec![
+            index_with_files("uuid:b", &[("report-b.txt", now - 200 * 86_400)]),
+            index_with_files("uuid:a", &[("report-a.txt", now - 60)]),
+            index_with_files("uuid:c", &[("report-c.txt", now - 60)]),
+        ];
+        let request = parse_search_query("report").unwrap();
+
+        let hits = merge_search_request(
+            &indexes,
+            None,
+            &request,
+            SortKey::Relevance,
+            SortDirection::Asc,
+        );
+
+        assert_eq!(
+            hits,
+            vec![
+                SearchHit {
+                    device_id: "uuid:a".into(),
+                    record_idx: 1,
+                },
+                SearchHit {
+                    device_id: "uuid:c".into(),
+                    record_idx: 1,
+                },
+                SearchHit {
+                    device_id: "uuid:b".into(),
+                    record_idx: 1,
+                },
+            ]
+        );
     }
 
     #[test]
